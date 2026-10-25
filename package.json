@@ -1,0 +1,21 @@
+{
+  "name": "engen-tech-plugins",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Engen-Tech plugins for pi: the pi resources of the plugins under plugins/.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "UNLICENSED",
+  "type": "module",
+  "pi": {
+    "extensions": [],
+    "skills": [],
+    "subagents": {
+      "agents": []
+    }
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

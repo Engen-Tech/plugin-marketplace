@@ -1,6 +1,6 @@
 # Engen-Tech plugin marketplace: design and build plan
 
-Date: 2026-10-25. Status: design only; no code in any repo yet.
+Date: 2026-10-25. Status: build step 1 done (the skeleton in this repo); steps 2 and 3 on steward branch `marketplace-release`.
 Repo: `github.com/Engen-Tech/plugin-marketplace`, public, GitHub only, no Forgejo copy (operator decided). Marketplace `name`: `engen-tech`; ids `steward-delegation@engen-tech`, `steward-prose-gate@engen-tech`, `steward-orchestration@engen-tech`, `plainlanguage@engen-tech` (operator decided).
 Paths below are `steward ...` (`/mnt/agent-storage/vader/src/steward`, main 050887f), `common-skills ...`, `pi docs ...` (`earendil-pi packages/coding-agent/docs/`) and `FINDINGS.md` (`hatch docs/backlog/engen-tech-plugin-marketplace/FINDINGS.md`, background research only).
 
@@ -38,6 +38,7 @@ Paths below are `steward ...` (`/mnt/agent-storage/vader/src/steward`, main 0508
 package.json                      the pi package: static fields plus the pi field (operator decided)
 plugins.lock.json                 one entry per plugin
 README.md                         install lines and plugin sets
+LICENSE                           the Engen license (see "License")
 docs/design.md                    this file
 plugins/<name>/                   shipped files only
 ```
@@ -53,7 +54,7 @@ plugins/<name>/                   shipped files only
 | `.agents/plugins/marketplace.json` | plugins with `.codex-plugin/plugin.json` (orchestration has none, as today) | `name`; `source` = `{"source":"local","path":"./plugins/<name>"}`; `category` = manifest `interface.category`; `policy` = constant `{"installation":"AVAILABLE","authentication":"ON_INSTALL"}`, as steward .agents/plugins/marketplace.json:14-17 |
 | `package.json` `pi` | plugins with pi resources | the lock's `pi` lists, each prefixed `./plugins/<name>/`; `agents` go under `subagents.agents` |
 
-Static fields come from the skeleton and no release touches them: catalog `name` `engen-tech`, `owner.name` `Engen-Tech`, Codex `interface.displayName` `Engen-Tech`. The `package.json` copies the shape of steward package.json:1-18,36-38 (`private`, `keywords: ["pi-package"]`, `type: module`, `peerDependencies` `@earendil-works/pi-coding-agent: "*"`), with name `engen-tech-plugins` and a fixed `version` `1.0.0` that is not a release number (same rule as plugin-split.md:217).
+Static fields come from the skeleton and no release touches them: catalog `name` `engen-tech`, `owner.name` `Engen-Tech`, the Claude catalog's `description` (added in step 1 to clear a `claude plugin validate` warning), Codex `interface.displayName` `Engen-Tech`. The `package.json` copies the shape of steward package.json:1-18,36-38 (`private`, `keywords: ["pi-package"]`, `type: module`, `peerDependencies` `@earendil-works/pi-coding-agent: "*"`), with name `engen-tech-plugins` and a fixed `version` `1.0.0` that is not a release number (same rule as plugin-split.md:217).
 
 ### Lock file
 
@@ -103,7 +104,7 @@ Steps for tag `T` = `<plugin>--v<version>`:
 Rules for the shared files:
 - The publisher refuses to replace a lock entry whose `source` is not its own repo URL, so neither product can overwrite the other's plugins.
 - JSON is written as `json.dumps(indent=2)` plus a newline, entries sorted by name, the format the skeleton starts with, so other entries' bytes never change.
-- The commit author is set as plain values in the workflow file (the operator's git identity; operator to confirm). The token goes in an HTTP auth header from the secret, never in the remote URL or the log.
+- The commit author is set as plain values in the workflow file (operator decided): the operator's git identity, name `Tej`, email `46010260+TejGandham@users.noreply.github.com`, as `git config user.name` and `user.email` print them in the steward checkout. The token goes in an HTTP auth header from the secret, never in the remote URL or the log.
 
 Dry run: `scripts/release_marketplace.sh <tag> --dry-run [--marketplace <url>]` runs steps 1-5 for a local tag, stops after the commit, prints the temp clone path and `git show --stat HEAD`, and pushes nothing. The default marketplace URL is the GitHub repo, cloned read-only; tests pass a `file://` bare repo.
 
@@ -130,7 +131,7 @@ Failures: a failed run leaves the marketplace unchanged; fix the cause and re-ru
 | (b) the pipeline generates manifests from a descriptor | a descriptor JSON | the manifests users get appear only in the marketplace commit, never as files in common-skills |
 | (c) manifests in a sibling folder `plainlanguage-plugin/` | its three manifests | two folders for one plugin |
 
-Pick (c) (designer's call, operator to confirm): the manifests are plain files in common-skills where the operator edits them, and the deployed skill folder stays byte-identical to today.
+Pick (c) (operator decided): the manifests are plain files in common-skills where the operator edits them, and the deployed skill folder stays byte-identical to today.
 
 - `plainlanguage-plugin/.claude-plugin/plugin.json`: `name` `plainlanguage`, `version`, `description`, `author`, `license`, `"skills": "./skills/"` (shape of common-skills exa-rest/.claude-plugin/plugin.json).
 - `plainlanguage-plugin/.codex-plugin/plugin.json`: the same plus `interface` with `category` `Productivity` (shape of common-skills exa-rest/.codex-plugin/plugin.json).
@@ -206,7 +207,7 @@ Each step is one commit or one named operator act, re-runnable from its done-che
 
 | # | Step | Where | Done-check |
 |-|-|-|-|
-| 1 | Skeleton: two catalogs with `plugins: []`, `package.json` static fields and empty pi lists, `plugins.lock.json` `{}`, README stub | this repo | each file parses; `claude plugin validate .` output recorded |
+| 1 | Skeleton: two catalogs with `plugins: []`, `package.json` static fields and empty pi lists, `plugins.lock.json` `{}`, README stub, LICENSE | this repo | each file parses; `claude plugin validate .` output recorded |
 | 2 | `scripts/publish_marketplace.py` and `tests/test_publish_marketplace.py` | steward branch [outside] | suite passes; against a temp `file://` bare marketplace: an upsert leaves other entries byte-identical; each validator row rejects its drift case; a foreign `source` is refused; a dry run pushes nothing; a rejected push re-clones, keeps the other product's entry, then pushes |
 | 3 | `scripts/release_marketplace.sh` and the workflow | steward branch [outside] | `release_marketplace.sh steward-prose-gate--v0.15.0 --dry-run --marketplace file://<skeleton>` builds one commit with 10 files under `plugins/steward-prose-gate/` and no `tests/` (a test, never pushed); a tag whose version differs from the manifests fails |
 | 4 | Re-point READMEs and catalogs; rewrite `tests/test_catalogs.py` | steward branch [outside] | suite; no install line for `@steward` or `@steward-codex` is left outside migration text |
@@ -224,9 +225,14 @@ Each step is one commit or one named operator act, re-runnable from its done-che
 | 16 | Full marketplace README | this repo [push, operator authorizes] | every command in it ran in step 15 |
 | 17 | Steward step 23 on the operator's machine, re-pointed: marketplace `engen-tech`, ids `<x>@engen-tech`, the Codex trust keys above, pi entry `git:github.com/Engen-Tech/plugin-marketplace` | operator's machine [operator] | each harness starts a session with one edict and no duplicate gates |
 
+Step 1 result (2026-10-25): the four JSON files parse. `claude plugin validate .` with Claude Code 2.1.310 printed `Validation passed with warnings` and one warning, `plugins: Marketplace has no plugins defined`, exit 0. The first release clears that warning.
+
 Order notes: steps 2-5 sit on one steward branch and can run in any order. Steps 6 and 7 come before step 8 so the steward README never points at a missing repo for long. Step 11 proves the steward releases before a second product writes to the shared files.
+
+## License
+
+(operator decided) This repo carries the Engen license as `LICENSE`, copied byte for byte from hatch `LICENSE` (git blob `051e6e0b78a9cbb0c77a8962288690bb28676540`, the same file as Engen-Tech/karta's LICENSE). Manifest `license` values are `"UNLICENSED"`, as hatch .claude-plugin/plugin.json:12 has it; the skeleton `package.json` uses the same value. The steward manifests still say MIT; changing them is part of build steps 4 and 5. The plainlanguage manifests (step 12) use `"UNLICENSED"` from the start.
 
 ## Open questions
 
-- License: the repo is public; steward manifests say MIT but steward has no LICENSE file; common-skills has none and exa-rest says UNLICENSED. The operator picks a LICENSE for this repo and a `license` value for the plainlanguage manifests.
 - Forgejo has not yet run a tag-triggered workflow for common-skills, or pushed to github.com from its runner; step 14 is the first proof.

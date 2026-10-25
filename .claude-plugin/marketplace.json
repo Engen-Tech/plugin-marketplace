@@ -1,0 +1,8 @@
+{
+  "name": "engen-tech",
+  "owner": {
+    "name": "Engen-Tech"
+  },
+  "description": "Engen-Tech plugins: steward delegation, prose gate and orchestration, and plainlanguage.",
+  "plugins": []
+}
