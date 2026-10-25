@@ -231,7 +231,7 @@ Order notes: steps 2-5 sit on one steward branch and can run in any order. Steps
 
 ## License
 
-(operator decided) This repo carries the Engen license as `LICENSE`, copied byte for byte from hatch `LICENSE` (git blob `051e6e0b78a9cbb0c77a8962288690bb28676540`, the same file as Engen-Tech/karta's LICENSE). Manifest `license` values are `"UNLICENSED"`, as hatch .claude-plugin/plugin.json:12 has it; the skeleton `package.json` uses the same value. The steward manifests still say MIT; changing them is part of build steps 4 and 5. The plainlanguage manifests (step 12) use `"UNLICENSED"` from the start.
+(operator decided) This repo carries the Engen license as `LICENSE`, taken from hatch `LICENSE` (git blob `051e6e0b78a9cbb0c77a8962288690bb28676540`) plus one paragraph saying a paid license agreement with the Owner overrides it (operator decided 2026-10-25). Manifest `license` values are `"UNLICENSED"`, as hatch .claude-plugin/plugin.json:12 has it; the skeleton `package.json` uses the same value. The steward manifests still say MIT; changing them is part of build steps 4 and 5. The plainlanguage manifests (step 12) use `"UNLICENSED"` from the start.
 
 ## Open questions
 
