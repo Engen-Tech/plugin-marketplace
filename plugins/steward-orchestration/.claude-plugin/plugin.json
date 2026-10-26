@@ -1,0 +1,15 @@
+{
+  "name": "steward-orchestration",
+  "description": "Primary and secondary session roles for multi-session initiatives on Claude Code, with a shared registry of who directs whom.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Tej Gandham"
+  },
+  "repository": "https://github.com/tejgandham/steward",
+  "license": "UNLICENSED",
+  "keywords": [
+    "orchestration",
+    "multi-session",
+    "delegation"
+  ]
+}

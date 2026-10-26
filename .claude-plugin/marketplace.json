@@ -11,6 +11,11 @@
       "source": "./plugins/steward-delegation"
     },
     {
+      "name": "steward-orchestration",
+      "description": "Primary and secondary session roles for multi-session initiatives on Claude Code, with a shared registry of who directs whom.",
+      "source": "./plugins/steward-orchestration"
+    },
+    {
       "name": "steward-prose-gate",
       "description": "Blocks a reply or a gh pr create/edit body that reads like AI-generated text, and asks for a plain-language revision.",
       "source": "./plugins/steward-prose-gate"
