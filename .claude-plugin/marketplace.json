@@ -6,6 +6,11 @@
   "description": "Engen-Tech plugins: steward delegation, prose gate and orchestration, and plainlanguage.",
   "plugins": [
     {
+      "name": "plainlanguage",
+      "description": "Plain-language writing and editing for any prose a person has to read and act on: a de-LLM pass that strips generated-text tells, plain-language rules, and the ASD-STE100 controlled register for procedures and runbooks.",
+      "source": "./plugins/plainlanguage"
+    },
+    {
       "name": "steward-delegation",
       "description": "Delegation edict for Claude Code: seven pinned subagent profiles chosen by task complexity, and a gate that denies a second direct edit on the main thread.",
       "source": "./plugins/steward-delegation"

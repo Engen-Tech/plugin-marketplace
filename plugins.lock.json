@@ -1,4 +1,16 @@
 {
+  "plainlanguage": {
+    "version": "1.0.0",
+    "source": "https://brahma.myth-gecko.ts.net:3000/stackhouse/common-skills",
+    "tag": "plainlanguage--v1.0.0",
+    "commit": "250aacf2fe7e9bfcaabf242c6912ddbc9c531628",
+    "tree": "37872619f71075b2f55c2007c2f8a325298066af",
+    "pi": {
+      "skills": [
+        "skills"
+      ]
+    }
+  },
   "steward-delegation": {
     "version": "1.0.0",
     "source": "https://github.com/TejGandham/steward",

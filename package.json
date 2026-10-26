@@ -14,6 +14,7 @@
       "./plugins/steward-prose-gate/pi/extensions/steward-prose-gate/index.ts"
     ],
     "skills": [
+      "./plugins/plainlanguage/skills",
       "./plugins/steward-delegation/pi/skills"
     ],
     "subagents": {

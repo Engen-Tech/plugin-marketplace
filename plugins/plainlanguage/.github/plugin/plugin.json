@@ -1,0 +1,18 @@
+{
+  "name": "plainlanguage",
+  "version": "1.0.0",
+  "description": "Plain-language writing and editing for any prose a person has to read and act on: a de-LLM pass, plain-language rules, and the ASD-STE100 controlled register.",
+  "author": {
+    "name": "Stackhouse"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "writing",
+    "plain-language",
+    "editing",
+    "ste100"
+  ],
+  "skills": [
+    "skills/"
+  ]
+}

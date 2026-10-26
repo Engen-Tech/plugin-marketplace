@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "plainlanguage",
+  "version": "1.0.0",
+  "description": "Plain-language writing and editing for any prose a person has to read and act on: a de-LLM pass that strips generated-text tells, plain-language rules, and the ASD-STE100 controlled register for procedures and runbooks.",
+  "author": { "name": "Stackhouse" },
+  "license": "UNLICENSED",
+  "keywords": ["writing", "plain-language", "editing", "ste100"],
+  "skills": "./skills/"
+}
