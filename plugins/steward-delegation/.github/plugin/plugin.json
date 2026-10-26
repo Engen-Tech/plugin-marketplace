@@ -1,10 +1,12 @@
 {
   "name": "steward-delegation",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Delegation edict for GitHub Copilot: seven pinned subagent profiles chosen by task complexity, and a gate that denies a second direct edit on the main thread.",
   "author": {
-    "name": "Tej Gandham"
+    "name": "Engen Inc.",
+    "url": "https://engen.tech"
   },
+  "homepage": "https://engen.tech",
   "repository": "https://github.com/tejgandham/steward",
   "license": "UNLICENSED",
   "keywords": [
