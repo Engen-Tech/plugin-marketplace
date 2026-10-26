@@ -39,6 +39,7 @@ package.json                      the pi package: static fields plus the pi fiel
 plugins.lock.json                 one entry per plugin
 README.md                         install lines and plugin sets
 LICENSE                           the Engen license (see "License")
+assets/                           banner, social preview and logo (step 16)
 docs/design.md                    this file
 plugins/<name>/                   shipped files only
 ```
@@ -54,7 +55,7 @@ plugins/<name>/                   shipped files only
 | `.agents/plugins/marketplace.json` | plugins with `.codex-plugin/plugin.json` (orchestration has none, as today) | `name`; `source` = `{"source":"local","path":"./plugins/<name>"}`; `category` = manifest `interface.category`; `policy` = constant `{"installation":"AVAILABLE","authentication":"ON_INSTALL"}`, as steward .agents/plugins/marketplace.json:14-17 |
 | `package.json` `pi` | plugins with pi resources | the lock's `pi` lists, each prefixed `./plugins/<name>/`; `agents` go under `subagents.agents` |
 
-Static fields come from the skeleton and no release touches them: catalog `name` `engen-tech`, `owner.name` `Engen-Tech`, the Claude catalog's `description` (added in step 1 to clear a `claude plugin validate` warning), Codex `interface.displayName` `Engen-Tech`. The `package.json` copies the shape of steward package.json:1-18,36-38 (`private`, `keywords: ["pi-package"]`, `type: module`, `peerDependencies` `@earendil-works/pi-coding-agent: "*"`), with name `engen-tech-plugins` and a fixed `version` `1.0.0` that is not a release number (same rule as plugin-split.md:217).
+Static fields come from the skeleton and no release touches them: catalog `name` `engen-tech`, `owner` (`name` `Engen Inc.`, `url` `https://engen.tech`), the Claude catalog's `description` (added in step 1 to clear a `claude plugin validate` warning; branded in step 16), Codex `interface.displayName` `Engen Inc.`, and `package.json` `author` and `homepage`. The `package.json` copies the shape of steward package.json:1-18,36-38 (`private`, `keywords: ["pi-package"]`, `type: module`, `peerDependencies` `@earendil-works/pi-coding-agent: "*"`), with name `engen-tech-plugins` and a fixed `version` `1.0.0` that is not a release number (same rule as plugin-split.md:217).
 
 ### Lock file
 
@@ -233,6 +234,19 @@ Order notes: steps 2-5 sit on one steward branch and can run in any order. Steps
 
 (operator decided) This repo carries the Engen license as `LICENSE`, taken from hatch `LICENSE` (git blob `051e6e0b78a9cbb0c77a8962288690bb28676540`) plus one paragraph saying a paid license agreement with the Owner overrides it (operator decided 2026-10-25). Manifest `license` values are `"UNLICENSED"`, as hatch .claude-plugin/plugin.json:12 has it; the skeleton `package.json` uses the same value. The steward manifests still say MIT; changing them is part of build steps 4 and 5. The plainlanguage manifests (step 12) use `"UNLICENSED"` from the start.
 
+## Results (2026-10-25)
+
+- Step 10: the three steward releases ran green, one tag at a time: GitHub Actions run ids 40248859540, 40248940233 and 40249036702, each ending in a `release: <plugin> 1.0.0` commit here.
+- Step 11: from this marketplace, every gate check passes on Claude Code, Codex and pi. Copilot is checked for install and load only: its model quota is exhausted until about 2026-10-31, so the three gate checks wait for the reset.
+- Step 14: plainlanguage 1.0.0 released through Forgejo Actions run #1, marketplace commit 945bae1. This settles the old open question: the Forgejo runner has python3 and can push to github.com.
+- Step 15: plainlanguage installs on all four harnesses. On Claude Code the steward-delegation writer preloads the full text of the skill. On pi (pi-subagents 0.31.0 and later) a preloaded skill arrives only as its name, description and path, and the subagent reads the file, so the check's "without reading" wording does not apply to pi. The pi filter strings, both checked live:
+  - prose gate only: `{"source": "git:github.com/Engen-Tech/plugin-marketplace", "extensions": ["plugins/steward-prose-gate/pi/extensions/steward-prose-gate/index.ts"], "skills": []}`
+  - everything but plainlanguage: `{"source": "git:github.com/Engen-Tech/plugin-marketplace", "skills": ["plugins/steward-delegation/pi/skills/**"]}` (the `/**` is required)
+
+  pi keeps the first skill with a given name and reads `~/.agents/skills` before packages, so a hand-deployed plainlanguage there hides the marketplace copy without a warning. Delete the old copy to use the plugin.
+- Branding (operator decided): brand name "Engen Inc.", site https://engen.tech, tagline "Software Design for the Next Generation", accent #B7364A. The logo comes from the engen-website `favicon.svg`; the operator approved the design canvas. The banner, social preview and logo live in `assets/`. The static catalog fields now read: Claude catalog `owner` `{"name": "Engen Inc.", "url": "https://engen.tech"}` and a `description` that opens with the tagline; Codex `interface.displayName` `Engen Inc.`; `package.json` `author` `Engen Inc.` and `homepage` `https://engen.tech`. The catalog `name` stays `engen-tech`. The publisher rewrites only the catalogs' `plugins` lists and the `package.json` `pi` field, so these fields survive every release.
+
 ## Open questions
 
-- Forgejo has not yet run a tag-triggered workflow for common-skills, or pushed to github.com from its runner; step 14 is the first proof.
+- Resolved 2026-10-25: Forgejo ran the tag-triggered workflow for common-skills and pushed to github.com from its runner (step 14 above).
+- Resolved 2026-10-25: the license is the Engen license with the paid-agreement paragraph (see "License").
