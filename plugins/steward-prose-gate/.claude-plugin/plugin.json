@@ -1,10 +1,13 @@
 {
   "name": "steward-prose-gate",
+  "displayName": "Steward Prose Gate",
   "description": "Blocks a reply or a gh pr create/edit body that reads like AI-generated text, and asks for a plain-language revision.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": {
-    "name": "Tej Gandham"
+    "name": "Engen Inc.",
+    "url": "https://engen.tech"
   },
+  "homepage": "https://engen.tech",
   "repository": "https://github.com/tejgandham/steward",
   "license": "UNLICENSED",
   "keywords": [

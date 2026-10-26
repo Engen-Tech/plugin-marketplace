@@ -1,9 +1,10 @@
 {
   "name": "steward-prose-gate",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Blocks a reply or a gh pr create/edit body that reads like AI-generated text, and asks for a plain-language revision.",
   "author": {
-    "name": "Tej Gandham"
+    "name": "Engen Inc.",
+    "url": "https://engen.tech"
   },
   "repository": "https://github.com/tejgandham/steward",
   "license": "UNLICENSED",
@@ -17,11 +18,14 @@
     "displayName": "Steward Prose Gate",
     "shortDescription": "Send back replies and PR bodies that read like AI text.",
     "longDescription": "Hooks check each reply and each gh pr create or gh pr edit body for AI-writing tells and your own banned phrases, after hook trust review.",
-    "developerName": "Tej Gandham",
+    "developerName": "Engen Inc.",
     "category": "Productivity",
     "capabilities": [
       "Read"
     ],
-    "websiteURL": "https://github.com/tejgandham/steward"
+    "websiteURL": "https://engen.tech",
+    "brandColor": "#B7364A",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/logo.png"
   }
 }
