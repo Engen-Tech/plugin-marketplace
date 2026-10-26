@@ -1,8 +1,9 @@
 {
   "name": "plainlanguage",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Plain-language writing and editing for any prose a person has to read and act on: a de-LLM pass, plain-language rules, and the ASD-STE100 controlled register.",
-  "author": { "name": "Stackhouse" },
+  "author": { "name": "Engen Inc.", "url": "https://engen.tech" },
+  "homepage": "https://engen.tech",
   "license": "UNLICENSED",
   "keywords": ["writing", "plain-language", "editing", "ste100"],
   "skills": "./skills/",
@@ -10,8 +11,12 @@
     "displayName": "Plain Language",
     "shortDescription": "Prose a reader can use on the first read",
     "longDescription": "Drafts and revises documentation, READMEs, release notes, emails and help text so they read plainly: strips AI-generated tells first, then applies plain-language rules, with the ASD-STE100 register for procedures.",
-    "developerName": "Stackhouse",
+    "developerName": "Engen Inc.",
     "category": "Productivity",
-    "capabilities": ["Read"]
+    "capabilities": ["Read"],
+    "websiteURL": "https://engen.tech",
+    "brandColor": "#B7364A",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/logo.png"
   }
 }
