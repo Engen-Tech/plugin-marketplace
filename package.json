@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "description": "Engen-Tech plugins for pi: the pi resources of the plugins under plugins/.",
+  "author": "Engen Inc.",
+  "homepage": "https://engen.tech",
   "keywords": [
     "pi-package"
   ],

@@ -1,9 +1,10 @@
 {
   "name": "engen-tech",
   "owner": {
-    "name": "Engen-Tech"
+    "name": "Engen Inc.",
+    "url": "https://engen.tech"
   },
-  "description": "Engen-Tech plugins: steward delegation, prose gate and orchestration, and plainlanguage.",
+  "description": "Software Design for the Next Generation. Plugins from Engen Inc. for Claude Code, GitHub Copilot, Codex and pi: plain-language writing, a prose gate, subagent delegation and multi-session orchestration.",
   "plugins": [
     {
       "name": "plainlanguage",
