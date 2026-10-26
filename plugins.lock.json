@@ -1,1 +1,14 @@
-{}
+{
+  "steward-prose-gate": {
+    "version": "1.0.0",
+    "source": "https://github.com/TejGandham/steward",
+    "tag": "steward-prose-gate--v1.0.0",
+    "commit": "e7cca706379c160b8c91ae90d632eef2449593b4",
+    "tree": "9aa7daffbaa3c43517fb8ff859d14d079aea0048",
+    "pi": {
+      "extensions": [
+        "pi/extensions/steward-prose-gate/index.ts"
+      ]
+    }
+  }
+}

@@ -1,0 +1,35 @@
+# AI-tell word list for the steward-prose-gate hooks.
+# One literal word or phrase per line (not a regex). Lines starting with #
+# and blank lines are skipped; surrounding whitespace is trimmed.
+# Matching is case-insensitive at word boundaries. A reply or PR body
+# with two or more distinct entries is blocked.
+delve
+delves
+delving
+leverage
+leverages
+leveraging
+crucial
+pivotal
+tapestry
+landscape
+vibrant
+showcase
+showcases
+intricate
+testament
+underscore
+underscores
+underscoring
+it's important to note
+it is important to note
+it's worth noting
+in summary
+in conclusion
+great question
+i hope this helps
+stands as
+serves as
+plays a vital role
+certainly!
+let me know if

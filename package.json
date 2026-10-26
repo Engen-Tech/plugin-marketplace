@@ -9,7 +9,9 @@
   "license": "UNLICENSED",
   "type": "module",
   "pi": {
-    "extensions": [],
+    "extensions": [
+      "./plugins/steward-prose-gate/pi/extensions/steward-prose-gate/index.ts"
+    ],
     "skills": [],
     "subagents": {
       "agents": []
