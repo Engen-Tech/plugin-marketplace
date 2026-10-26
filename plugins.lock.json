@@ -1,4 +1,22 @@
 {
+  "steward-delegation": {
+    "version": "1.0.0",
+    "source": "https://github.com/TejGandham/steward",
+    "tag": "steward-delegation--v1.0.0",
+    "commit": "e7cca706379c160b8c91ae90d632eef2449593b4",
+    "tree": "c5d1cfabb876602016b4e048d7a57b34d4086622",
+    "pi": {
+      "extensions": [
+        "pi/extensions/steward-delegation/index.ts"
+      ],
+      "skills": [
+        "pi/skills"
+      ],
+      "agents": [
+        "pi/agents"
+      ]
+    }
+  },
   "steward-prose-gate": {
     "version": "1.0.0",
     "source": "https://github.com/TejGandham/steward",

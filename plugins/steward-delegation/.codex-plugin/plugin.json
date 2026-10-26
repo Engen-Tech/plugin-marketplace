@@ -1,0 +1,32 @@
+{
+  "name": "steward-delegation",
+  "version": "1.0.0",
+  "description": "Delegate work to seven OpenAI role profiles in Codex CLI and the ChatGPT desktop app.",
+  "author": {
+    "name": "Tej Gandham"
+  },
+  "repository": "https://github.com/tejgandham/steward",
+  "license": "UNLICENSED",
+  "keywords": [
+    "delegation",
+    "subagents"
+  ],
+  "skills": "./codex/skills/",
+  "hooks": "./codex/hooks.json",
+  "interface": {
+    "displayName": "Steward Delegation",
+    "shortDescription": "Delegate by role, model, and effort.",
+    "longDescription": "Seven OpenAI role profiles for implementation, reasoning, review, research, writing, and mechanical tasks in the local Codex runtime. A session-start hook loads the delegation edict after hook trust review.",
+    "developerName": "Tej Gandham",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/tejgandham/steward",
+    "defaultPrompt": [
+      "Use Steward to delegate this work.",
+      "Use Steward to review this diff."
+    ]
+  }
+}

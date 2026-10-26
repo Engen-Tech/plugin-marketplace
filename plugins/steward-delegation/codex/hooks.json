@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{
+      "type": "command",
+      "command": "python3 \"${PLUGIN_ROOT}/hooks/delegation_hook.py\" codex session-start",
+      "timeout": 15
+    }]}]
+  }
+}

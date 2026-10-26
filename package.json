@@ -10,11 +10,16 @@
   "type": "module",
   "pi": {
     "extensions": [
+      "./plugins/steward-delegation/pi/extensions/steward-delegation/index.ts",
       "./plugins/steward-prose-gate/pi/extensions/steward-prose-gate/index.ts"
     ],
-    "skills": [],
+    "skills": [
+      "./plugins/steward-delegation/pi/skills"
+    ],
     "subagents": {
-      "agents": []
+      "agents": [
+        "./plugins/steward-delegation/pi/agents"
+      ]
     }
   },
   "peerDependencies": {

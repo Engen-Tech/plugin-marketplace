@@ -6,6 +6,11 @@
   "description": "Engen-Tech plugins: steward delegation, prose gate and orchestration, and plainlanguage.",
   "plugins": [
     {
+      "name": "steward-delegation",
+      "description": "Delegation edict for Claude Code: seven pinned subagent profiles chosen by task complexity, and a gate that denies a second direct edit on the main thread.",
+      "source": "./plugins/steward-delegation"
+    },
+    {
       "name": "steward-prose-gate",
       "description": "Blocks a reply or a gh pr create/edit body that reads like AI-generated text, and asks for a plain-language revision.",
       "source": "./plugins/steward-prose-gate"

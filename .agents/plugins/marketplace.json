@@ -5,6 +5,18 @@
   },
   "plugins": [
     {
+      "name": "steward-delegation",
+      "source": {
+        "source": "local",
+        "path": "./plugins/steward-delegation"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
       "name": "steward-prose-gate",
       "source": {
         "source": "local",
