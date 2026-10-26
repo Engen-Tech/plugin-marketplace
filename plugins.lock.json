@@ -30,11 +30,11 @@
     }
   },
   "steward-orchestration": {
-    "version": "1.0.0",
+    "version": "1.0.1",
     "source": "https://github.com/TejGandham/steward",
-    "tag": "steward-orchestration--v1.0.0",
-    "commit": "e7cca706379c160b8c91ae90d632eef2449593b4",
-    "tree": "a0eb0ebf893725561b702e34d6a058133b178eba",
+    "tag": "steward-orchestration--v1.0.1",
+    "commit": "4fdc3e381a870c6887f0b740ff6d035035c24827",
+    "tree": "853c043ed9db896cd81c7cabb87865662b2c18f2",
     "pi": {}
   },
   "steward-prose-gate": {

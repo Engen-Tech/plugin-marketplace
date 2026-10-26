@@ -1,10 +1,13 @@
 {
   "name": "steward-orchestration",
+  "displayName": "Steward Orchestration",
   "description": "Primary and secondary session roles for multi-session initiatives on Claude Code, with a shared registry of who directs whom.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": {
-    "name": "Tej Gandham"
+    "name": "Engen Inc.",
+    "url": "https://engen.tech"
   },
+  "homepage": "https://engen.tech",
   "repository": "https://github.com/tejgandham/steward",
   "license": "UNLICENSED",
   "keywords": [
