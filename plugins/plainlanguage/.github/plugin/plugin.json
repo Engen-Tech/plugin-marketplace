@@ -1,7 +1,7 @@
 {
   "name": "plainlanguage",
-  "version": "1.0.1",
-  "description": "Plain-language writing and editing for any prose a person has to read and act on: a de-LLM pass, plain-language rules, and the ASD-STE100 controlled register.",
+  "version": "1.1.0",
+  "description": "Plain-language writing and editing for any prose a person has to read and act on: plain-language rules and the ASD-STE100 controlled register.",
   "author": {
     "name": "Engen Inc.",
     "url": "https://engen.tech"

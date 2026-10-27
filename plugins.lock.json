@@ -1,10 +1,10 @@
 {
   "plainlanguage": {
-    "version": "1.0.1",
+    "version": "1.1.0",
     "source": "https://brahma.myth-gecko.ts.net:3000/stackhouse/common-skills",
-    "tag": "plainlanguage--v1.0.1",
-    "commit": "9dc01afd4c546dce030822dc4c837ccd813c15ae",
-    "tree": "75c1009e6fa56ab88bb28e11c18a0b86e5a3f714",
+    "tag": "plainlanguage--v1.1.0",
+    "commit": "77de475f039a13c1c3ae43df8605842386f8594d",
+    "tree": "edce437df357e0e104cf98fc1a357a19332fb11e",
     "pi": {
       "skills": [
         "skills"

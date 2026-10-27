@@ -1,32 +1,15 @@
 ---
 name: plainlanguage
-description: Write or revise prose so a real reader can use it on the first read. Apply this whenever drafting or editing user-facing writing — documentation, READMEs, guides, announcements, emails, policies, regulations, release notes, help text, user-facing error messages, public-facing copy, or any message someone has to act on. Also apply when the user says "make this clearer," "simplify this," "rewrite in plain English," "less jargon," "tighten this up," asks for an edit pass on existing prose, or wants text to read less like AI/LLM output — "remove the AI tells," "de-slop this," "make it sound human-written," "less ChatGPT-sounding." Skip for code, code comments, commit messages, internal log lines, and machine-facing error strings — those follow different conventions.
+description: Write or revise prose so a real reader can use it on the first read. Apply this whenever drafting or editing user-facing writing — documentation, READMEs, guides, announcements, emails, policies, regulations, release notes, help text, user-facing error messages, public-facing copy, or any message someone has to act on. Also apply when the user says "make this clearer," "simplify this," "rewrite in plain English," "less jargon," "tighten this up," or asks for an edit pass on existing prose. Skip for code, code comments, commit messages, internal log lines, and machine-facing error strings — those follow different conventions.
 ---
 
 # Plain Language
 
 Adapted from the U.S. federal Plain Language guidance (digital.gov) and the Plain Writing Act of 2010. The goal of plain language is not "dumbed-down" writing — it's writing that a specific reader can act on without rereading.
 
-**The goal is reader usefulness, not the absence of AI fingerprints.** Use the de-LLM catalog to remove noise, then stop — before the text becomes strange, over-formal, or performatively human. A text can be clear, useful, and human-sounding without looking like it was never near a model.
+## Decide the reader first
 
-## Pick the job first
-
-Three different requests hide behind "fix this writing." Decide which one you were handed before touching anything:
-
-| Job | Trigger | What you do |
-|-|-|-|
-| **Clarify** | "make this clearer," "simplify," "less jargon," "rewrite for X audience" | Phase 2 only. Restructure freely. |
-| **De-slop** | "remove the AI tells," "de-slop this," "sound less like ChatGPT" | Phase 1 only. Keep the document's architecture. |
-| **Both** | AI-generated draft handed over for a real rewrite; no constraint stated | Phase 1, then Phase 2. |
-
-A de-slop request is not a licence to reorganize the document, and a clarify request is not a licence to hunt for tells. When the ask is ambiguous, do **Both** and say so in one line.
-
-Two senses of "structure" collide here, so be precise about which one a de-slop pass may touch:
-
-- **Document architecture** — section order, headings, what lives where, what the piece argues. A de-slop pass leaves this alone. Only **Clarify** and **Both** may move it.
-- **Prose structure** — sentence rhythm, paragraph weighting, triads, hedging, fragments. This is category 0 of the catalog and it *is* the de-slop pass. Fixing it is the job, not scope creep.
-
-Then decide the reader:
+Before touching anything, decide the reader:
 
 - Who is this for, and what do they already know?
 - What must they do after reading?
@@ -42,46 +25,20 @@ When two rules in this skill collide, the higher item wins:
 2. **Reader action.** What the reader must do, and when.
 3. **Structure.** Can a reader find the part that applies to them?
 4. **Word choice.** Plain words, active voice, no jargon that isn't earning its place.
-5. **AI-tic removal.** Vocabulary, rhythm, fragments, hedging.
-6. **Rhythm and voice.** Variance, emphasis, personality.
+5. **Rhythm and voice.** Variance, emphasis, personality.
 
 **If an edit makes the reader less able to act, don't make it.** That single test resolves most of the conflicts below.
 
 ## Do not overcorrect
 
-The failure mode of this skill is a text that has been scrubbed until it reads like nobody wrote it. Do not:
+The failure mode of this skill is a text that has been simplified until it reads like nobody wrote it. Do not:
 
-- Replace every em dash, or every triad, or every hedge — calibrate on density and function.
-- Force sentences to different lengths when the meaning wants uniform ones.
-- Add casual language, contractions, anecdotes, or sensory detail to sound human. Invented voice is a worse tell than the one you removed.
 - Turn a policy into a blog post, or formal register into chattiness.
 - Add facts, causes, or context that were not in the source.
 - Delete a caveat that carries legal, safety, or operational meaning.
 - Flatten a text past what the material justifies.
 
-**If a pattern is just the writer's voice, leave it alone.** Frequency and function decide, not presence.
-
-## Two passes: de-LLM, then plain language
-
-For the **Both** job, run these in order:
-
-1. **Phase 1 — De-LLM.** Strip the tics of AI-generated writing. Start with *structure* — sentence-length uniformity, rhetorical triads, blanket hedging, evenly-weighted paragraphs — then the lexical tells. This removes *noise*.
-2. **Phase 2 — Plain language.** Everything from "The one rule" down. This adds *signal* — reader focus, the bottom line up front, active voice, scannable structure.
-
-Phase 1 first. A de-LLM'd draft is shorter and more honest, which makes the Phase 2 decisions easier. Running Phase 2 on slop just polishes the slop.
-
-Four seams where the passes appear to disagree:
-
-- **Sentence length.** Phase 1 rejoins fragments split for drama ("It works. Every time." → "It works every time."); Phase 2 breaks genuinely overstuffed sentences. Rejoin first, then split what's still too long.
-- **Sentence *variance*.** Applied mechanically, Phase 2's "break long sentences" produces a page of uniform medium-length sentences — itself the strongest structural AI tell. Break the overstuffed ones, then check the spread. Leave the short ones short.
-- **Em dashes.** Phase 1 trims em dashes used for false drama; plain language still uses one for an ordinary aside. Calibrate on density, not presence.
-- **Formatting.** Phase 2 pushes toward tables, lists, subheads. Phase 1 warns against over-formatting and evenly-weighted sections. Both are right: structure what the reader must navigate, but don't pad every item to the same wordcount. Real emphasis is uneven.
-
-### Phase 1 in brief
-
-**[de-llm.md](de-llm.md) is the source of truth for the catalog.** Read it for anything more than a quick pass — every list, every calibration rule, and the overcorrection guardrails live there.
-
-Priority order: **structure first** (sentence-length uniformity, rhetorical triads, hedging on every claim, evenly-weighted sections, abstraction where a concrete case belongs, sentences that restate the point just made), then **hard evidence** (chat leakage: "Great question!", "I hope this helps!"), then **vocabulary and formatting** (delve, leverage, crucial, foster, showcase, testament, underscore; the "quiet" family; significance claims; hollow *-ing* tails; copula avoidance; dramatic fragments; title-case headings). Surface edits alone move AI-detection by about a point — a text can pass every word list and still read as generated.
+**If a choice is just the writer's voice and the reader can still act, leave it alone.**
 
 ## The one rule
 
@@ -172,7 +129,7 @@ Inflated formal vocabulary is the #1 jargon source after technical terms.
 | if | in the event that |
 | to | in order to |
 
-Exception: `must / should / may / cannot` are load-bearing — see "High-stakes writing" below. Never swap one for another while simplifying.
+Exception: `must / should / may / cannot` are binding. See "High-stakes writing" below. Never swap one for another while simplifying.
 
 ### Stay consistent
 
@@ -221,9 +178,8 @@ Different documents fail differently. Common ones:
 | Release notes | What changed, who's affected, what to do |
 | Announcement | Persuasive tone kept; unsupported claims cut |
 | Legal notice | Clarify wording and structure; never touch obligations |
-| AI-generated essay | Fix structure first, then vocabulary |
 | User-facing error message | Say what happened and what to do next |
-| Marketing copy | Preserve voice unless asked; remove obvious AI tics only |
+| Marketing copy | Preserve voice unless asked |
 
 ## Controlled register (STE100)
 
@@ -231,7 +187,7 @@ When the document is one a stranger has to execute without asking anyone, and th
 
 [ste100.md](ste100.md) carries the rules, the limits, and the approved words. The three that change output most: 20-word instruction sentences and 25-word descriptive ones; one instruction per sentence, in the imperative; no semicolons, contractions, or dropped articles. Safety writing has its own structure: warning for injury or death, caution for equipment damage, note for information only.
 
-The register is stricter than this skill and chooses plainer, more repetitive wording on purpose, so inside a register passage it overrides the de-LLM preference for rhythm variance. It never overrides "What to protect": facts, obligations, and safety levels stay exactly as the source gives them, and no step, condition, or warning is dropped to make a word count.
+The register is stricter than this skill and chooses plainer, more repetitive wording on purpose, so inside a register passage it overrides this skill's preference for rhythm variance. It never overrides "What to protect": facts, obligations, and safety levels stay exactly as the source gives them, and no step, condition, or warning is dropped to make a word count.
 
 ## When you're given existing prose to revise
 
@@ -242,8 +198,8 @@ Work in this order — largest improvement for the least effort:
 3. **Cut filler.** One pass for modifiers, one for doublets, one for whole sentences that don't earn their place.
 4. **Swap jargon for everyday words** where the meaning survives the swap.
 5. **Convert to active voice and second person** where appropriate.
-6. **Break long sentences** at natural seams. A sentence with three commas and an *and* is usually two sentences.
-7. **Add subheads or a list** if the reader has to navigate a wall of text.
+6. **Break long sentences** at natural seams. A sentence with three commas and an *and* is usually two sentences. Leave the short ones short; a page of uniform medium-length sentences is hard to read too.
+7. **Add subheads or a list** if the reader has to navigate a wall of text. Do not pad every item to the same length; real emphasis is uneven.
 8. **Read it aloud, or whisper it.** Sentences that are hard to say are hard to read.
 
 ### The reverse check
@@ -273,8 +229,6 @@ Example:
 > - Cut "It is important to note that."
 > - Kept the denial condition and the *must*.
 
-For a de-slop-only job, one line is enough: "Removed the chat-adjacent opener, cut two hedges, rejoined three dramatic fragments. Structure untouched."
-
 ## Red flags to scan for in your own draft
 
 - **Empty openers**: *"It is important to note that…", "There are several reasons why…"* — cut and start with the point.
@@ -287,8 +241,6 @@ For a de-slop-only job, one line is enough: "Removed the chat-adjacent opener, c
 
 ## A short checklist before shipping
 
-Items marked *(Phase 1)* apply to the De-slop and Both jobs; skip them on a pure Clarify pass.
-
 - [ ] Every fact, number, date, obligation, and exception from the source survived — with its modal intact.
 - [ ] Nothing was added that wasn't in the source, or additions are flagged.
 - [ ] A new reader can tell, from the first screen, what this is and what to do with it.
@@ -300,8 +252,6 @@ Items marked *(Phase 1)* apply to the De-slop and Both jobs; skip them on a pure
 - [ ] Long lists or steps are formatted as lists.
 - [ ] In a controlled-register passage, the STE limits and approved words in [ste100.md](ste100.md) hold.
 - [ ] Same concept = same word throughout.
-- [ ] Sentence lengths are uneven where the meaning allows (Phase 1).
-- [ ] AI tells that actually fired are gone; ones that were just the writer's voice are still there (Phase 1; see [de-llm.md](de-llm.md)).
 
 The standard, in one line: **a reader from the intended audience can read it once and act.**
 
@@ -312,6 +262,6 @@ The standard, in one line: **a reader from the intended audience can read it onc
 - Literary or expressive writing.
 - Internal logs, telemetry, and error strings meant for machines.
 
-Marketing copy is a partial case: voice and persuasion carry the work, so preserve them unless asked otherwise, and limit yourself to removing obvious AI tics.
+Marketing copy is a partial case: voice and persuasion carry the work, so preserve them unless asked otherwise.
 
 If the user is writing one of the excluded genres, say you noticed and ask whether they still want a pass.

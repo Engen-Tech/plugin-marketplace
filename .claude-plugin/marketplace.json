@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "plainlanguage",
-      "description": "Plain-language writing and editing for any prose a person has to read and act on: a de-LLM pass that strips generated-text tells, plain-language rules, and the ASD-STE100 controlled register for procedures and runbooks.",
+      "description": "Plain-language writing and editing for any prose a person has to read and act on: plain-language rules and the ASD-STE100 controlled register for procedures and runbooks.",
       "source": "./plugins/plainlanguage"
     },
     {
