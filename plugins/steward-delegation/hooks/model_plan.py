@@ -101,7 +101,7 @@ empty roles and a single ``facts-invalid`` or ``internal-error`` finding, so
 session start can fail open.
 
 Sources mirrored (pi 1.1.0 at PI=.../releases/1.1.0/node_modules, and
-pi-subagents 0.77.0 at PS=~/.pi/agent/npm/node_modules/pi-subagents) are
+pi-subagents 0.83.0 at PS=~/.pi/agent/npm/node_modules/pi-subagents) are
 cited beside the code that mirrors them.
 """
 
@@ -170,7 +170,7 @@ BY_MAIN_FIELDS = {"model", "thinking"}
 
 DEFAULT_AGENTS_DIR = Path(__file__).resolve().parent.parent / "pi" / "agents"
 
-# Agent discovery (PS/src/agents/agents.js:1611-1621,1688-1758).
+# Agent discovery (PS/src/agents/agents.js:1627-1637,1704-1774).
 DISCOVERY_PRUNED_DIR_NAMES = {".git", "node_modules", ".pi", "sync-backups"}
 MAX_DISCOVERY_FILES = 5000
 
@@ -311,7 +311,7 @@ def _resolve_base(base, available, preferred):
 
 def resolve_subagent_model(model, available, preferred):
     """resolveSubagentModelCandidate (model-resolution.js:212-220), matching
-    only `getAvailable()` models (PS/src/runs/foreground/subagent-executor.js:1039).
+    only `getAvailable()` models (PS/src/runs/foreground/subagent-executor.js:1075).
     Returns the resolved `provider/id[:level]`, or None when pi-subagents
     would pass the raw string through to the child."""
     if not available:
@@ -329,7 +329,7 @@ def resolve_subagent_model(model, available, preferred):
 
 def agent_dir_from_env(env):
     """$PI_CODING_AGENT_DIR or ~/.pi/agent. Same result as pi-subagents
-    getAgentDir (PS/src/shared/utils.js:80-87). Inlined so the delegation
+    getAgentDir (PS/src/shared/utils.js:81-88). Inlined so the delegation
     hook (hooks/delegation_hook.py) can import this module without a cycle."""
     home = env.get("HOME") or os.path.expanduser("~")
     value = env.get("PI_CODING_AGENT_DIR")
@@ -352,7 +352,7 @@ def _home_dirs(env):
 
 def _walk_up(cwd, env):
     """Directories from cwd upward; the home directory ends the walk and is
-    not included (PS/src/agents/agents.js:573-652)."""
+    not included (PS/src/agents/agents.js:582-661)."""
     homes = _home_dirs(env)
     current = os.path.abspath(cwd)
     while True:
@@ -367,7 +367,7 @@ def _walk_up(cwd, env):
 
 def find_project_root(cwd, env):
     """Mirror pi-subagents findConfiguredProjectRoot
-    (PS/src/agents/agents.js:573-652): walk up from cwd; a directory with
+    (PS/src/agents/agents.js:582-661): walk up from cwd; a directory with
     `.pi` or `.agents` is a candidate; the home directory is never a project
     and ends the walk; `subagents.projectRootResolution` ("nearest" or
     "git-root") in a candidate's .pi/settings.json picks between them."""
@@ -586,6 +586,8 @@ _JS_NON_WS_RE = re.compile("[^%s]" % _JS_WS)
 _JS_LINE_START = "(?:\\A|(?<=[\n\r\u2028\u2029]))"
 _FM_KEY_RE = re.compile("^([A-Za-z0-9_-]+):[%s]*([^\n\r\u2028\u2029]*)\\Z" % _JS_WS)
 _FM_INDENT_RE = re.compile(_JS_LINE_START + "[ \t]+(?=[^%s])" % _JS_WS)
+# Keys whose quoted value may be a list of quoted names (PS/src/agents/frontmatter.js:129).
+_FM_NAME_LIST_KEYS = ("tools", "excludeTools", "mutationTools", "extensions", "subagentOnlyExtensions")
 # pi-subagents IDENTIFIER_PATTERN (PS/src/agents/identity.js:1).
 PACKAGE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*\Z")
 
@@ -615,7 +617,7 @@ def _fold_block(block):
 
 
 def parse_frontmatter(content):
-    """Mirror pi-subagents parseFrontmatter (PS/src/agents/frontmatter.js:62-140):
+    """Mirror pi-subagents parseFrontmatter (PS/src/agents/frontmatter.js:75-161):
     `key: value` lines at column 0, quotes stripped, and block values (an
     empty value, `|`, `|-`, `>` or `>-` followed by more-indented lines)
     joined with their common indent removed, folded for `>`."""
@@ -645,6 +647,10 @@ def parse_frontmatter(content):
         first = _JS_NON_WS_RE.search(line)
         indent = first.start() if first else len(line)
         trimmed = _js_trim(line)
+        # Comment lines are content only inside a | or > block scalar; elsewhere
+        # they neither end a pending block nor join its value.
+        if trimmed.startswith("#") and not state["folded"] and not state["literal"]:
+            continue
         if state["key"] is not None and state["lines"] is not None and (
                 indent > (state["indent"] or 0) or ((state["folded"] or state["literal"]) and trimmed == "")):
             state["lines"].append(line)
@@ -655,8 +661,11 @@ def parse_frontmatter(content):
         if not match:
             continue
         key, raw_value = match.group(1), _js_trim(match.group(2))
-        quoted = (raw_value.startswith('"') and raw_value.endswith('"')) or (
-            raw_value.startswith("'") and raw_value.endswith("'"))
+        quote = raw_value[:1]
+        # `"read", "bash"` on a name-list key is a list: its item quotes stay.
+        quoted_list = key in _FM_NAME_LIST_KEYS and quote in ('"', "'") and (
+            quote + "," in raw_value or ", " + quote in raw_value)
+        quoted = not quoted_list and quote in ('"', "'") and raw_value.endswith(quote)
         value = raw_value[1:-1] if quoted else raw_value
         is_folded = not quoted and raw_value in (">", ">-")
         is_literal = not quoted and raw_value in ("|", "|-")
@@ -1448,17 +1457,17 @@ def _resolve_settings_model(ctx, value, preferred):
 def _effective_binding(ctx, role, frontmatter, fm_path, layers):
     """The binding pi-subagents will launch steward.<role> with.
 
-    Order mirrored from PS 0.77.0: defaults are applied to agents that lack
-    the field (applySubagentDefaults, PS/src/agents/agents.js:1179-1181;
-    defaultModel and defaultProvider :1085-1114, defaultThinking :1115-1132),
+    Order mirrored from PS 0.83.0: defaults are applied to agents that lack
+    the field (applySubagentDefaults, PS/src/agents/agents.js:1195-1197;
+    defaultModel and defaultProvider :1101-1130, defaultThinking :1131-1148),
     then the user override, then the project override, field by field
-    (applyCustomAgentOverrides, :1374-1387, "Apply user then project so
+    (applyCustomAgentOverrides, :1390-1403, "Apply user then project so
     project fields win"). Inside one settings file the provider-scoped entry
     for the parent provider layers over the plain agentOverrides entry
-    (selectProviderOverrides, :1073-1084, called at :2511,2516). `false`
-    clears a field (applyBuiltinOverride, :1237-1257). The agent's
+    (selectProviderOverrides, :1089-1100, called at :2527,2532). `false`
+    clears a field (applyBuiltinOverride, :1253-1273). The agent's
     modelProvider, else the parent provider, is the preferred provider for a
-    bare or fuzzy id (subagent-executor.js:2775,3114). An absent model or
+    bare or fuzzy id (subagent-executor.js:2843,3182). An absent model or
     "inherit" means the parent session model
     (PS/src/runs/shared/model-resolution.js:296-331)."""
     name = "steward." + role
@@ -1681,8 +1690,8 @@ def _check_latent_settings(ctx, layers):
 
 def _agent_scan_dirs(agent_dir, env, cwd, project_root, settings_paths):
     """The user and project agent directories pi-subagents scans
-    (buildAgentDiscoverySources, PS/src/agents/agents.js:2385-2414;
-    expandAgentScanDirPattern :2253-2282)."""
+    (buildAgentDiscoverySources, PS/src/agents/agents.js:2401-2430;
+    expandAgentScanDirPattern :2269-2298)."""
     home = env.get("HOME") or os.path.expanduser("~")
     dirs = []
     extra = env.get("PI_SUBAGENT_EXTRA_AGENT_DIRS")
@@ -1767,7 +1776,7 @@ def _agent_files(root, limit=None):
 def _check_shadowing(ctx, agent_dir, env, cwd, project_root, settings_paths, package_dir):
     """A user or project agent whose runtime name is steward.<role> replaces
     the package profile (mergeAgentsForScope, PS/src/agents/agent-selection.js:1-21).
-    Mirrors loadAgentsFromDefinitionFiles (PS/src/agents/agents.js:1891-1910):
+    Mirrors loadAgentsFromDefinitionFiles (PS/src/agents/agents.js:1907-1926):
     frontmatter parsed as parseFrontmatter does, name and description
     required, `package` normalised by normalizePackageName and checked with
     IDENTIFIER_PATTERN (an invalid package makes pi-subagents skip the file),
@@ -1899,7 +1908,7 @@ def _evaluate(facts, env, agent_dir, agents_dir):
     models = _clean_models(facts["models"], findings)
 
     # Project root as pi-subagents finds it; an untrusted project
-    # contributes nothing (PS/src/agents/agents.js:2385-2396).
+    # contributes nothing (PS/src/agents/agents.js:2401-2412).
     project_root = find_project_root(cwd, env) if trusted else None
 
     # ---- plans
@@ -1968,7 +1977,7 @@ def _evaluate(facts, env, agent_dir, agents_dir):
                                  "longer applied; move it to \"steward.%s\"." % (prov, key, STALE_KEYS[key]), path)
 
     # Project modelScope replaces the user one; maxThinking project wins
-    # (PS/src/agents/agents.js:1133-1137,2563; PS/docs/models.md "Model scope enforcement").
+    # (PS/src/agents/agents.js:1149-1153,2579; PS/docs/models.md "Model scope enforcement").
     if project_found and project_sub.get("modelScope") is not None:
         scope, scope_src = project_sub.get("modelScope"), project_found
     else:

@@ -64,7 +64,7 @@ nothing and makes no backup. The profile file gets the same temp-file and
 rename, a backup when it exists and changes, and pi-subagents' own style
 (``JSON.stringify(value, null, 2) + "\\n"``, PS/src/profiles/profiles.js:18-21).
 
-Sources (pi 1.1.0, pi-subagents 0.77.0): pi settings writes,
+Sources (pi 1.1.0, pi-subagents 0.83.0): pi settings writes,
 PI/dist/core/settings-manager.js:126-171,450-471; pi-subagents profile
 format and load, PS/src/profiles/profiles.js:39-71,359-386; leases,
 PS/src/shared/file-lease.js and settings-file-lease.js.
@@ -457,10 +457,10 @@ def build_settings(data, targets, findings):
 
 
 def profile_entry_problem(value):
-    """Why pi-subagents 0.77.0 would reject this agentOverrides entry in a
+    """Why pi-subagents 0.83.0 would reject this agentOverrides entry in a
     profile, or None. Mirrors validateSubagentProfile and
     validateOptionalMachine (PS/src/profiles/profiles.js:39-65,
-    PS/src/agents/agents.js:743-754); settings accept more (model: false)."""
+    PS/src/agents/agents.js:752-763); settings accept more (model: false)."""
     if not isinstance(value, dict):
         return "expected an object"
     model = value.get("model")
@@ -586,7 +586,7 @@ class _Locks:
             return True
         except OSError:
             return False
-        # pi-subagents 0.77.0 src/shared/file-lease.js:64-65: the moved lease
+        # pi-subagents 0.83.0 src/shared/file-lease.js:64-65: the moved lease
         # must still be the dead owner's; otherwise a live holder's lease was
         # moved in between the read and the rename.
         moved = _read_owner(retired)

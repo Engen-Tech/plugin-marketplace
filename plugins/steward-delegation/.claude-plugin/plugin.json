@@ -2,7 +2,7 @@
   "name": "steward-delegation",
   "displayName": "Steward Delegation",
   "description": "Delegation edict for Claude Code: seven pinned subagent profiles chosen by task complexity, and a gate that denies a second direct edit on the main thread.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": {
     "name": "Engen Inc.",
     "url": "https://engen.tech"

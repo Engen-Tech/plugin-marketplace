@@ -150,7 +150,7 @@ On [pi](https://pi.dev) you get the same edict, the same seven profiles and the 
 
 - pi 1.0 or newer (`pi --version`).
 - `python3` on your PATH. The extension runs the same hook script as the other harnesses, `hooks/delegation_hook.py`. To use another interpreter, set `STEWARD_DELEGATION_PYTHON`. If the interpreter cannot be found, the extension shows a warning, and the edict and the gate are off for that session.
-- pi-subagents. Install it with `pi install npm:pi-subagents` before steward, and `pi update` keeps it current. Steward was tested live on 2026-10-25 with pi 1.4.0 and pi-subagents 0.82.1. Steward's pi-subagents mirror tests still pin 0.78.0, so two version tests fail against 0.82.1 (follow-up). pi-subagents ships new versions every few days, so if an update breaks delegation, hold it at a known version with `pi install npm:pi-subagents@0.78.0`.
+- pi-subagents. Install it with `pi install npm:pi-subagents` before steward, and `pi update` keeps it current. Steward was tested live on 2026-10-25 with pi 1.4.0 and pi-subagents 0.82.1. Steward's pi-subagents mirror was checked against 0.83.0, and its tests pin that version. pi-subagents ships new versions every few days, so if an update breaks delegation, hold it at a known version with `pi install npm:pi-subagents@0.83.0`.
 - The `plainlanguage` skill, in `~/.agents/skills/plainlanguage/` or `~/.pi/agent/skills/plainlanguage/` (recommended).
 - Optional: an `update-pr-summary` prompt template at `~/.pi/agent/prompts/update-pr-summary.md`. If it is there, the edict uses it to draft PR bodies.
 

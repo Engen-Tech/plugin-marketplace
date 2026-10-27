@@ -149,8 +149,8 @@ export function runHook(
 
 /**
  * True when a `subagent` call starts work, so it counts as a delegation: a direct child
- * (`agent`), top-level parallel `tasks` or a `chain` (pi-subagents 0.77.0
- * `src/extension/schemas.js:278-280`), a workflow, or `action: "resume"` of a retained child.
+ * (`agent`), top-level parallel `tasks` or a `chain` (pi-subagents 0.83.0
+ * `src/extension/schemas.js:279-281`), a workflow, or `action: "resume"` of a retained child.
  * Other management calls
  * (`action: "list"`, `"status"`, `"guide"`, ...) and the `subagents_enable` loader do not.
  */
@@ -251,7 +251,7 @@ const SUBAGENT_NOT_ACTIVE_WARNING =
 /** Rotate the outcome log to `<file>.<stamp>-<pid>` when it grows past this size. */
 export const DELEGATION_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const DELEGATION_LOG_NAME = "pi-delegations.jsonl";
-/** pi-subagents 0.77.0 events (`PS/src/shared/types.js:11,15`). */
+/** pi-subagents 0.83.0 events (`PS/src/shared/types.js:11,15`). */
 const ASYNC_STARTED_EVENT = "subagent:async-started";
 const ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -744,7 +744,7 @@ function register(
 
 	/**
 	 * Where a launch runs by its input: the top-level `cwd` against the session directory, then a
-	 * per-item `cwd` against that, as pi-subagents 0.78.0 resolves them (src/shared/utils.js:110,
+	 * per-item `cwd` against that, as pi-subagents 0.83.0 resolves them (src/shared/utils.js:111,
 	 * src/runs/shared/child-launch-plan.js:70). Undefined when nothing anchors a relative path.
 	 */
 	function inputCwd(input: Record<string, any>, item?: Record<string, any>): string | undefined {
@@ -763,8 +763,8 @@ function register(
 	/**
 	 * The launch's items in the order pi-subagents numbers its result rows: `tasks` as given, or
 	 * `chain` with each parallel group's tasks in place and a dynamic group as one slot
-	 * (pi-subagents 0.78.0 src/runs/background/async-execution.js:1451-1467). A group's `machine`
-	 * passes to its tasks (async-execution.js:1116). Undefined for a single launch.
+	 * (pi-subagents 0.83.0 src/runs/background/async-execution.js:1455-1471). A group's `machine`
+	 * passes to its tasks (async-execution.js:1117). Undefined for a single launch.
 	 */
 	function flatItems(input: Record<string, any>): (Record<string, any> | undefined)[] | undefined {
 		if (Array.isArray(input.tasks)) return input.tasks.map((t: unknown) => (isObject(t) ? t : undefined));
@@ -781,7 +781,7 @@ function register(
 
 	/**
 	 * Where a launch item runs. With a `machine` its `cwd` is the directory on that machine
-	 * (pi-subagents 0.78.0 src/extension/schemas.js:229, subagent-executor.js:6193), so the
+	 * (pi-subagents 0.83.0 src/extension/schemas.js:230, subagent-executor.js:6389-6395), so the
 	 * local directory logged is the session's and `remote` names the machine.
 	 */
 	function placeOf(input: Record<string, any>, item?: Record<string, any>): { cwd?: string; ownCwd?: string; remote: string | null } {
@@ -882,11 +882,11 @@ function register(
 					const index = Number.isInteger(row.index) ? row.index : i;
 					const task = steps ? steps[index] : undefined;
 					const param = typeof task?.model === "string" && task.model ? task.model : modelParam;
-					// Sync results carry no cwd (pi-subagents 0.78.0 SingleResult, src/shared/types.d.ts:1127).
+					// Sync results carry no cwd (pi-subagents 0.83.0 SingleResult, src/shared/types.d.ts:1133).
 					const { cwd, remote } = placeOf(input, task);
 					// Not finished: a detached child keeps running and an interrupted one waits for
-					// the next action (pi-subagents 0.77.0 src/runs/foreground/execution.js:503,1407,
-					// subagent-executor.js:3951-3968); a stop without an error is the same. The real
+					// the next action (pi-subagents 0.83.0 src/runs/foreground/execution.js:519,1467,
+					// subagent-executor.js:4042-4063); a stop without an error is the same. The real
 					// outcome arrives later under the same run id, so keep the launch-time record.
 					if (row.detached || row.interrupted || (row.stopped && !row.error)) {
 						const runId = typeof details.runId === "string" ? details.runId : undefined;
@@ -938,8 +938,8 @@ function register(
 		try {
 			const d = data as Record<string, any> | null;
 			if (d && typeof d.id === "string" && !started.has(d.id)) remember(started, d.id, Date.now());
-			// pi-subagents 0.78.0 reports the resolved run directory here (src/runs/background/
-			// async-execution.js:1520,2105; workflows src/runs/foreground/subagent-executor.js:5219).
+			// pi-subagents 0.83.0 reports the resolved run directory here (src/runs/background/
+			// async-execution.js:1524,2115; workflows src/runs/foreground/subagent-executor.js:5379).
 			const cwd = d ? reportedCwd(d.cwd) : undefined;
 			if (d && typeof d.id === "string" && cwd && !startedCwd.has(d.id)) remember(startedCwd, d.id, cwd);
 		} catch {
@@ -960,8 +960,8 @@ function register(
 				return;
 			}
 			// The completion spreads the run's result file, which records its directory as `cwd`
-			// (pi-subagents 0.78.0 src/runs/background/result-watcher.js:525 over
-			// src/runs/background/subagent-runner.js:4783; workflows subagent-executor.js:5830,5892).
+			// (pi-subagents 0.83.0 src/runs/background/result-watcher.js:548 over
+			// src/runs/background/subagent-runner.js:4800; workflows subagent-executor.js:6014,6076).
 			const runCwd = startedCwd.get(id) ?? reportedCwd(d.cwd) ?? asyncLaunches.get(id)?.cwd;
 			const rows: Record<string, any>[] = Array.isArray(d.results) ? d.results.filter((r: unknown) => r && typeof r === "object") : [];
 			const children = d.workflowChildren?.children;
@@ -997,7 +997,7 @@ function register(
 			list.forEach((row, i) => {
 				const ok = row.success !== false && d.success !== false && !row.error;
 				const index = Number.isInteger(row.index) ? row.index : i;
-				// The reported run directory is the top-level one only (async-execution.js:1520); an
+				// The reported run directory is the top-level one only (async-execution.js:1524); an
 				// item with its own cwd resolves that against it (child-launch-plan.js:70).
 				const item = launch?.items?.[index];
 				const remote = item ? item.remote : (launch?.remote ?? null);

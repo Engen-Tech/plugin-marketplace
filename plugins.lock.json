@@ -12,11 +12,11 @@
     }
   },
   "steward-delegation": {
-    "version": "1.0.1",
+    "version": "1.0.2",
     "source": "https://github.com/TejGandham/steward",
-    "tag": "steward-delegation--v1.0.1",
-    "commit": "4fdc3e381a870c6887f0b740ff6d035035c24827",
-    "tree": "c74a26c42ef40ca2f76bf3cfe2c32e4c4912f01f",
+    "tag": "steward-delegation--v1.0.2",
+    "commit": "9dc46b60ad9d9c22cb41981745d14814efebf135",
+    "tree": "791b64b37642c7309f3b05f5f46c8f5518ad9839",
     "pi": {
       "extensions": [
         "pi/extensions/steward-delegation/index.ts"
