@@ -1,0 +1,29 @@
+{
+  "slug": "note-tags-new",
+  "title": "Tag editor component",
+  "summary": "Build a self-contained tag editor that people can drop into a note, without wiring it into the app yet — so it ships green on its own.",
+  "motivation": "Add a self-contained NoteTagEditor component for editing a note's tags. Stage 1 of 3 (new then edit then delete): introduces the new component without wiring it into the app, so it lands green on its own.",
+  "scope": {
+    "included": ["NoteTagEditor component", "frontend tag-normalization helper"],
+    "excluded": ["wiring NoteTagEditor into AppShell", "removing legacy tag code"]
+  },
+  "sme": ["minimalism", "vue"],
+  "work_items": [
+    {
+      "id": "tag-editor-component",
+      "title": "Tag editor component",
+      "summary": "Build the tag editor and a helper that cleans up tag text — lowercase it, trim it, and drop duplicates.",
+      "estimate": "M",
+      "touches": ["src/components/NoteTagEditor.vue", "src/lib/normalizeTags.ts"],
+      "contract": "exports <NoteTagEditor v-model:tags> and normalizeTags(input: string[]): string[]",
+      "oracle": {
+        "type": "unit",
+        "assertions": [
+          "NoteTagEditor renders the tags passed to it",
+          "normalizeTags lowercases, trims, and de-duplicates its input"
+        ],
+        "command": "npm run lint && npm test"
+      }
+    }
+  ]
+}

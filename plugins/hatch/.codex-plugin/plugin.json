@@ -1,0 +1,43 @@
+{
+  "name": "hatch",
+  "version": "2.43.1",
+  "description": "Stack-agnostic, ad-hoc orchestration framework. hatch synthesizes a binder of work items (hatch-plan) and delivers it in parallel waves onto a per-binder integration branch (hatch-deliver), building each item in an isolated git worktree (hatch-build) and verifying it against its own acceptance check \u2014 behavioral (hatch-verify) or visual (hatch-validate). Works across stacks (frontend, backend, CLI, data, IaC, \u2026) while keeping deep frontend support: component/icon/token mapping, DTCG conformance, and a design-validation loop.",
+  "author": {
+    "name": "Tej Gandham",
+    "email": "tej@engen.tech"
+  },
+  "homepage": "https://github.com/engen-tech/hatch",
+  "repository": "https://github.com/engen-tech/hatch",
+  "license": "UNLICENSED",
+  "keywords": [
+    "orchestration",
+    "binder",
+    "parallel",
+    "worktree",
+    "agents",
+    "frontend",
+    "design",
+    "design-validation",
+    "dtcg",
+    "stack-agnostic"
+  ],
+  "skills": "./skills/",
+  "hooks": "./.codex-plugin/hooks/hooks.json",
+  "interface": {
+    "displayName": "hatch",
+    "shortDescription": "Synthesize a binder and deliver it in parallel waves, gated by acceptance checks.",
+    "longDescription": "hatch packages five stack-agnostic orchestration skills, a bundled plain-language writing standard (hatch-plainlanguage), and five agents — three read-only gates (hatch-acceptance-reviewer, hatch-safety-auditor, hatch-design-reviewer) and two opt-in writers (hatch-doc-gardner, hatch-kaizen). hatch-plan synthesizes a validated binder of work items; hatch-deliver builds them in parallel waves onto a per-binder integration branch; hatch-build implements one item in an isolated worktree; hatch-verify (behavioral) and hatch-validate (visual) are the acceptance gates. Stack-agnostic across frontend, backend, CLI, data, and IaC, while keeping deep frontend support (component/token mapping, DTCG, design validation).",
+    "developerName": "Tej Gandham",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/engen-tech/hatch",
+    "defaultPrompt": [
+      "Synthesize a hatch binder for this work.",
+      "Deliver this binder in parallel waves.",
+      "Validate this running view against the design."
+    ]
+  }
+}

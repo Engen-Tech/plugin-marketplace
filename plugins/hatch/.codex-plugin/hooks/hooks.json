@@ -1,0 +1,93 @@
+{
+  "description": "hatch harness enforcement for Codex: binder immutability, pack write validation, the fail-closed dispatch inspectors (guard_auditor_dispatch.py and guard_gate_dispatch.py on spawn_agent|Agent — a recognized hatch-safety-auditor dispatch must carry its binder and pinned-pack checklists, and a recognized gate-reviewer dispatch must carry a real, sized diff, denied on both documented channels before two reviewer contexts spin up), the delivery Stop-gate, the SubagentStop whiff advisory, and the SessionStart status injection (inject_hatch_status.py — purely informational: it emits a short fenced hatch status summary as session context, always exits 0, and never blocks anything) — the subset of hatch's Claude Code hooks that Codex's hook surface can express (docs/how-to/codex.md has the full parity table). Referenced by the 'hooks' entry in .codex-plugin/plugin.json. Codex file edits arrive as apply_patch calls whose tool_input.command is the raw patch body; the guard scripts parse that shape natively. Same contract as everywhere else: hook payload JSON on stdin; exit 0 allows, exit 2 blocks with the reason on stderr (the Stop, SubagentStop, and dispatch-inspector guards also emit their JSON decision on stdout). Each command is a fail-open launcher: if PLUGIN_ROOT does not resolve to the installed plugin on this Codex build, the hook allows rather than wedging the session. That launcher-open posture is not in conflict with the dispatch inspectors' guard-closed posture — the launcher only decides whether a guard runs at all, while the fail-closed rule governs once the guard is running.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "apply_patch|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'p=\"${PLUGIN_ROOT}/.codex-plugin/hooks/scripts/guard_binder_immutability.py\"; [ -f \"$p\" ] && exec python3 \"$p\"; exit 0'",
+            "timeout": 30,
+            "commandWindows": "if exist \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" (powershell -NoProfile -ExecutionPolicy Bypass -File \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" \".codex-plugin/hooks/scripts/guard_binder_immutability.py\" Plugin) else (exit /b 0)"
+          },
+          {
+            "type": "command",
+            "command": "sh -c 'p=\"${PLUGIN_ROOT}/.codex-plugin/hooks/scripts/guard_pack_write.py\"; [ -f \"$p\" ] && exec python3 \"$p\"; exit 0'",
+            "timeout": 60,
+            "commandWindows": "if exist \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" (powershell -NoProfile -ExecutionPolicy Bypass -File \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" \".codex-plugin/hooks/scripts/guard_pack_write.py\" Plugin) else (exit /b 0)"
+          }
+        ]
+      },
+      {
+        "matcher": "spawn_agent|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'p=\"${PLUGIN_ROOT}/.codex-plugin/hooks/scripts/guard_auditor_dispatch.py\"; [ -f \"$p\" ] && exec python3 \"$p\"; exit 0'",
+            "timeout": 30,
+            "commandWindows": "if exist \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" (powershell -NoProfile -ExecutionPolicy Bypass -File \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" \".codex-plugin/hooks/scripts/guard_auditor_dispatch.py\" Plugin) else (exit /b 0)"
+          },
+          {
+            "type": "command",
+            "command": "sh -c 'p=\"${PLUGIN_ROOT}/.codex-plugin/hooks/scripts/guard_gate_dispatch.py\"; [ -f \"$p\" ] && exec python3 \"$p\"; exit 0'",
+            "timeout": 60,
+            "commandWindows": "if exist \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" (powershell -NoProfile -ExecutionPolicy Bypass -File \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" \".codex-plugin/hooks/scripts/guard_gate_dispatch.py\" Plugin) else (exit /b 0)"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'p=\"${PLUGIN_ROOT}/.codex-plugin/hooks/scripts/guard_pack_write.py\"; [ -f \"$p\" ] && exec python3 \"$p\"; exit 0'",
+            "timeout": 60,
+            "commandWindows": "if exist \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" (powershell -NoProfile -ExecutionPolicy Bypass -File \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" \".codex-plugin/hooks/scripts/guard_pack_write.py\" Plugin) else (exit /b 0)"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'p=\"${PLUGIN_ROOT}/.codex-plugin/hooks/scripts/guard_delivery_stop.py\"; [ -f \"$p\" ] && exec python3 \"$p\"; exit 0'",
+            "timeout": 30,
+            "commandWindows": "if exist \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" (powershell -NoProfile -ExecutionPolicy Bypass -File \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" \".codex-plugin/hooks/scripts/guard_delivery_stop.py\" Plugin) else (exit /b 0)"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'p=\"${PLUGIN_ROOT}/.codex-plugin/hooks/scripts/guard_subagent_whiff.py\"; [ -f \"$p\" ] && exec python3 \"$p\"; exit 0'",
+            "timeout": 30,
+            "commandWindows": "if exist \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" (powershell -NoProfile -ExecutionPolicy Bypass -File \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" \".codex-plugin/hooks/scripts/guard_subagent_whiff.py\" Plugin) else (exit /b 0)"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'p=\"${PLUGIN_ROOT}/.codex-plugin/hooks/scripts/inject_hatch_status.py\"; [ -f \"$p\" ] && exec python3 \"$p\"; exit 0'",
+            "timeout": 30,
+            "commandWindows": "if exist \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" (powershell -NoProfile -ExecutionPolicy Bypass -File \"%PLUGIN_ROOT%\\.codex-plugin\\hooks\\launch_hook.ps1\" \".codex-plugin/hooks/scripts/inject_hatch_status.py\" Plugin) else (exit /b 0)"
+          }
+        ]
+      }
+    ]
+  }
+}

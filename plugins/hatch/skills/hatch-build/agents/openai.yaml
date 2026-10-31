@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-build"
+  short_description: "Build one binder work item in an isolated git worktree, gated by lint/test/build and its acceptance check."
+policy:
+  allow_implicit_invocation: true

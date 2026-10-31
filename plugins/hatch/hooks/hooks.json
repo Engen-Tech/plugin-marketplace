@@ -1,0 +1,110 @@
+{
+  "description": "hatch phase-1 harness enforcement: binder immutability, pack write validation, fail-closed auditor dispatch, fail-closed gate-dispatch diff guard (a gate-reviewer dispatch with an empty diff range or a missing/mismatched Diff-size line is denied before two reviewer contexts spin up), confined-writer surfaces (kaizen and doc-gardner, on Write/Edit/MultiEdit/NotebookEdit and on their Bash commands) and read-only gate reviewers (acceptance, safety, design: every edit tool denied, write-shaped Bash denied — hook enforcement for the recognized command shapes, not a sandbox), session status injection, the delivery Stop-gate (a session may not quietly stop with built-but-unmerged items or a complete-but-unarchived binder — blocked once per state, then the identical stop passes), and the SubagentStop whiff advisory (a hatch-typed subagent stopping while an item branch stands with no commits over integration and no state ref is told once — stateless, loop-guarded by stop_hook_active — to surface the whiff in its report). Same contract everywhere: hook payload JSON on stdin; exit 0 allows, exit 2 blocks (PreToolUse, Stop, SubagentStop) or feeds corrective stderr back to the model (PostToolUse).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/guard_binder_immutability.py\"",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/guard_pack_write.py\"",
+            "timeout": 60
+          }
+        ]
+      },
+      {
+        "matcher": "Task|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/guard_auditor_dispatch.py\"",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/guard_gate_dispatch.py\"",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/guard_writer_confinement.py\"",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/guard_writer_confinement.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/guard_pack_write.py\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/inject_hatch_status.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/guard_delivery_stop.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/guard_subagent_whiff.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -7,6 +7,11 @@
   "description": "Software Design for the Next Generation. Plugins from Engen Inc. for Claude Code, GitHub Copilot, Codex and pi: plain-language writing, a prose gate, subagent delegation and multi-session orchestration.",
   "plugins": [
     {
+      "name": "hatch",
+      "description": "Stack-agnostic, ad-hoc orchestration framework. hatch synthesizes a binder of work items (hatch-plan) and delivers it in parallel waves onto a per-binder integration branch (hatch-deliver), building each item in an isolated git worktree (hatch-build) and verifying it against its own acceptance check \u2014 behavioral (hatch-verify) or visual (hatch-validate). Works across stacks (frontend, backend, CLI, data, IaC, \u2026) while keeping deep frontend support: component/icon/token mapping, DTCG conformance, and a design-validation loop.",
+      "source": "./plugins/hatch"
+    },
+    {
       "name": "plainlanguage",
       "description": "Plain-language writing and editing for any prose a person has to read and act on: plain-language rules and the ASD-STE100 controlled register for procedures and runbooks.",
       "source": "./plugins/plainlanguage"

@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-verify"
+  short_description: "Behavioral acceptance gate: verify a built item against its oracle, read-only, on the actual diff."
+policy:
+  allow_implicit_invocation: true

@@ -1,4 +1,16 @@
 {
+  "hatch": {
+    "version": "2.43.1",
+    "source": "https://github.com/Engen-Tech/hatch",
+    "tag": "v2.43.1",
+    "commit": "037973f7fa36817599790358a99c219a97060e1f",
+    "tree": "39e852edc60e194e8761763dce8dd483c3435913",
+    "pi": {
+      "extensions": [
+        "extensions/pi/index.ts"
+      ]
+    }
+  },
   "plainlanguage": {
     "version": "1.1.0",
     "source": "https://brahma.myth-gecko.ts.net:3000/stackhouse/common-skills",

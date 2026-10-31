@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Engen-Tech/hatch/binder-schema.json",
+  "title": "hatch binder",
+  "type": "object",
+  "required": ["slug", "title", "summary", "motivation", "scope", "work_items"],
+  "additionalProperties": false,
+  "properties": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "kebab-case; names the integration branch hatch/<slug>/integration and the wave tags"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "human-friendly binder name shown as the build's title on the Hatch Status page, e.g. 'Tag editing for notes' (the slug stays the technical id)"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "plain-language goal, 1-2 sentences: what this binder delivers and why it matters; reader-facing (distinct from 'motivation', the terse internal why)"
+    },
+    "motivation": { "type": "string", "minLength": 1 },
+    "scope": {
+      "type": "object",
+      "required": ["included"],
+      "additionalProperties": false,
+      "properties": {
+        "included": { "type": "array", "items": { "type": "string" } },
+        "excluded": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "design_facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": ["string", "null"], "description": "path to the source design/prototype, or null" },
+        "stack": { "type": "string", "description": "resolved stack, recorded once" }
+      }
+    },
+    "after": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "default": [],
+      "description": "slugs of binders that must merge before this one — the cross-binder dependency the suggested run order is derived from; the order itself is never stored"
+    },
+    "sme": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "description": "ids of advisory SME packs auto-matched at plan time; the Review checklist of each is the enforceable subset the safety-auditor judges (project-local .hatch/sme/<id>.md overrides the built-in references/sme/<id>.md)"
+    },
+    "token_manifest": {
+      "type": ["object", "null"],
+      "description": "shared design-token map; present only when a token system exists"
+    },
+    "env_contract": {
+      "type": "object",
+      "required": ["command", "supports_isolation"],
+      "additionalProperties": false,
+      "properties": {
+        "command": { "type": "string", "description": "the project's own test/dev env command" },
+        "supports_isolation": { "type": "boolean", "description": "whether the command accepts injectable isolation params" },
+        "isolation_params": { "type": "array", "items": { "type": "string" }, "description": "e.g. PORT, COMPOSE_PROJECT_NAME" },
+        "cwd": { "type": "string", "description": "worktree-relative directory the command runs in; default is the worktree root" }
+      }
+    },
+    "runtime_contract": {
+      "type": "object",
+      "required": ["runtimes", "on_unavailable"],
+      "additionalProperties": false,
+      "description": "required language/toolchain runtimes the project's commands need; present only when a runtime floor exists",
+      "properties": {
+        "runtimes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["name", "version"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "description": "runtime/toolchain, e.g. node, python, go, ruby, rust" },
+              "version": { "type": "string", "description": "required version or range, e.g. '>=24.15.0', '3.12.x'" },
+              "manager": { "type": "string", "description": "version manager that pins it, e.g. nvm, mise, asdf, volta, pyenv" }
+            }
+          }
+        },
+        "on_unavailable": {
+          "enum": ["halt"],
+          "description": "policy when a required runtime is absent: halt and report. hatch does not provision runtimes on its own."
+        }
+      }
+    },
+    "shared_terms": {
+      "type": "array",
+      "description": "canonical strings several work items must render byte-identically; check_shared_terms.py enforces them on the assembled tree at deliver time. validate_binder.py additionally checks that entry ids are unique and that every listed item id names a work item",
+      "items": {
+        "type": "object",
+        "required": ["id", "canonical", "items"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "canonical": { "type": "string", "minLength": 1 },
+          "items": { "type": "array", "minItems": 2, "items": { "type": "string" } }
+        }
+      }
+    },
+    "supersedes": {
+      "type": "object",
+      "required": ["slug", "carried"],
+      "additionalProperties": false,
+      "description": "marks this binder as the successor of a partially delivered, committed binder (slug convention <predecessor>-r2, -r3). The predecessor stays immutable; see docs/how-to/binder-repair.md",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "description": "the predecessor binder's slug; its refs/hatch/<slug>/ refs and integration branch prove the carried work"
+        },
+        "carried": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "description": "ids of work items already delivered by the predecessor. Each must appear in this binder's work_items unchanged from the predecessor's plan and carry a done ref in the predecessor that passes provenance; deliver_preflight.py refuses the binder otherwise"
+        },
+        "dropped": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "description": "ids of predecessor items that are done but NOT carried: their merge is on the predecessor integration branch the successor starts from, so the successor must plan a work item that reverts or replaces that code. deliver_preflight.py halts on any predecessor done item that is neither carried nor dropped, and on a dropped id with no predecessor done ref"
+        }
+      }
+    },
+    "work_items": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/workItem" }
+    }
+  },
+  "$defs": {
+    "workItem": {
+      "type": "object",
+      "required": ["id", "title", "summary", "oracle"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "title": { "type": "string", "minLength": 1 },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "plain-language goal, one sentence: what this work item does"
+        },
+        "estimate": { "enum": ["S", "M", "L"] },
+        "depends_on": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "design_reference": { "type": "string", "minLength": 1, "description": "view/route id, or the literal 'none'" },
+        "component_map": { "type": "array" },
+        "icon_map": { "type": "array" },
+        "token_changes": { "type": "array" },
+        "contract": {
+          "type": ["object", "string", "null"],
+          "description": "the open-shape interface this item exposes/consumes"
+        },
+        "covers": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "ids of the work items whose design claim this item's visual gate checks; a visual_check_waiver naming this item is only accepted when the waived item's id appears here, so coverage is agreed by both items rather than claimed by one"
+        },
+        "visual_check_waiver": {
+          "type": "object",
+          "required": ["reason", "covered_by"],
+          "additionalProperties": false,
+          "description": "records that this item's design_reference claim is checked by another item's visual gate instead of its own; only meaningful when design_reference names a real view and this item has no visual oracle — validate_binder.py's design: rule enforces the coverage conditions",
+          "properties": {
+            "reason": { "type": "string", "minLength": 1, "description": "why this item names a design view but does not open it itself" },
+            "covered_by": { "type": "string", "minLength": 1, "description": "id of the work item whose visual oracle checks the view this item names" }
+          }
+        },
+        "serialize": { "type": "boolean", "default": false },
+        "shared_resources": { "type": "array", "items": { "type": "string" } },
+        "touches": { "type": "array", "items": { "type": "string" }, "description": "files/paths this item creates or modifies (concrete paths, directory prefixes, or globs all match); drives the parallelism file-collision + shared-resource gates and the validator's same-wave overlap check" },
+        "surface": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "flagged": { "type": "boolean" },
+            "signals": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "oracle": { "$ref": "#/$defs/oracle" }
+      },
+      "if": {
+        "anyOf": [
+          { "required": ["component_map"] },
+          { "required": ["icon_map"] },
+          { "required": ["token_changes"] },
+          { "required": ["covers"] },
+          { "required": ["visual_check_waiver"] }
+        ]
+      },
+      "then": { "required": ["design_reference"] },
+      "description": "UI-only fields (component_map, icon_map, token_changes, covers, visual_check_waiver) are allowed only on an item with a UI surface, which the schema recognises by its design_reference (a view id, or 'none' for UI foundation work). An item without design_reference is a non-UI item and carries none of them"
+    },
+    "oracle": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "enum": ["unit", "integration", "e2e", "smoke", "visual"] },
+            "assertions": { "type": "array", "items": { "type": "string" } },
+            "command": { "type": "string", "description": "the CI-facing check hatch runs; floor is compile/type-check/lint" },
+            "expect": { "type": "string", "description": "success-only marker the command's output must contain — a string printed only on genuine success, so the check cannot pass by staying silent (run_oracle.py --expect asserts it)" },
+            "cwd": { "type": "string", "description": "worktree-relative directory the command runs in; default is the worktree root" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["opt_out", "reason"],
+          "additionalProperties": false,
+          "properties": {
+            "opt_out": { "const": true },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    }
+  }
+}

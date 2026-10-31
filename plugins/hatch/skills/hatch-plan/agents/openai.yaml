@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-plan"
+  short_description: "Synthesize a validated binder of work items from a problem, feature, or design — stack-agnostic."
+policy:
+  allow_implicit_invocation: true

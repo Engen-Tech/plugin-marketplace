@@ -1,0 +1,57 @@
+{
+  "slug": "notifications-redesign",
+  "title": "Notifications center",
+  "summary": "Replace the old alerts panel with a notifications center people can open, read, and clear.",
+  "motivation": "Replace the legacy alerts panel with the new notifications center from the design prototype.",
+  "scope": {
+    "included": ["notifications list view", "notification detail pane", "mark-all-read action"],
+    "excluded": ["push delivery backend", "email digests"]
+  },
+  "design_facts": {
+    "source": "design-export/notifications.html",
+    "stack": "Vue 3 (script setup) + Vite + internal component library + DTCG tokens + REST API"
+  },
+  "sme": ["minimalism", "vue"],
+  "token_manifest": null,
+  "env_contract": {
+    "command": "npm run dev",
+    "supports_isolation": true,
+    "isolation_params": ["PORT"]
+  },
+  "work_items": [
+    {
+      "id": "shell",
+      "title": "Notifications center shell + routing",
+      "summary": "Stand up the notifications center view and its route so the rest of the work has a place to live.",
+      "estimate": "M",
+      "depends_on": [],
+      "design_reference": "none",
+      "contract": "registers /notifications in the router and mounts <NotificationsView/> (script setup) there",
+      "touches": ["src/router/index.js", "src/views/NotificationsView.vue"],
+      "oracle": { "type": "smoke", "assertions": ["/notifications route renders without error"], "command": "npm run lint && npm test" }
+    },
+    {
+      "id": "list-view",
+      "title": "Notifications list view",
+      "summary": "Show the list of notifications, matching the design.",
+      "estimate": "L",
+      "depends_on": ["shell"],
+      "design_reference": "notifications-list",
+      "contract": "<NotificationsList/> takes typed props (defineProps), keys every v-for row, and emits read events up",
+      "touches": ["src/views/notifications/NotificationsList.vue", "src/composables/useNotifications.js"],
+      "oracle": { "type": "visual", "assertions": ["matches notifications-list view at 1440x900, zero critical/major discrepancies"] }
+    },
+    {
+      "id": "schema-migration",
+      "title": "Add read_at column to notifications table",
+      "summary": "Add a read_at column so a notification can be marked as read.",
+      "estimate": "S",
+      "depends_on": [],
+      "serialize": true,
+      "shared_resources": ["db/migrations"],
+      "touches": ["db/migrations/0002_read_at.sql"],
+      "contract": "adds nullable read_at timestamptz to notifications",
+      "oracle": { "opt_out": true, "reason": "migration verified by the team's existing migration test suite in CI, not re-run here" }
+    }
+  ]
+}

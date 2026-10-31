@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-kaizen"
+  short_description: "Improve the project's stack packs from what its builds keep repeating (opt-in via .hatch/kaizen.json)."
+policy:
+  allow_implicit_invocation: true

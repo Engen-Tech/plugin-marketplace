@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-debt"
+  short_description: "Harvest every HATCH-DEFER and HATCH-SME-OVERRIDE marker into a one-shot, read-only ledger."
+policy:
+  allow_implicit_invocation: true

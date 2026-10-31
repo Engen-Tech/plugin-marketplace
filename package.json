@@ -12,6 +12,7 @@
   "type": "module",
   "pi": {
     "extensions": [
+      "./plugins/hatch/extensions/pi/index.ts",
       "./plugins/steward-delegation/pi/extensions/steward-delegation/index.ts",
       "./plugins/steward-prose-gate/pi/extensions/steward-prose-gate/index.ts"
     ],
@@ -26,6 +27,7 @@
     }
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   }
 }

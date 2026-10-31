@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-doc-gardner"
+  short_description: "Automatically correct documentation drift to match the code (opt-in via .hatch/doc-gardner.json)."
+policy:
+  allow_implicit_invocation: true

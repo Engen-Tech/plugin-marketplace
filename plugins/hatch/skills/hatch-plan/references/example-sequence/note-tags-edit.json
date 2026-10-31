@@ -1,0 +1,30 @@
+{
+  "slug": "note-tags-edit",
+  "after": ["note-tags-new"],
+  "title": "Tag editing in the note screen",
+  "summary": "Hook the new tag editor into the note screen so edited tags save through the existing notes API.",
+  "motivation": "Wire AppShell's note-save flow to use NoteTagEditor so edited tags persist through the existing notes update API. Stage 2 of 3 (new then edit then delete): assumes note-tags-new is merged.",
+  "scope": {
+    "included": ["AppShell edit mode mounts NoteTagEditor", "tags included in the note update payload"],
+    "excluded": ["the NoteTagEditor component itself", "removing legacy tag code"]
+  },
+  "sme": ["minimalism", "vue", "python-fastapi"],
+  "work_items": [
+    {
+      "id": "app-shell-tag-editing",
+      "title": "Wire tag editing into the note screen",
+      "summary": "Mount the tag editor in edit mode and include the tags when a note is saved.",
+      "estimate": "M",
+      "touches": ["src/components/AppShell.vue"],
+      "contract": "AppShell edit mode mounts <NoteTagEditor> and includes tags in the NoteUpdate request payload",
+      "oracle": {
+        "type": "integration",
+        "assertions": [
+          "editing tags and saving sends tags in the update request",
+          "read mode still shows tag chips with filter behavior intact"
+        ],
+        "command": "npm run lint && npm test"
+      }
+    }
+  ]
+}

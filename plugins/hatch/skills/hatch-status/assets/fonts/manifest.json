@@ -1,0 +1,107 @@
+{
+  "note": "Every typeface the Hatch Status page uses, vendored and served same-origin from /assets/fonts/. This file is the DECLARED record of what was shipped: the gate checks that it, the files on disk and the page's @font-face rules agree. Glyph coverage is a guarantee of the subsetting step recorded here, not something read back out of the woff2 cmap — the gate is stdlib Python with no font library. Each face also carries a \"variable\" claim, checked against the file's own WOFF2 table directory (a stdlib parse, never a decompress) rather than taken on this manifest's word alone — a variable face must carry fvar at its recorded \"fvar_length\" and every tag it lists under \"variation_tables\" at a non-zero length, and a static face must carry no fvar at all. See woff2-table-directory-round-trips, font-manifest-agrees-with-variation-table and font-hinting-tables-stripped in serve_status.py. What a directory read reaches is a tag and a recorded length; every table's CONTENTS are Brotli-compressed and are not read here.",
+  "unicode_range_blocks": [
+    "Basic Latin U+0020-007F",
+    "Latin-1 Supplement U+00A0-00FF",
+    "General Punctuation U+2000-206F"
+  ],
+  "coverage_caveat": "The range is a fixed writing system, not the characters the page happens to render today. Text outside it (arrows, box drawing, CJK, emoji) falls through to the next family in the stack — the system font — which is why every stack keeps one.",
+  "subsetting": {
+    "tool": "fonttools pyftsubset (build-time only — never a runtime dependency)",
+    "flags": [
+      "--unicodes=U+0000-00FF,U+2000-206F",
+      "--layout-features+=tnum",
+      "--no-hinting",
+      "--desubroutinize",
+      "--flavor=woff2",
+      "--name-IDs=1,2,3,4,5,6,16,17"
+    ],
+    "variable_sources": "Plus Jakarta Sans is the design's own face: the latin woff2 packed in the approved design file (see the family's source_path), variable on wght 200..800, and it is shipped as one variable file. It is cut with fontTools.varLib.instancer LIMITING wght to 400..800 and pinning nothing, then subset with the flags above. IBM Plex Mono ships static per-weight files, used directly. The subsetting flags above preserve fvar, gvar, HVAR, MVAR and STAT on their own; the instancer step is what would flatten a face, and it is given a range here, never a point.",
+    "fonttools_version": "4.63.0",
+    "reproducibility": "NOT byte-reproducible, which is why the version above is recorded rather than a promise of identical bytes. Replaying this recipe on fontTools 4.60.1 reproduced one face's byte count exactly and landed 36 bytes off another, and two runs of 4.63.0 differ from each other. What is checked is that the bytes on disk match the sha256 and byte count recorded per face here, and that the shipped total stays under the payload bound. That the bytes on disk came from THIS recipe is recorded, never verified.",
+    "upstream_repo": "https://github.com/google/fonts",
+    "upstream_commit": "352f6b7d9d6cc4fa9e242b931291d31b21a6dc84",
+    "recipe": [
+      "uv run --no-project --with fonttools==4.63.0 --with brotli python -I -m fontTools.varLib.instancer jakarta-packed.woff2 wght=400:800 -o limited.ttf",
+      "uv run --no-project --with fonttools==4.63.0 --with brotli python -I -m fontTools.subset limited.ttf --unicodes=U+0000-00FF,U+2000-206F --layout-features+=tnum --no-hinting --desubroutinize --flavor=woff2 --name-IDs=1,2,3,4,5,6,16,17 --output-file=plus-jakarta-sans-var.woff2"
+    ],
+    "recipe_note": "The Plus Jakarta Sans cut, as run on 2026-10-18. jakarta-packed.woff2 is the font/woff2 entry of the approved design file's __bundler manifest, base64-decoded and read as data (the file's script is never run); its sha256 is the face's source_sha256. fontTools is a build-time tool only, pulled per command by uv and never a dependency of this plugin. upstream_repo and upstream_commit below are IBM Plex Mono's: Plus Jakarta Sans has no upstream commit, because its source is the design file."
+  },
+  "families": {
+    "Plus Jakarta Sans": {
+      "licence": "plus-jakarta-sans-OFL.txt",
+      "licence_name": "SIL Open Font Licence 1.1",
+      "upstream_version": "2.071",
+      "source_path": "design/Hatch Status Page/HATch StatusPage.html",
+      "source_files": "the font/woff2 entry (7ddef297-030c-4f73-ad90-3baa5f3a7861) of the file's __bundler manifest — the Google Fonts latin piece of PlusJakartaSans[wght], saved unchanged into the design",
+      "pinned_axes": null,
+      "axes": {
+        "wght": "400..800 (limited from the packed 200..800)"
+      },
+      "axes_caveat": "RECORDED, NOT CHECKED. Reading an axis tag or its range out of a woff2 needs the fvar table's CONTENTS, which are Brotli-compressed; the gate is stdlib Python and reads the table DIRECTORY only, so it holds this face to an fvar entry of the recorded length and no further. A 76-byte fvar is one axis with five named instances, or equally another shape of the same size.",
+      "licence_source": "the OFL notice in the approved design file's head comment, copied with its copyright line"
+    },
+    "IBM Plex Mono": {
+      "licence": "ibm-plex-mono-OFL.txt",
+      "licence_name": "SIL Open Font Licence 1.1",
+      "upstream_version": "2.3",
+      "source_url": "https://github.com/google/fonts/tree/352f6b7d9d6cc4fa9e242b931291d31b21a6dc84/ofl/ibmplexmono",
+      "source_files": "IBMPlexMono-{Regular,Medium,SemiBold}.ttf",
+      "pinned_axes": null
+    }
+  },
+  "faces": [
+    {
+      "family": "Plus Jakarta Sans",
+      "weight": "400 800",
+      "file": "plus-jakarta-sans-var.woff2",
+      "bytes": 17684,
+      "sha256": "f39e794d75be5fc75edde8826d07eb5cc6bd04a2d6575f00bf51dcde83be2e39",
+      "unicode_range": "U+0000-00FF, U+2000-206F",
+      "source_file": "design/Hatch Status Page/HATch StatusPage.html#__bundler/7ddef297-030c-4f73-ad90-3baa5f3a7861",
+      "source_sha256": "cd8db90cd950e26bc8761f65d323588bd5cd112d326d6d322bc7c8ea86771215",
+      "variable": true,
+      "fvar_length": 76,
+      "variation_tables": [
+        "fvar",
+        "gvar",
+        "HVAR",
+        "MVAR",
+        "STAT"
+      ]
+    },
+    {
+      "family": "IBM Plex Mono",
+      "weight": 400,
+      "file": "ibm-plex-mono-400.woff2",
+      "bytes": 8440,
+      "sha256": "06d7234f6dd584151d8cdf9ef0fe4741365f549b555d4b7f51857a8c8cc03b8c",
+      "unicode_range": "U+0000-00FF, U+2000-206F",
+      "source_file": "IBMPlexMono-Regular.ttf",
+      "source_sha256": "6a3412f058c7d8dfd9170c41e85ade48e5156ecb89356110ca57a0a27734af46",
+      "variable": false
+    },
+    {
+      "family": "IBM Plex Mono",
+      "weight": 500,
+      "file": "ibm-plex-mono-500.woff2",
+      "bytes": 8380,
+      "sha256": "781d9869b99088f87578f23f9762acbd13b36d7132aedabbafdfc702f3f4ef42",
+      "unicode_range": "U+0000-00FF, U+2000-206F",
+      "source_file": "IBMPlexMono-Medium.ttf",
+      "source_sha256": "a9b4c49bb299e05b5f6c481e7fb5e78943d2793249a0c8874ab574a2d1ea6755",
+      "variable": false
+    },
+    {
+      "family": "IBM Plex Mono",
+      "weight": 600,
+      "file": "ibm-plex-mono-600.woff2",
+      "bytes": 8380,
+      "sha256": "9bb32951ab78d49340eaca5cf098339b3cc491b71676a655b839721000fc9313",
+      "unicode_range": "U+0000-00FF, U+2000-206F",
+      "source_file": "IBMPlexMono-SemiBold.ttf",
+      "source_sha256": "d3c38e55c78f5b0f28009fddba4834ec503278936a5986032424c9bd2d23aa46",
+      "variable": false
+    }
+  ]
+}

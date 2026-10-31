@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/Engen-Tech/hatch/kaizen-schema.json",
+  "title": "hatch kaizen config",
+  "description": "Opt-in switch for hatch's stack-pack writer. The switch is absolute: absent or enabled:false means kaizen never runs, including direct invocation. Presence with enabled:true turns kaizen on — it runs after each hatch-deliver run and seeds the project's packs into .hatch/sme/ on the first enabled run.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["enabled"],
+  "properties": {
+    "enabled": {
+      "type": "boolean",
+      "description": "true turns kaizen on; absent or false means it never runs, even invoked directly."
+    },
+    "focus": {
+      "type": "string",
+      "description": "Optional plain nudge about what to watch (e.g. 'watch the billing items and the auth rules'). NOT a task list."
+    }
+  }
+}

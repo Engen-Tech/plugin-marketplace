@@ -1,0 +1,35 @@
+{
+  "name": "@engen-tech/hatch",
+  "version": "2.43.1",
+  "description": "Stack-agnostic orchestration for parallel, Git-native delivery.",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.6.2",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "orchestration",
+    "worktree",
+    "agents"
+  ],
+  "files": [
+    "extensions/pi/",
+    "skills/",
+    "agents/",
+    "hooks/scripts/",
+    "!**/__pycache__/",
+    "!**/*.pyc"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/pi/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

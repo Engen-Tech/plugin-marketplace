@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "exec": "git",
+            "args": [
+              "-c",
+              "alias.kh=!f() { d=$1; e=$2; g=$3; o=$IFS; set -f; for w in 0 1; do for n in python3 python; do IFS=:; for x in $PATH; do IFS=$o; case $x in /*) ;; *) continue;; esac; case $x in *WindowsApps*) [ $w = 1 ] || continue;; *) [ $w = 0 ] || continue;; esac; for c in \"$x/$n\" \"$x/$n.exe\"; do [ -f \"$c\" ] && [ -x \"$c\" ] && \"$c\" -I -S \"$d\" --probe </dev/null >/dev/null 2>&1 && exec \"$c\" -X utf8 \"$d\" \"$e\" \"$g\"; done; done; IFS=$o; done; if [ $w = 0 ] && command -v py >/dev/null 2>&1 && py -3 -I -S \"$d\" --probe </dev/null >/dev/null 2>&1; then exec py -3 -X utf8 \"$d\" \"$e\" \"$g\"; fi; done; m='hatch: no Python 3.9 or later found for the plugin hooks (the WindowsApps alias stub does not count), so hatch guards are not running. Install Python 3.9 or later on PATH and start a new session.'; case $e in PreToolUse) printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"%s\"}}\\n' \"$m\"; echo \"$m\" >&2; exit 2;; SessionStart) echo \"$m\"; exit 0;; *) exit 0;; esac; }; f",
+              "kh",
+              "${PLUGIN_ROOT}/.codex-plugin/hooks/dispatch.py",
+              "PreToolUse",
+              "edit"
+            ],
+            "timeoutSec": 90
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "exec": "git",
+            "args": [
+              "-c",
+              "alias.kh=!f() { d=$1; e=$2; g=$3; o=$IFS; set -f; for w in 0 1; do for n in python3 python; do IFS=:; for x in $PATH; do IFS=$o; case $x in /*) ;; *) continue;; esac; case $x in *WindowsApps*) [ $w = 1 ] || continue;; *) [ $w = 0 ] || continue;; esac; for c in \"$x/$n\" \"$x/$n.exe\"; do [ -f \"$c\" ] && [ -x \"$c\" ] && \"$c\" -I -S \"$d\" --probe </dev/null >/dev/null 2>&1 && exec \"$c\" -X utf8 \"$d\" \"$e\" \"$g\"; done; done; IFS=$o; done; if [ $w = 0 ] && command -v py >/dev/null 2>&1 && py -3 -I -S \"$d\" --probe </dev/null >/dev/null 2>&1; then exec py -3 -X utf8 \"$d\" \"$e\" \"$g\"; fi; done; m='hatch: no Python 3.9 or later found for the plugin hooks (the WindowsApps alias stub does not count), so hatch guards are not running. Install Python 3.9 or later on PATH and start a new session.'; case $e in PreToolUse) printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"%s\"}}\\n' \"$m\"; echo \"$m\" >&2; exit 2;; SessionStart) echo \"$m\"; exit 0;; *) exit 0;; esac; }; f",
+              "kh",
+              "${PLUGIN_ROOT}/.codex-plugin/hooks/dispatch.py",
+              "PreToolUse",
+              "task"
+            ],
+            "timeoutSec": 90
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "exec": "git",
+            "args": [
+              "-c",
+              "alias.kh=!f() { d=$1; e=$2; g=$3; o=$IFS; set -f; for w in 0 1; do for n in python3 python; do IFS=:; for x in $PATH; do IFS=$o; case $x in /*) ;; *) continue;; esac; case $x in *WindowsApps*) [ $w = 1 ] || continue;; *) [ $w = 0 ] || continue;; esac; for c in \"$x/$n\" \"$x/$n.exe\"; do [ -f \"$c\" ] && [ -x \"$c\" ] && \"$c\" -I -S \"$d\" --probe </dev/null >/dev/null 2>&1 && exec \"$c\" -X utf8 \"$d\" \"$e\" \"$g\"; done; done; IFS=$o; done; if [ $w = 0 ] && command -v py >/dev/null 2>&1 && py -3 -I -S \"$d\" --probe </dev/null >/dev/null 2>&1; then exec py -3 -X utf8 \"$d\" \"$e\" \"$g\"; fi; done; m='hatch: no Python 3.9 or later found for the plugin hooks (the WindowsApps alias stub does not count), so hatch guards are not running. Install Python 3.9 or later on PATH and start a new session.'; case $e in PreToolUse) printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"%s\"}}\\n' \"$m\"; echo \"$m\" >&2; exit 2;; SessionStart) echo \"$m\"; exit 0;; *) exit 0;; esac; }; f",
+              "kh",
+              "${PLUGIN_ROOT}/.codex-plugin/hooks/dispatch.py",
+              "PostToolUse",
+              "edit"
+            ],
+            "timeoutSec": 60
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "exec": "git",
+            "args": [
+              "-c",
+              "alias.kh=!f() { d=$1; e=$2; g=$3; o=$IFS; set -f; for w in 0 1; do for n in python3 python; do IFS=:; for x in $PATH; do IFS=$o; case $x in /*) ;; *) continue;; esac; case $x in *WindowsApps*) [ $w = 1 ] || continue;; *) [ $w = 0 ] || continue;; esac; for c in \"$x/$n\" \"$x/$n.exe\"; do [ -f \"$c\" ] && [ -x \"$c\" ] && \"$c\" -I -S \"$d\" --probe </dev/null >/dev/null 2>&1 && exec \"$c\" -X utf8 \"$d\" \"$e\" \"$g\"; done; done; IFS=$o; done; if [ $w = 0 ] && command -v py >/dev/null 2>&1 && py -3 -I -S \"$d\" --probe </dev/null >/dev/null 2>&1; then exec py -3 -X utf8 \"$d\" \"$e\" \"$g\"; fi; done; m='hatch: no Python 3.9 or later found for the plugin hooks (the WindowsApps alias stub does not count), so hatch guards are not running. Install Python 3.9 or later on PATH and start a new session.'; case $e in PreToolUse) printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"%s\"}}\\n' \"$m\"; echo \"$m\" >&2; exit 2;; SessionStart) echo \"$m\"; exit 0;; *) exit 0;; esac; }; f",
+              "kh",
+              "${PLUGIN_ROOT}/.codex-plugin/hooks/dispatch.py",
+              "Stop",
+              "any"
+            ],
+            "timeoutSec": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "exec": "git",
+            "args": [
+              "-c",
+              "alias.kh=!f() { d=$1; e=$2; g=$3; o=$IFS; set -f; for w in 0 1; do for n in python3 python; do IFS=:; for x in $PATH; do IFS=$o; case $x in /*) ;; *) continue;; esac; case $x in *WindowsApps*) [ $w = 1 ] || continue;; *) [ $w = 0 ] || continue;; esac; for c in \"$x/$n\" \"$x/$n.exe\"; do [ -f \"$c\" ] && [ -x \"$c\" ] && \"$c\" -I -S \"$d\" --probe </dev/null >/dev/null 2>&1 && exec \"$c\" -X utf8 \"$d\" \"$e\" \"$g\"; done; done; IFS=$o; done; if [ $w = 0 ] && command -v py >/dev/null 2>&1 && py -3 -I -S \"$d\" --probe </dev/null >/dev/null 2>&1; then exec py -3 -X utf8 \"$d\" \"$e\" \"$g\"; fi; done; m='hatch: no Python 3.9 or later found for the plugin hooks (the WindowsApps alias stub does not count), so hatch guards are not running. Install Python 3.9 or later on PATH and start a new session.'; case $e in PreToolUse) printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"%s\"}}\\n' \"$m\"; echo \"$m\" >&2; exit 2;; SessionStart) echo \"$m\"; exit 0;; *) exit 0;; esac; }; f",
+              "kh",
+              "${PLUGIN_ROOT}/.codex-plugin/hooks/dispatch.py",
+              "SubagentStop",
+              "any"
+            ],
+            "timeoutSec": 30
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "exec": "git",
+            "args": [
+              "-c",
+              "alias.kh=!f() { d=$1; e=$2; g=$3; o=$IFS; set -f; for w in 0 1; do for n in python3 python; do IFS=:; for x in $PATH; do IFS=$o; case $x in /*) ;; *) continue;; esac; case $x in *WindowsApps*) [ $w = 1 ] || continue;; *) [ $w = 0 ] || continue;; esac; for c in \"$x/$n\" \"$x/$n.exe\"; do [ -f \"$c\" ] && [ -x \"$c\" ] && \"$c\" -I -S \"$d\" --probe </dev/null >/dev/null 2>&1 && exec \"$c\" -X utf8 \"$d\" \"$e\" \"$g\"; done; done; IFS=$o; done; if [ $w = 0 ] && command -v py >/dev/null 2>&1 && py -3 -I -S \"$d\" --probe </dev/null >/dev/null 2>&1; then exec py -3 -X utf8 \"$d\" \"$e\" \"$g\"; fi; done; m='hatch: no Python 3.9 or later found for the plugin hooks (the WindowsApps alias stub does not count), so hatch guards are not running. Install Python 3.9 or later on PATH and start a new session.'; case $e in PreToolUse) printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"%s\"}}\\n' \"$m\"; echo \"$m\" >&2; exit 2;; SessionStart) echo \"$m\"; exit 0;; *) exit 0;; esac; }; f",
+              "kh",
+              "${PLUGIN_ROOT}/.codex-plugin/hooks/dispatch.py",
+              "SessionStart",
+              "any"
+            ],
+            "timeoutSec": 30
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-plainlanguage"
+  short_description: "Write or revise user-facing prose so a real reader can use it on the first read."
+policy:
+  allow_implicit_invocation: true

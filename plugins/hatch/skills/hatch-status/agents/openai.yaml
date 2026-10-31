@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-status"
+  short_description: "Show what's next in a hatch run — where you are and the single next action — derived from git, read-only."
+policy:
+  allow_implicit_invocation: true

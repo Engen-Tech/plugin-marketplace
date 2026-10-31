@@ -1,0 +1,29 @@
+{
+  "slug": "note-tags-delete",
+  "after": ["note-tags-edit"],
+  "title": "Remove the old tag input",
+  "summary": "Delete the old inline tag-editing code now that the new tag editor has taken over.",
+  "motivation": "Remove the legacy inline tag-editing code now that NoteTagEditor owns it. Stage 3 of 3 (new then edit then delete): assumes note-tags-edit is merged, so nothing references the old code.",
+  "scope": {
+    "included": ["remove legacy tag-input markup and handlers from AppShell"],
+    "excluded": ["NoteTagEditor", "the AppShell update wiring"]
+  },
+  "sme": ["minimalism", "vue"],
+  "work_items": [
+    {
+      "id": "remove-legacy-tag-input",
+      "title": "Remove the old tag-input code",
+      "summary": "Remove the old tag-input markup and handlers from the note screen.",
+      "estimate": "S",
+      "touches": ["src/components/AppShell.vue"],
+      "oracle": {
+        "type": "unit",
+        "assertions": [
+          "legacy tag-input markup and handlers are removed",
+          "no references to the removed handlers remain in the tree"
+        ],
+        "command": "npm run lint && npm test"
+      }
+    }
+  ]
+}

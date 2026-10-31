@@ -1,0 +1,27 @@
+{
+  "angular.md": [
+    "3ee9536c4a5ed893d0bbf8bee8fa4c23c59fe08f29309c9acbef35536c8b99e4"
+  ],
+  "go-htmx.md": [
+    "f2ba4cf58e50f995f131d2c447636e10911df0b2fbb0c1dd25e7b50c2036569d",
+    "659c11a03815e16222ccc1ce1c6b58889587f4bf544cec55bc36f7fc125430f1"
+  ],
+  "go-naming.md": [
+    "36ecd824100f52ed89a377644ebb67087504612cd3cbcde3ee85c7b62517509d"
+  ],
+  "minimalism.md": [
+    "9af911a88f6e21d3f82a109d8c1aa4029f6abaecf9b4ec0c9fd372a6e9b988f3"
+  ],
+  "platform-native.md": [
+    "85ac08a550178fa07b5194e5fc36302f1c99edca27b9952d7ce6c30f2d3c6d9b"
+  ],
+  "python-fastapi.md": [
+    "b9c22269cf7023452595e229768d97cd5e2d0d7fa524a3b1cc9a8b543793b59b"
+  ],
+  "python.md": [
+    "bf3d6f8fee5badf340b8bffd5cdefb2a5241db3dfc8a8cc92a6947a3b4fa3cc4"
+  ],
+  "vue.md": [
+    "8531e89c058474b93c3733fe6409df11883ff73160bc2a7694093c5e2647625c"
+  ]
+}

@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-deliver"
+  short_description: "Deliver a binder in parallel waves onto a per-binder integration branch, gated by acceptance checks."
+policy:
+  allow_implicit_invocation: true

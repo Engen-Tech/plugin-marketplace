@@ -1,0 +1,439 @@
+# Hatch Status — the behaviours the page's self-test must never stop checking.
+#
+# This file is the ANCHOR, and it lives OUTSIDE serve_status.py deliberately:
+# every item in a watch binder edits serve_status.py, so a registry entry and
+# its expectation can be deleted together in one edit and nothing would notice.
+# The anchor is not in that file, so the deletion still fails.
+#
+# validate_plugin.py compares it against the live coverage registry
+# (`serve_status.py --list-behaviours`) as a FLOOR, never as equality:
+#   - every name here MUST be present in the registry, or the validator fails;
+#   - extra registered behaviours are fine, so a later item can add its own.
+# Equality would be self-defeating — each restyle item introduces new
+# behaviours, and a frozen anchor compared by equality would fail all of them.
+#
+# One behaviour per line. Blank lines and # comments are ignored. Adding a line
+# tightens the floor; removing one is a deliberate, reviewable decision to stop
+# guarding that behaviour — not something a refactor should ever do quietly.
+
+page-title-repo-name
+shell-home-link
+shell-repo-name
+shell-feed-indicator
+
+# The Hatch Status frame (shell-and-frame): the slim header that opens the page,
+# the running-now strip, the two-line footer and the views the page moves
+# between. Each surface the old frame had and this one does not — the map rail,
+# the show-delivered toggle, the mascot and its underline, the header's branch
+# chips — is held as an absence, so none can come back unnoticed.
+header-region-holds-brand-feed-and-controls
+no-rail-on-the-page
+no-show-delivered-toggle
+only-view-titles-are-headed
+one-top-level-heading-is-the-wordmark
+egg-is-the-only-brand-mark
+no-branch-chips-in-the-header
+empty-state-shows-the-egg
+favicon-is-the-egg-on-every-document
+every-document-is-titled-hatch-status
+retired-wording-renders-nowhere
+hat-legend-reads-the-design
+running-strip-renders-only-while-something-builds
+frame-mirrors-match-their-twins
+view-state-is-the-designs
+default-build-is-the-one-the-old-page-showed
+feed-dot-shows-three-states
+footer-reads-the-designs-two-lines
+unforced-page-follows-the-system-theme
+every-rendered-hook-is-covered
+
+# The home view (home-grid): the design's four squares and the header's
+# headline. With no-rail-on-the-page above, home-is-four-squares carries the
+# claim the retired rail lines made — one place lists every build — and
+# delivered-builds-sort-last takes over from the show-delivered toggle, which
+# kept finished builds out of the way of live ones.
+home-is-four-squares
+home-grid-fits-the-viewport-and-folds
+build-roll-precedence
+delivered-builds-sort-last
+my-builds-row-shows-state-title-progress-and-word
+headline-counts-healthy-builds-and-who-needs-you
+replaced-builds-need-no-one
+needs-you-rows-are-the-engines
+waves-square-numbers-each-wave
+running-square-lists-every-building-item
+needs-you-square-is-the-navy-card
+home-mirrors-match-their-twins
+
+palette-light-and-dark-agree
+palette-four-selector-cascade
+no-undefined-css-variables
+retired-tokens-unreferenced
+waiting-state-distinct-from-ready
+halted-state-carries-a-foreground
+delivered-and-built-share-one-green
+# Two names RETIRED here, not lost: five-keyframes-each-settle-under-reduced-motion
+# and reduced-motion-keeps-halt-and-run-legible pinned the alarm to animation:none
+# under reduced motion. The page then took the design's soften instead, and the
+# item-cards item dropped the alarm with the card that wore it, so the second
+# claim now rests on the running signal alone (reduced-motion-keeps-running-legible,
+# in the item-cards block at the foot). Every retirement is recorded both ways in
+# serve_status.py's _RETIRED_BEHAVIOURS and asserted by the name below.
+retired-behaviours-recorded-both-ways
+type-roles-bound-to-vendored-weights
+reduced-motion-breathes
+# The design's blink on running indicators. The status redesign shipped the
+# ring defined but worn by nothing, so a live build read as idle at a glance.
+running-indicators-blink
+theme-toggle-control
+theme-persistence-key
+theme-query-override
+
+# One name RETIRED here, not lost: phase-timeline-groups asserted the shape of
+# the panel's phase grouping — one row per phase, keyed and ordered. The design's
+# main column has no grouping at all, so the grouping is gone and the claim is
+# replaced by the stronger one in the build view block below — that no grouping
+# node exists between the detail frame and the build view — with the retirement recorded both ways
+# in serve_status.py's _RETIRED_BEHAVIOURS and asserted by
+# retired-behaviours-recorded-both-ways above.
+
+item-disclosure-aria-expanded
+expand-collapse-state
+item-detail-disclosure
+chip-vocabulary
+chip-icons-resolve
+degraded-state
+route-repo-page
+route-state-json
+route-assets
+hub-route-landing
+hub-route-repo-page
+hub-route-repo-state-json
+hub-route-identity
+hub-token-constant-time
+ephemeral-key-gate-constant-time
+hub-host-pinning
+asset-directory-confinement
+vendored-font-faces
+font-manifest-agreement
+font-payload-budget
+font-licences-shipped
+font-src-same-origin
+font-stack-system-fallback
+page-fetches-nothing-remote
+single-front-end-runtime
+inert-json-escaping
+poll-loop-interval
+feed-live-paused-debounce
+file-snapshot-no-polling
+poll-decision-hidden-tab
+no-visual-change-hooks-are-attribute-only
+
+# The refresh controls: the reader decides when the page asks git anything.
+# poll-loop-interval, poll-decision-hidden-tab and file-snapshot-no-polling
+# above are DELIBERATELY superseded, never dropped — each still names a
+# behaviour that must hold, and each now reads it off refresh_decision and the
+# two-timer model instead of the retired poll_decision.
+refresh-cluster-region
+refresh-countdown-region
+refresh-age-when-off
+manual-refresh-control
+auto-refresh-toggle
+refresh-off-means-off
+refresh-decision-mirror
+refresh-single-poll-timer
+refresh-countdown-is-local
+refresh-baseline-reset-in-caller
+refresh-timers-torn-down
+manual-refresh-not-reentrant
+auto-refresh-persistence-key
+refresh-off-wording-is-not-feed-paused
+
+# The hub landing is off its old ten-second meta refresh for good: no document
+# declares one. (The landing itself is gone — see the cross-repo home block.)
+hub-no-meta-refresh
+
+# The single next action, stated on the build view's 'What happens next' card.
+# One derivation feeds it — hatch_next's next_action, the same object the
+# hatch-status footer prints — so the page and the terminal cannot disagree, and
+# no git call was added to say it. The command copies as one click; when there
+# is no command left, the sentence stands alone.
+next-action-is-the-engines
+next-action-command-copies-what-it-shows
+next-action-end-state-offers-no-command
+next-action-copy-handler
+next-action-command-is-inert
+
+# One card treatment per engine state — including the sixth the design forgot.
+# An item committed on its branch but not yet merged used to render nothing at
+# all: the metadata had no distinct treatment for it, so it read as passed. It
+# now takes the same --green at inverted weight (border, no fill), a merge glyph
+# and its own word, and no seventh colour was added to the palette to say it.
+# The border weight is a named role — calm or urgent — so the assertion has a
+# structural source instead of matching a CSS declaration.
+every-engine-state-has-a-card
+built-is-outlined-green-passed-is-filled
+built-card-carries-no-green-fill
+no-token-invented-for-the-built-state
+built-and-passed-separate-on-three-cues
+card-border-weight-is-a-named-role
+item-cards-key-on-the-work-item-id
+
+# What the collapsed card leads with, and what waits behind its disclosure. The
+# card says its state FIRST, as a capitalised label in a plain row with no fill
+# of its own, with the meta line trailing it and the title on its own line
+# beneath; the check command, the touched paths and the git ref wait behind a
+# per-card disclosure. A halted card DEFAULTS to open so a halt reads with no
+# click — a default and not a force, which is why the last three exist: the
+# collapse has to stick across a poll and the inventory has to prove nothing
+# was subtracted on the way. (The lead's own steps, and where the check type is
+# named, moved to the item-cards block at the foot.)
+card-leads-with-its-state
+card-meta-reads-the-slug-and-the-size
+disclosure-holds-the-command-paths-and-ref
+halted-card-opens-at-rest
+a-collapsed-card-stays-collapsed
+card-keeps-every-fact-it-rendered
+
+waiting-wording-never-says-blocked
+item-title-and-summary-are-inert
+copy-confirmation-is-per-affordance
+
+# The outline: the wordmark is the page's one top-level heading (see the
+# shell-and-frame block near the top), and each view title — a build's
+# title among them — sits one level under it. No region's name repeats a heading inside it, and taking the heading
+# tag changes no family, weight, step or margin.
+landmark-names-never-echo-a-heading
+headings-keep-the-step-they-had
+
+# The build view's panel model: its progress (the complete share), its counts
+# row, its wave frames' headers and its meta line, a Python twin driven by direct
+# call so the grouping and the counts are PROVEN over fixtures rather than
+# argued from the template.
+binder-progress-is-the-finished-share
+counts-row-totals-the-cards-below-it
+counts-row-omits-a-zero
+counts-row-covers-every-engine-state
+wave-step-header-per-dependency-depth
+wave-step-count-matches-its-depth
+wave-lane-glyph-has-an-accessible-label
+binder-meta-names-the-real-integration-branch
+binder-meta-omits-an-empty-pack-list
+
+# The expandable item detail, and the state that lets one card open on its own.
+# Registered by the disclosure item, anchored here by the closing sweep: the
+# disclosure item read the "no later item edits this file" note as covering the
+# anchor too and reverted its own append. The nine items before it appended, and
+# the operator confirmed the delivery's practice — an item anchors what it
+# registered — so the fourteen land here rather than staying unguarded.
+blocked-by-chips-carry-the-blockers-state
+item-detail-caret-turns-and-settles
+item-detail-hooks-are-registered
+item-detail-marks-a-declared-empty-field
+item-detail-mirror-matches-its-twin
+item-detail-names-the-items-git-ref
+item-detail-omits-an-undeclared-field
+item-detail-opt-out-states-its-reason
+item-detail-renders-every-assertion
+item-detail-rows-are-labelled
+item-detail-values-are-inert
+item-expansion-is-keyed-per-item
+item-expansion-survives-a-poll
+oracle-type-icons-all-resolve
+
+# The closing sweep's own six — the states and guarantees no single item owned.
+# The reduced-motion audit is the one that had to exist: the five-motion check
+# reads a hand-kept list, so a SIXTH keyframe was settled by convention alone and
+# a seventh would have slipped through entirely. This one reads the stylesheet.
+# The last two are the sweep's honesty entries: the 404 that is deliberately NOT
+# a page, and the enumeration of what nothing here can prove at all.
+every-keyframe-settles-under-reduced-motion
+wave-grouping-survives-a-cycle-and-a-foreign-dependency
+forced-theme-renders-the-whole-page
+not-found-is-plain-text-never-an-untokened-page
+browser-checklist-enumerates-what-no-check-can-prove
+
+# Type fidelity: the card's body copy is held on the sans by
+# card-body-on-the-jakarta-body-step (the item-cards block at the foot); the
+# title on the serif was retired with the serif itself (see the
+# status-foundation block). The header-control and rail type entries left with
+# the old header and the rail (see the shell-and-frame block).
+
+# The progress row's per-state readings are labels rather than chips.
+state-readings-are-labels-not-chips
+
+# Everything that is round stays round: every dot a circle and every pill on
+# the pill step, named one by one, with the copy control's button the one
+# control held off the pill set. And the general form of the corner defect the
+# fidelity record found: no rounded container on the page ends in an opaque last
+# child that sits square inside its curve. (The corner steps themselves are held
+# by container-corners-are-the-new-designs-steps, in the build view block.)
+round-shapes-keep-their-shape
+no-opaque-last-child-sits-square-in-a-rounded-container
+
+# The build view is one build: no phase grouping around it, no head, no count,
+# no empty-group row, no wrapper between the detail frame and the view, and no
+# rule left in the sheet for any of them — the stronger claim that replaced
+# phase-timeline-groups.
+panel-carries-no-phase-grouping
+
+# The stdlib WOFF2 table-directory reader (serve_status.py, "the WOFF2 table
+# directory" section) and the two behaviours it holds the shipped faces to.
+# The first proves the reader itself against synthetic fixtures — the
+# reserved-transform-version and malformed-input paths have no shipped face
+# to exercise them. The second reads every shipped face's own directory and
+# checks it against the manifest's per-face "variable" claim: a face marked
+# variable must carry fvar at the manifest's recorded length and every named
+# variation table at a non-zero length; a face marked static must carry no
+# fvar. Named for a variation-AXIS table, never for an optical size — a
+# directory read cannot reach an axis tag, which needs Brotli and is outside
+# this reader. The third holds every face to the directory-visible half of
+# the subsetting recipe's --no-hinting flag: none of the six font-wide
+# hinting tables may appear. The instructions inside glyf are compressed and
+# stay unchecked; the tables are the part that is visible.
+woff2-table-directory-round-trips
+font-manifest-agrees-with-variation-table
+font-hinting-tables-stripped
+
+# The review strip (review-ledger / watch-review-history): what the roundtable
+# said about a plan, on its binder card — read from .hatch/roundtable/<slug>.json
+# and <slug>.rounds.json, validated in full, rendered as text only.
+review-strip-counts-the-rounds
+review-round-row-names-its-blob-and-verdicts
+review-strip-absent-when-no-review
+review-detail-never-enters-the-archived-poll-entry
+review-strings-render-as-text-never-markup
+review-component-template-has-no-v-html
+review-record-only-shows-verdicts-and-no-rounds
+review-strip-survives-a-mid-session-archive
+review-slug-cannot-escape-the-roundtable-directory
+review-file-corruption-degrades-to-unavailable
+
+# Status truth (audit F13/F14): a waived item never reads as passed, and the
+# engine's warnings/errors are on the page whenever the next action points at them.
+accepted-is-never-badged-passed
+notices-list-engine-warnings-and-errors
+
+# status-foundation: the design's colours, typeface and logo. The dark palette is
+# derived from the light one by the plan's dark rule and held to it; the page
+# carries no serif at all, and the two families the redesign dropped are named
+# nowhere; the icon component names or hides every glyph, and the egg logo is
+# drawn on its own canvas. Two names RETIRED here, not lost:
+# binder-headline-at-the-serif-display-step and
+# card-title-on-the-serif-at-the-cards-own-step each pinned a role to the serif,
+# and the design has none — both claims move to the absence claim
+# no-serif-family-on-the-page, recorded both ways in _RETIRED_BEHAVIOURS.
+palette-dark-follows-the-dark-rule
+no-serif-family-on-the-page
+vendored-typefaces-named-as-shipped
+hatch-icon-names-or-hides-itself
+egg-logo-in-its-own-viewbox
+
+# The cross-repo home (cross-repo-home): the hub's / is the app document a repo
+# page is, seeded with the roster hub_cards builds and polling each repo's own
+# /r/<slug>/state.json on the one refresh decision. Eight names RETIRED here,
+# not lost, each recorded both ways in _RETIRED_BEHAVIOURS: hub-landing-cards,
+# hub-card-verdict-vocabulary and hub-landing-token-parity move to
+# repo-chip-vocabulary; hub-landing-empty to cross-repo-empty-roster;
+# hub-refresh-shared-decision and hub-refresh-off-means-off to the two
+# cross-repo refresh claims; switcher-also-watching to its absence,
+# no-also-watching-switcher; and shell-ephemeral-no-hub, its switcher half
+# gone, to ephemeral-page-has-no-hub-link.
+repo-chip-vocabulary
+cross-repo-empty-roster
+cross-repo-poll-shares-the-refresh-decision
+cross-repo-refresh-off-means-off
+no-also-watching-switcher
+ephemeral-page-has-no-hub-link
+repo-word-mirrors-the-card-word
+wedged-repo-recovers-on-the-next-poll
+unavailable-repo-is-never-polled
+cross-repo-builds-carry-repo-name-and-chip
+hub-home-inlines-the-roster
+open-build-is-found-in-its-own-repo
+hub-landing-is-gone
+
+# The detail frame and its first two sections (builds-and-wave-map): every view
+# but home sits in one frame — Back, then the Builds and Wave map tabs — and
+# both sections read one row model over the roll and wave grouping the home
+# squares read. The squares' header buttons open them.
+detail-frame-has-back-and-section-tabs
+square-links-open-their-views
+builds-view-lists-every-build
+build-marks-render-from-one-table
+wave-map-shows-every-builds-waves
+build-rows-and-wave-boxes-open-their-build
+state-pill-and-progress-bar-are-shared-atoms
+builds-mirrors-match-their-twins
+
+# The build view (build-drill-in): one build inside the detail frame — its
+# header, the 'What happens next' card in place of the next-action band, its
+# progress, the two info cards, the review strip, and one tinted frame per wave
+# with the item cards inside.
+build-view-is-one-card-on-the-page
+build-header-states-roll-hat-slug-and-branch
+build-header-shows-only-unsaid-marks
+delivered-mark
+next-step-card-has-a-variant-per-level
+next-step-card-points-to-the-build-it-names
+copy-command-says-where-to-run-it
+commandless-levels-offer-nothing-to-copy
+build-info-cards-say-what-and-how
+wave-frame-per-depth
+review-strip-renders-whenever-review-is-set
+cycle-error-shows-and-every-build-renders
+container-corners-are-the-new-designs-steps
+build-view-mirrors-match-their-twins
+
+# The work-item card (item-cards): the Hatch Status design's card (template
+# L554-585) with a word for every engine state. A halted card opens with the
+# 'HALTED — NEEDS YOU' banner; every started state shows the Build / Test /
+# Merge bar; the lead reads the state, any CARRIED OVER tag, then
+# 'W<n> · <id> · <size>', then the title; the check is named in words; the
+# detail rows are the design's, with the branch among them; the card claims no
+# fact the engine lacks; and the alarm keyframe is gone. Seven retired names
+# are recorded both ways in _RETIRED_BEHAVIOURS.
+halted-card-opens-with-the-needs-you-banner
+running-stage-marks-the-current-step
+item-stages-mirror-matches-its-twin
+how-we-check-it-row-names-the-check
+card-lead-reads-state-meta-then-title
+card-body-on-the-jakarta-body-step
+reduced-motion-keeps-running-legible
+no-alarm-keyframe
+carried-item-wears-the-carried-over-tag
+item-detail-names-the-items-branch
+card-claims-no-fact-the-engine-lacks
+state-square-draws-its-glyph-or-badge
+
+# The Running and Needs you views (running-and-needs-you): every building item,
+# every place a person is needed with the command its rule allows to copy, the
+# four tabs and the four square buttons, and the one K they all agree on.
+running-view-lists-every-building-item
+needs-view-draws-a-card-per-row
+needs-cards-copy-only-the-command-their-rule-allows
+needs-view-makes-no-request-and-drops-the-secondary-buttons
+needs-count-agrees-across-tab-square-and-headline
+running-and-needs-mirrors-match-their-twins
+
+# The dark theme's contrast floor (dark-theme-contrast): every text-on-ground
+# pairing the page paints, derived from the stylesheet over the templates and
+# held to 4.5:1 in the dark palette; the arithmetic against published answers;
+# the report that prints both themes; and a forced dark render that leaves no
+# role empty and no variable undefined.
+wcag-contrast-known-answers
+dark-text-pairs-clear-the-floor
+contrast-report-marks-what-the-floor-refuses
+forced-dark-render-defines-every-role
+
+# The closing comparison (status-fidelity-gate): the root component's data
+# never shares a name with one of its computed properties or methods, the
+# shadowing that had hidden the build view's next-step tag and where-to-run
+# line.
+root-data-never-shadows-a-computed-or-method
+# Every build's status line under its waves, on the home square and the wave
+# map (the design's nowText), and the lanes' legend and the wave HAT where the
+# design repeats them: under the home waves square and in HOW IT RUNS.
+build-status-line-follows-the-roll
+lanes-legend-and-wave-hat-on-home-and-the-build
+home-tally-counts-each-roll

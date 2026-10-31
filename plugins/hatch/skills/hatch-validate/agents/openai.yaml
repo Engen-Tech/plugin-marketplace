@@ -1,0 +1,5 @@
+interface:
+  display_name: "hatch-validate"
+  short_description: "Visual acceptance gate: compare a running view against its design prototype and report discrepancies."
+policy:
+  allow_implicit_invocation: true
