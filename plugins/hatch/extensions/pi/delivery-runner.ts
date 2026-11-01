@@ -295,6 +295,7 @@ function successorHalt(packet: PreflightPacket, planned: SupersedesSpec): string
  * The halt for a wave build that produced no mergeable checkpoint. An empty build is
  * either a whiff (re-dispatch) or a change already on the base (a plan change through a
  * per docs/how-to/binder-repair.md, with the oracle receipt as its evidence); neither writes a completion ref.
+ * A blocked or failed build's reason comes from buildHaltReason; this text is its fallback.
  */
 function buildHaltMessage(item: string, status: string): string {
   if (status === "already-present") {
@@ -313,12 +314,79 @@ function buildHaltMessage(item: string, status: string): string {
       "no completion ref was written. Re-dispatch the item's worker."
     );
   }
-  return `Item '${item}' did not produce a mergeable built checkpoint.`;
+  return `Item '${item}' did not produce a mergeable built checkpoint (${status}).`;
+}
+
+/** Build statuses that leave no mergeable checkpoint; every other status is merged serially. */
+const BUILD_HALT_STATUSES = ["failed", "blocked", "no-change", "already-present"];
+
+interface DeferredItem {
+  status: string;
+  message: string;
+}
+
+/**
+ * The reason recorded for an item whose build halted. A blocked build carries the
+ * worker's own words; a failed build carries the host's message plus the gate findings
+ * that capped it, in the same shape as a merge-time failure; an empty build keeps its
+ * specific text.
+ */
+function buildHaltReason(build: HatchBuildItemResult): string {
+  const detail = build.message?.trim();
+  if (build.status === "failed") {
+    const reason = haltReasonWithFindings(build.message ?? "", [build.finalization?.verification]);
+    if (reason.trim()) return reason;
+  }
+  if (build.status === "blocked" && detail) return detail;
+  return buildHaltMessage(build.item, build.status);
+}
+
+/**
+ * The aggregate stop for a run whose remaining frontier is held by items halted in this
+ * run: each halted item with its status and reason, what landed, and what stalls behind them.
+ */
+function deferredHaltMessage(
+  items: DeliveryItem[],
+  deferred: Map<string, DeferredItem>,
+  landedThisRun: readonly string[],
+  done: (item: string) => boolean,
+): string {
+  const halted = [...deferred].filter(([item]) => !done(item));
+  // An item that landed and was later rolled back has lost its done ref, so the
+  // done check keeps the list to what is on the integration tip now.
+  const landed = [...new Set(landedThisRun)].filter((item) => done(item));
+  const blocked = new Set(halted.map(([item]) => item));
+  const waiting: string[] = [];
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const item of items) {
+      if (blocked.has(item.id) || done(item.id)) continue;
+      if (item.depends_on.some((dependency) => blocked.has(dependency))) {
+        blocked.add(item.id);
+        waiting.push(item.id);
+        grew = true;
+      }
+    }
+  }
+  return [
+    ...halted.map(([item, value]) => `${item} (${value.status}): ${value.message}`),
+    `landed: ${landed.length > 0 ? landed.join(", ") : "none"}`,
+    `stalled behind them: ${waiting.length > 0 ? waiting.join(", ") : "none"}`,
+  ].join("\n");
 }
 
 /** The finding text of a failed merge-time integration, bounded for a prompt. */
 function integrationHaltReason(result: HatchIntegrationResult): string {
-  const findings = [result.verification, result.safetyVerification]
+  return haltReasonWithFindings(result.message, [result.verification, result.safetyVerification]);
+}
+
+/** A halt message followed by every gate finding of the given verifications, bounded for a prompt. */
+function haltReasonWithFindings(
+  message: string,
+  verifications: (HatchIntegrationResult["verification"] | undefined)[],
+): string {
+  const findings = verifications
     .flatMap((verification) => Object.values(verification?.gates ?? {}))
     .flatMap(
       (gate) =>
@@ -330,7 +398,7 @@ function integrationHaltReason(result: HatchIntegrationResult): string {
     .map((finding) =>
       `[${finding.severity ?? "unknown"}] ${finding.code ?? "finding"}: ${finding.message ?? ""}`.trim(),
     );
-  const reason = [result.message, ...findings].join(" ");
+  const reason = [message, ...findings].join(" ").trim();
   return reason.length > 1_000 ? `${reason.slice(0, 997)}...` : reason;
 }
 
@@ -1177,6 +1245,11 @@ export class HatchDeliveryRunner {
       const activeItems = document.work_items.filter((item) => !carried.has(item.id));
       // Why each item halted in this run, shown at the human's fix/accept/defer prompt.
       const haltReasons = new Map<string, string>();
+      // Items whose build halted in this run, with the status and reason. In memory only:
+      // Git refs stay the record, and a later run rebuilds the frontier from them.
+      const deferred = new Map<string, DeferredItem>();
+      // Items merged during this run, for the aggregate stop's "landed" line.
+      const landedThisRun: string[] = [];
       const waves: HatchDeliveryWave[] = [];
       const existingTags = await git(repoRoot, [
         "for-each-ref",
@@ -1278,6 +1351,7 @@ export class HatchDeliveryRunner {
                 message: "Recovered pending wave failed validation and was rolled back.",
               });
             }
+            landedThisRun.push(...integrations.map((integration) => integration.item));
             continue;
           }
           if (archived) {
@@ -1400,6 +1474,7 @@ export class HatchDeliveryRunner {
               message: "Recovered accepted merge failed post-wave validation and was rolled back.",
             });
           }
+          landedThisRun.push(acceptPending.id);
           continue;
         }
         const failed = activeItems.find((item) => states.get(item.id)?.state === "failed");
@@ -1424,6 +1499,9 @@ export class HatchDeliveryRunner {
           if (choice === "Fix and rerun") {
             const itemTip = states.get(failed.id)?.itemTip;
             if (!itemTip) throw new Error("Hatch failed item has no item tip");
+            // A rerun is the human's decision, so a build-time halt recorded earlier in
+            // this run no longer keeps the item out of the frontier.
+            deferred.delete(failed.id);
             await git(repoRoot, [
               "update-ref",
               "-d",
@@ -1509,11 +1587,14 @@ export class HatchDeliveryRunner {
               message: `Human acceptance for '${failed.id}' was cancelled, blocked, or rolled back.`,
             });
           }
+          landedThisRun.push(failed.id);
           waveNumber += 1;
           continue;
         }
         const ready = activeItems.filter((item) =>
-          !isDone(states, item.id) && item.depends_on.every((dependency) => isDone(states, dependency)),
+          !isDone(states, item.id) &&
+          !deferred.has(item.id) &&
+          item.depends_on.every((dependency) => isDone(states, dependency)),
         );
         const batch = collisionBatch(ready);
         const waveMates = batch.map((waveItem) => waveItem.id);
@@ -1521,6 +1602,21 @@ export class HatchDeliveryRunner {
         // authored for its own item, so a wave-mate's worker is not blamed for
         // this host's mid-wave branch, ref, and worktree writes.
         const ledger = new WaveHostLedger(repoRoot, binder);
+        if (batch.length === 0 && deferred.size > 0) {
+          return report({
+            schema: "hatch-delivery-v1",
+            binder,
+            status: "blocked",
+            integrationWorktree,
+            waves,
+            message: deferredHaltMessage(
+              activeItems,
+              deferred,
+              landedThisRun,
+              (item) => isDone(states, item),
+            ),
+          });
+        }
         if (batch.length === 0) {
           return report({
             schema: "hatch-delivery-v1",
@@ -1543,19 +1639,22 @@ export class HatchDeliveryRunner {
           integrations: [],
         };
         waves.push(waveResult);
-        const failedBuild = builds.find((build) =>
-          ["failed", "blocked", "no-change", "already-present"].includes(build.status),
-        );
-        if (failedBuild) {
-          return report({
-            schema: "hatch-delivery-v1",
-            binder,
-            status: "blocked",
-            integrationWorktree,
-            waves,
-            message: buildHaltMessage(failedBuild.item, failedBuild.status),
-          });
+        // Each item's own build decides that item. A halted build writes no ref and is
+        // set aside for the rest of this run; its dependents stall because it has no done
+        // ref. The wave-mates that built still merge, serially, in batch order.
+        const pairs = batch.map((item, index) => ({ item, build: builds[index] }));
+        for (const { item, build } of pairs) {
+          if (!BUILD_HALT_STATUSES.includes(build.status)) continue;
+          const reason = buildHaltReason(build);
+          deferred.set(item.id, { status: build.status, message: reason });
+          // A failed build leaves a failed ref, so the next pass asks the human about
+          // it; the prompt names this run's reason rather than an earlier run's.
+          if (build.status === "failed") haltReasons.set(item.id, reason);
         }
+        const mergeable = pairs.filter(({ build }) => !BUILD_HALT_STATUSES.includes(build.status));
+        if (mergeable.length === 0) continue;
+        // The anchor is written only when a merge follows: a started wave that never
+        // finishes leaves an anchor the pending-wave recovery cannot resolve.
         const anchor = await this.#waves.start(
           binder,
           waveNumber,
@@ -1568,8 +1667,8 @@ export class HatchDeliveryRunner {
         const itemChecks = new Map<string, HatchCheckPlanEntry[]>();
         const landed = new Set<string>();
         let integrationFailed = false;
-        for (const [index, item] of batch.entries()) {
-          itemChecks.set(item.id, builds[index].worker?.checks.map((check) => ({
+        for (const { item, build } of mergeable) {
+          itemChecks.set(item.id, build.worker?.checks.map((check) => ({
             ...check,
             purpose: "floor" as const,
           })) ?? []);
@@ -1589,14 +1688,11 @@ export class HatchDeliveryRunner {
             }
           }
           if (state.state !== "built") {
-            return report({
-              schema: "hatch-delivery-v1",
-              binder,
-              status: "blocked",
-              integrationWorktree,
-              waves,
-              message: `Item '${item.id}' is not in a serially mergeable built state.`,
-            });
+            const reason = `Item '${item.id}' is not in a serially mergeable built state.`;
+            deferred.set(item.id, { status: state.state, message: reason });
+            // Should that state be failed, the next pass's prompt names this run's reason.
+            haltReasons.set(item.id, reason);
+            continue;
           }
           let checks: HatchCheckPlanEntry[] = itemChecks.get(item.id) ?? [];
           if (checks.length === 0) {
@@ -1664,8 +1760,11 @@ export class HatchDeliveryRunner {
             message: "Post-wave validation failed; the wave was rolled back.",
           });
         }
+        landedThisRun.push(...landed);
         // A merge-time failure is not a stop by itself: the next pass finds the item
         // failed and asks the human (or, with no host to ask, blocks naming it).
+        // Every pass progresses: a batch with nothing to merge has just deferred every
+        // item, and each mergeable item either lands, is deferred, or is marked failed.
         waveNumber += 1;
       }
       throw new Error("Hatch delivery exceeded its deterministic orchestration bound");
