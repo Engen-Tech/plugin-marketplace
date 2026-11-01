@@ -36,6 +36,16 @@ orchestrator can check a returned report before acting on it instead of reading 
      judgments cannot be promoted into a passing report. These checks bind report
      claims to content; they do not prove the model performed the review.
 
+  4. ROW FORM AND NOTES. The parser is line-based and deliberately not widened; both
+     agent files state its rules instead. A safety disposition row is one line, and a
+     passing one reads exactly `CONFORMS`. An acceptance row runs from its
+     `- assertion <i> — ` start to the next `- assertion ` line or `**` heading, so a
+     wrapped row fails its disposition. A safety report's `**Notes (non-blocking):**`
+     section is free text here: no row, violation or coverage gap is read from it,
+     and a note never changes the verdict. A note that borrows the row shape
+     (`- rule <id> — ...`) is still read as a row wherever it sits, which is why the
+     safety agent file forbids that shape in Notes.
+
 Stdlib only. Invoked directly (not installed), matching the non-executable mode of
 sibling scripts:
 
@@ -449,6 +459,26 @@ def _run_self_test() -> int:
                       "--binder", str(bnd), "--item", "a", "--range", "base..tip"])
     check("main() exit codes: 0 clean / 1 findings / 2 unreadable input",
           clean == 0 and finding == 1 and usage == 2, f"{clean} {finding} {usage}")
+
+    # (m) a safety report's Notes section is free text: a passing pinned report with a
+    #     note is clean. NEGATIVE CONTROL: the same note written in the disposition-row
+    #     shape is read as a second row for the rule, so coverage fails by name.
+    one_rule = [{"id": "p1.1", "text": "rule text", "source": "p1"}]
+    one_pack: dict = {"sme": ["p1"], "work_items": [{"id": "a"}]}
+    rows = "**Checklist dispositions:**\n- rule p1.1 — CONFORMS\n\n**Violations (if any):**\n\n"
+    note = ("**Notes (non-blocking):**\n"
+            "- [note] [tests/t.py:9] — assertNotEqual(a, b) is redundant: line 8 pins both\n")
+    with_note = check_report(report("PASS", prov("ran", ["p1"], ["p1"], 1), rows + note),
+                             "safety", "pass", one_pack, expected_rules=one_rule)
+    check("a Notes section is free text: no row, violation or coverage gap is read from it",
+          with_note == [], str(with_note))
+    borrowed = check_report(
+        report("PASS", prov("ran", ["p1"], ["p1"], 1),
+               rows + note + "- rule p1.1 — redundant assertion at tests/t.py:9\n"),
+        "safety", "pass", one_pack, expected_rules=one_rule)
+    check("a note shaped like a rule row is read as a row and fails coverage",
+          "coverage: disposition every resolved checklist rule exactly once" in borrowed,
+          str(borrowed))
 
     shutil.rmtree(tmp, ignore_errors=True)
 

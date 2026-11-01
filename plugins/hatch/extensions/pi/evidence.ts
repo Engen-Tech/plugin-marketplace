@@ -125,6 +125,17 @@ export interface HatchCheckManifestEvidence {
   manifest?: HatchCheckManifest;
 }
 
+export interface HatchEvidenceRelation {
+  id: string;
+  touches: string[];
+  shared_resources: string[];
+}
+
+export interface HatchEvidenceRelations {
+  prerequisites: HatchEvidenceRelation[];
+  dependents: HatchEvidenceRelation[];
+}
+
 export interface HatchEvidencePayload {
   binder: {
     slug: string;
@@ -134,6 +145,7 @@ export interface HatchEvidencePayload {
     document: BinderDocument;
   };
   workItem: Record<string, unknown> & { id: string };
+  relations: HatchEvidenceRelations;
   git: {
     integrationRef: string;
     integrationTip: string;
@@ -254,6 +266,40 @@ async function validateBinderSource(raw: string, slug: string): Promise<void> {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === "string");
+}
+
+function byIdentifier(left: { id: string }, right: { id: string }): number {
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+}
+
+// Direct dependency edges only: the items this one names in `depends_on`, and the
+// items that name this one. Transitive reach is deliberately not expanded — the gate
+// judges an overlap between two items whose own declared changes join them.
+export function resolveItemRelations(
+  items: BinderDocument["work_items"],
+  itemId: string,
+): HatchEvidenceRelations {
+  const relation = (item: Record<string, unknown> & { id: string }): HatchEvidenceRelation => ({
+    id: item.id,
+    touches: stringList(item.touches),
+    shared_resources: stringList(item.shared_resources),
+  });
+  const prerequisites = stringList(items.find((item) => item.id === itemId)?.depends_on);
+  return {
+    prerequisites: items
+      .filter((item) => prerequisites.includes(item.id))
+      .map(relation)
+      .sort(byIdentifier),
+    dependents: items
+      .filter((item) => stringList(item.depends_on).includes(itemId))
+      .map(relation)
+      .sort(byIdentifier),
+  };
 }
 
 function parseBinder(raw: string, expectedSlug: string, item: string): {
@@ -813,6 +859,7 @@ export async function buildHatchEvidence(
       document,
     },
     workItem,
+    relations: resolveItemRelations(document.work_items, workItem.id),
     git: {
       integrationRef,
       integrationTip,
@@ -978,7 +1025,10 @@ export function createEvidenceReadTool(
             value = manifest.payload.binder.document;
             break;
           case "workItem":
-            value = manifest.payload.workItem;
+            // The gate prompt requires this action, so the edge direction travels with
+            // it: a gate that read the item cannot report a planned overlap between two
+            // items joined by a direct `depends_on` edge as an undeclared edit.
+            value = { ...manifest.payload.workItem, relations: manifest.payload.relations };
             break;
           case "diff": {
             const offset = params.offset ?? 0;

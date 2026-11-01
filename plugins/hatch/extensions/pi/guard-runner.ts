@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { PACKAGE_ROOT, requirePackagePath } from "./package-paths.ts";
 
 export const HATCH_GUARD_PATHS = {
@@ -11,11 +12,17 @@ export const HATCH_GUARD_PATHS = {
 
 export type HatchGuard = keyof typeof HATCH_GUARD_PATHS;
 
+export interface GuardFailure {
+  kind: "spawn" | "timeout" | "aborted" | "exit" | "error";
+  detail: string;
+}
+
 export interface GuardResult {
   code: number;
   stdout: string;
   stderr: string;
   failedOpen: boolean;
+  failure?: GuardFailure;
 }
 
 export interface GuardRunOptions {
@@ -25,6 +32,53 @@ export interface GuardRunOptions {
 }
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
+
+const MAX_FAILURE_DETAIL = 200;
+
+function lastNonEmptyLine(text: string): string {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim() !== "");
+  return lines.length > 0 ? lines[lines.length - 1].trim() : "";
+}
+
+/**
+ * Turns a finished guard process into a result. A crash or a kill is a fail-open,
+ * so it resolves code 0 like every other failure — but it names what happened.
+ */
+export function guardExitResult(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  stdout: string,
+  stderr: string,
+): GuardResult {
+  if (code === 0 || code === 2) {
+    return { code, stdout, stderr, failedOpen: false };
+  }
+  if (code === null) {
+    return {
+      code: 0,
+      stdout,
+      stderr,
+      failedOpen: true,
+      failure: { kind: "exit", detail: `ended by signal ${signal ?? "unknown"}` },
+    };
+  }
+  const line = lastNonEmptyLine(stderr);
+  const detail = `exited ${code}${line ? `: ${line}` : ""}`;
+  return {
+    code: 0,
+    stdout,
+    stderr,
+    failedOpen: true,
+    failure: { kind: "exit", detail: detail.slice(0, MAX_FAILURE_DETAIL) },
+  };
+}
+
+function spawnFailureDetail(error: NodeJS.ErrnoException, cwd: string): string {
+  // Node reports a missing working directory as `spawn uv ENOENT` too, so check cwd first.
+  if (!existsSync(cwd)) return `working directory ${cwd} does not exist`;
+  if (error.code === "ENOENT") return "uv was not found on PATH";
+  return error.message;
+}
 
 export function guardInvocation(guard: HatchGuard): { command: "uv"; args: string[] } {
   return {
@@ -50,6 +104,7 @@ export async function runHatchGuard(
     let stderr = "";
     let settled = false;
     let failedOpen = false;
+    let failure: GuardFailure | undefined;
     const environment = { ...process.env };
     delete environment.PYTHONHOME;
     delete environment.PYTHONPATH;
@@ -64,23 +119,33 @@ export async function runHatchGuard(
       windowsHide: true,
     });
     let forceKill: NodeJS.Timeout | undefined;
-    const stopChild = () => {
+    const stopChild = (reason: GuardFailure) => {
+      if (failedOpen) return;
       failedOpen = true;
+      failure = reason;
       child.kill();
       forceKill ??= setTimeout(() => child.kill("SIGKILL"), 1_000);
     };
-    const timeout = setTimeout(stopChild, options.timeout ?? 35_000);
-    const abort = () => stopChild();
+    const timeoutMs = options.timeout ?? 35_000;
+    const timeout = setTimeout(
+      () => stopChild({ kind: "timeout", detail: `timed out after ${timeoutMs / 1000} s` }),
+      timeoutMs,
+    );
+    const abort = () => stopChild({ kind: "aborted", detail: "cancelled" });
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
 
-    const finish = (code: number): void => {
+    const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
       options.signal?.removeEventListener("abort", abort);
-      resolve({ code: failedOpen ? 0 : code, stdout, stderr, failedOpen });
+      if (failedOpen) {
+        resolve({ code: 0, stdout, stderr, failedOpen: true, failure });
+        return;
+      }
+      resolve(guardExitResult(code, signal, stdout, stderr));
     };
 
     child.stdout.on("data", (chunk) => {
@@ -89,11 +154,11 @@ export async function runHatchGuard(
     child.stderr.on("data", (chunk) => {
       stderr = appendBounded(stderr, chunk);
     });
-    child.once("error", () => {
-      failedOpen = true;
-      finish(0);
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      stopChild({ kind: "spawn", detail: spawnFailureDetail(error, options.cwd) });
+      finish(null, null);
     });
-    child.once("close", (code) => finish(code ?? 0));
+    child.once("close", (code, signal) => finish(code, signal));
     child.stdin.on("error", () => undefined);
     child.stdin.end(JSON.stringify(payload));
   });

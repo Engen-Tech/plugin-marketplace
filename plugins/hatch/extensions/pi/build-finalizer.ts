@@ -30,7 +30,18 @@ import {
 const exec = promisify(execFile);
 const MAX_GIT_OUTPUT = 4 * 1024 * 1024;
 
-export type HatchBuildFinalizationStatus = "built" | "failed" | "retry" | "blocked" | "no-change";
+// "no-change" is a whiff: the worker staged nothing and nothing proves the item's work is
+// already on the base, so the item halts for re-dispatch. "already-present" is an empty
+// candidate whose own diff against its merge base is empty AND whose oracle passes on
+// HEAD: the change is already on the base, which needs a plan decision, not a rebuild.
+// Neither writes any completion ref.
+export type HatchBuildFinalizationStatus =
+  | "built"
+  | "failed"
+  | "retry"
+  | "blocked"
+  | "no-change"
+  | "already-present";
 
 export type HatchFinalizationCheckpoint = (
   name:
@@ -54,6 +65,9 @@ export interface HatchBuildFinalizationResult {
   checkFailure?: CheckConvergenceResult;
   hookValidation?: HookValidationResult;
   verification?: HatchVerificationResult;
+  // Set on an empty candidate whose already-present oracle probe changed the worktree
+  // (tracked or untracked, not ignored); the host restored it to HEAD before returning.
+  probeRestored?: boolean;
   message: string;
 }
 
@@ -124,6 +138,24 @@ async function rejectProtectedCandidate(cwd: string): Promise<void> {
   if (protectedPath) {
     throw new Error(`Hatch build candidate modifies protected orchestration state: ${protectedPath}`);
   }
+}
+
+// Tracked or untracked changes in a worktree; ignored files do not count.
+async function worktreeChanges(worktree: string): Promise<boolean> {
+  return (await git(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])) !== "";
+}
+
+// Put a worktree that entered a probe clean back to HEAD: index, tracked files, and any
+// untracked file the probe wrote. Ignored files (installed dependencies) are kept.
+// Returns whether anything had to be restored.
+async function restoreProbedWorktree(worktree: string): Promise<boolean> {
+  if (!(await worktreeChanges(worktree))) return false;
+  await git(worktree, ["reset", "--hard", "--quiet", "HEAD"]);
+  await git(worktree, ["clean", "-f", "-d", "--quiet"]);
+  if (await worktreeChanges(worktree)) {
+    throw new Error("Hatch could not restore the item worktree after the already-present oracle probe");
+  }
+  return true;
 }
 
 function finalizationStatus(verification: HatchVerificationResult): HatchBuildFinalizationStatus {
@@ -614,6 +646,98 @@ export class HatchBuildFinalizer {
     };
   }
 
+  // The staged tree equals HEAD. Tell a whiff from a change already on the base before
+  // halting: already-present needs the item's own diff against its merge base (the base
+  // the evidence builder uses) to be empty AND its oracle to pass on HEAD's exact tree.
+  // Anything less — a diff of its own, no runnable oracle, an oracle that fails or moves
+  // the tree — stays no-change. This path never commits and never writes a ref: a done or
+  // built ref with no item merge behind it is the forged-done shape provenance rejects.
+  async #classifyEmptyCandidate(
+    ctx: ExtensionContext,
+    binder: string,
+    item: string,
+    worktree: string,
+    headTree: string,
+    processContext?: { manager: HatchProcessManager; owner: BinderLifecycleOwner },
+  ): Promise<HatchBuildFinalizationResult> {
+    const whiff = (extra: Partial<HatchBuildFinalizationResult> = {}): HatchBuildFinalizationResult => ({
+      status: "no-change",
+      binder,
+      item,
+      targetTree: headTree,
+      ...extra,
+      message:
+        "Worker produced no candidate change, and the item's work is not proven present on the base " +
+        "(its own diff is not empty, or it has no oracle that passes on HEAD); no completion ref was " +
+        "written. Re-dispatch the worker.",
+    });
+    const evidence = await buildHatchEvidence({ cwd: worktree, binder, item, target: "committed" });
+    if (evidence.payload.git.targetTree !== headTree || evidence.payload.diff.touchedPaths.length > 0) {
+      return whiff();
+    }
+    const oracle = oracleCheck(evidence.payload.workItem);
+    if (!oracle) return whiff();
+    // The probe runs in the worker's worktree, and the convergence loop stages what the
+    // oracle writes. Enter clean and leave clean: a file the oracle generates must not sit
+    // staged for the re-dispatch this halt may ask for, where it would be finalized as
+    // the item's candidate.
+    if (await worktreeChanges(worktree)) return whiff();
+    let probeRestored = false;
+    let convergence: CheckConvergenceResult;
+    try {
+      convergence = await runStableTreeChecks({
+      worktree,
+      checks: [oracle],
+      environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
+      signal: ctx.signal,
+      onProcessStart: processContext
+        ? (pid) =>
+            processContext.manager.registerProcess(pid, {
+              cwd: worktree,
+              parentId: processContext.owner.id,
+              label: `${item} already-present oracle`,
+              role: "host-check",
+            })
+        : undefined,
+      onProcessExit: processContext
+        ? (pid) => processContext.manager.forgetProcess(pid)
+        : undefined,
+      });
+    } finally {
+      probeRestored = await restoreProbedWorktree(worktree);
+    }
+    const restored = probeRestored ? { probeRestored } : {};
+    if (convergence.status === "precondition-unmet") {
+      return {
+        status: "blocked",
+        binder,
+        item,
+        targetTree: convergence.targetTree,
+        checkFailure: convergence,
+        ...restored,
+        message: preconditionHaltMessage(convergence),
+      };
+    }
+    if (convergence.status !== "stable" || convergence.targetTree !== headTree || probeRestored) {
+      return whiff({ checkFailure: convergence, ...restored });
+    }
+    if ((await git(worktree, ["rev-parse", "HEAD^{tree}"])) !== headTree) {
+      throw new Error("Hatch item HEAD moved while proving an already-present change");
+    }
+    return {
+      status: "already-present",
+      binder,
+      item,
+      targetTree: headTree,
+      checks: convergence.manifest,
+      message:
+        "The item's change is already on the base: its diff against the merge base is empty and its " +
+        "oracle passes on HEAD. No completion ref was written; a plan change per docs/how-to/binder-repair.md " +
+        "decides the item (a successor binder that drops or amends it when other items are done, or " +
+        "withdrawing the binder when none is), with this oracle receipt as its evidence.",
+    };
+  }
+
   async finalizeCandidate(
     ctx: ExtensionContext,
     binder: string,
@@ -631,13 +755,7 @@ export class HatchBuildFinalizer {
     const stagedTree = await git(worktree, ["write-tree"]);
     const headTree = await git(worktree, ["rev-parse", "HEAD^{tree}"]);
     if (stagedTree === headTree) {
-      return {
-        status: "no-change",
-        binder,
-        item,
-        targetTree: stagedTree,
-        message: "Worker produced no candidate change; no completion ref was written.",
-      };
+      return this.#classifyEmptyCandidate(ctx, binder, item, worktree, headTree, processContext);
     }
     await rejectProtectedCandidate(worktree);
     const preliminaryEvidence = await buildHatchEvidence({

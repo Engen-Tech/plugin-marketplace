@@ -14,6 +14,7 @@ import {
 } from "./child-runtime.ts";
 import { canonicalJson } from "./evidence.ts";
 import {
+  effectiveGateVerdict,
   parseGateVerdict,
   type HatchGateFinding,
   type HatchGateVerdict,
@@ -141,6 +142,9 @@ export interface VisualGateResult {
   retry: HatchRetryClassification;
   provider: string;
   model: string;
+  // The verdict the model itself returned, present only when the design reviewer's own
+  // rule reads a minor-only `concerns` as a pass. The findings stay as reported.
+  reportedVerdict?: HatchGateVerdict;
   // Present only when an operator-trusted executable provider hook carried the
   // visual gate child, so a result without it records no trust decision.
   trustedProviderHook?: string;
@@ -645,15 +649,20 @@ export async function judgeVisualEvidence(
     profileHash,
   });
 
+  // The design reviewer's own rule: PASS when no critical or major discrepancy remains;
+  // minor drift may remain and is listed in the notes. The findings stay on the record.
+  const verdict = effectiveGateVerdict(VISUAL_GATE_ROLE, parsed.verdict, parsed.findings);
+
   return {
     status: "judged",
     schema: VERDICT_SCHEMA,
     role: VISUAL_GATE_ROLE,
     dispatchHash,
-    verdict: parsed.verdict,
+    verdict,
+    ...(verdict === parsed.verdict ? {} : { reportedVerdict: parsed.verdict }),
     summary: parsed.summary,
     findings: parsed.findings,
-    retry: classifyRetry(parsed.verdict),
+    retry: classifyRetry(verdict),
     provider: runtime.provider,
     model: runtime.model,
     ...(runtime.trustedProviderHook

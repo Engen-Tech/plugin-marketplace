@@ -213,10 +213,71 @@ def _chmod_if_posix(path: Path | str, mode: int) -> None:
             raise
 
 
+# Store-write registry (the self-test's real-state-dir guard). While a
+# self-test records, every store writer notes the directory it touched: in
+# memory for this process, and appended to the file named by
+# _STORE_WRITES_ENV for any child that inherits it. The guard then asks
+# whether the real per-user dir is among them, which a live hub writing that
+# same dir concurrently cannot disturb (a before/after diff of the directory
+# could not tell the hub's writes from the self-test's).
+_STORE_WRITES: set[str] | None = None
+_STORE_WRITES_ENV = "HATCH_WATCH_SELFTEST_WRITES"
+
+
+def _note_store_write(target: Path | str) -> None:
+    """Record that a store writer touched `target` (a state dir, or a file in
+    one). A no-op unless a self-test is recording."""
+    log = os.environ.get(_STORE_WRITES_ENV)
+    if _STORE_WRITES is None and not log:
+        return
+    try:
+        resolved = str(Path(target).resolve())
+    except (OSError, RuntimeError):
+        resolved = os.path.abspath(os.fspath(target))
+    if _STORE_WRITES is not None:
+        _STORE_WRITES.add(resolved)
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(resolved + "\n")
+        except OSError:
+            pass
+
+
+@contextlib.contextmanager
+def _recording_store_writes(log_path: Path | None = None):
+    """Record every store write made inside the block; yields the live set.
+    With `log_path`, children started inside the block record there too."""
+    global _STORE_WRITES
+    prev, prev_log = _STORE_WRITES, os.environ.get(_STORE_WRITES_ENV)
+    _STORE_WRITES = set()
+    if log_path is not None:
+        os.environ[_STORE_WRITES_ENV] = str(log_path)
+    try:
+        yield _STORE_WRITES
+    finally:
+        _STORE_WRITES = prev
+        if prev_log is None:
+            os.environ.pop(_STORE_WRITES_ENV, None)
+        else:
+            os.environ[_STORE_WRITES_ENV] = prev_log
+
+
+def _store_writes_touch(state_dir: Path | str, writes) -> bool:
+    """True when any recorded write is `state_dir` itself or lies inside it."""
+    try:
+        real = Path(state_dir).resolve()
+    except (OSError, RuntimeError):
+        real = Path(os.path.abspath(os.fspath(state_dir)))
+    return any(Path(w) == real or Path(w).is_relative_to(real)
+               for w in writes if w)
+
+
 def ensure_state_dir(state_dir: Path | None = None) -> Path:
     """Store startup: create the state dir 0o700 (POSIX; best-effort elsewhere)
     and sweep stale temp files a crashed writer left behind."""
     sd = Path(state_dir) if state_dir is not None else resolve_state_dir()
+    _note_store_write(sd)
     sd.mkdir(mode=0o700, parents=True, exist_ok=True)
     _chmod_if_posix(sd, 0o700)
     now = time.time()
@@ -231,6 +292,7 @@ def ensure_state_dir(state_dir: Path | None = None) -> Path:
 
 def _atomic_write(path: Path, text: str) -> None:
     """Same-directory temp file + os.replace; the file lands 0o600 (POSIX)."""
+    _note_store_write(path.parent)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".",
                                suffix=".tmp")
     try:
@@ -292,6 +354,7 @@ def _store_lock(state_dir: Path):
     locked = False
     try:
         try:
+            _note_store_write(state_dir)
             fh = open(state_dir / LOCK_FILENAME, "ab")
             if fcntl is not None:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
@@ -6682,6 +6745,7 @@ def _hub_logger(state_dir: Path, max_bytes: int = LOG_MAX_BYTES,
     daemon runs with stdio on /dev/null, so this file is the only trace."""
     logger = logging.Logger("hatch-watch-hub")  # standalone — never the global registry
     logger.setLevel(logging.INFO)
+    _note_store_write(state_dir)
     handler = _OwnerOnlyRotatingHandler(state_dir / LOG_FILENAME,
                                         maxBytes=max_bytes, backupCount=backups,
                                         encoding="utf-8")
@@ -7846,22 +7910,6 @@ def _self_exit_watch(httpd, state_dir: Path | None,
             httpd.hub_logger.info("self-exit: %s", reason)
             httpd.shutdown()
             return
-
-
-def _dir_snapshot(path: Path):
-    """A comparable fingerprint of a directory's contents (None when absent).
-
-    The rotating hub log (hub.log*) counts by NAME only: a LIVE hub — plus any
-    open watch tab polling it — keeps appending to its own log while a
-    self-test runs, and that concurrent append is background activity, not a
-    self-test write. A self-test that *creates* a real log file still trips
-    the guard (the name appears); every other file keeps its full size+mtime
-    fingerprint."""
-    if not path.exists():
-        return None
-    return sorted((p.name, None, None) if p.name.startswith(LOG_FILENAME)
-                  else (p.name, p.stat().st_size, p.stat().st_mtime_ns)
-                  for p in path.iterdir())
 
 
 def _store_self_test_checks(scratch: Path) -> list[tuple[str, bool]]:
@@ -21631,7 +21679,8 @@ def _run_self_test() -> int:
     against a temp state dir (HATCH_WATCH_STATE_DIR) — never the real one."""
     # Store isolation (the self-test seam): point HATCH_WATCH_STATE_DIR at a
     # fresh temp dir for the WHOLE run — no self-test may ever read or write
-    # the real per-user state dir — and fingerprint the real dir to prove it.
+    # the real per-user state dir — and record every store write (this
+    # process's and its children's) to prove it.
     prev_override = os.environ.get("HATCH_WATCH_STATE_DIR")
     scratch = Path(tempfile.mkdtemp(prefix="hatch-watch-selftest-"))
     # Every other temp dir a check makes (the review fixtures call a bare
@@ -21641,7 +21690,8 @@ def _run_self_test() -> int:
     (scratch / "tmp").mkdir()
     tempfile.tempdir = str(scratch / "tmp")
     try:
-        rc = _run_self_test_in(scratch)
+        with _recording_store_writes(scratch / "store-writes.log"):
+            rc = _run_self_test_in(scratch)
     finally:
         tempfile.tempdir = prev_tempdir
         if prev_override is None:
@@ -21661,7 +21711,6 @@ def _run_self_test_in(scratch: Path) -> int:
     os.environ["HATCH_WATCH_STATE_DIR"] = str(scratch / "default-store")
     real_state_dir = resolve_state_dir(environ={
         k: v for k, v in os.environ.items() if k != "HATCH_WATCH_STATE_DIR"})
-    real_before = _dir_snapshot(real_state_dir)
 
     def _u(assertion, otype="unit"):
         return {"type": otype, "assertions": [assertion], "command": "npm run lint && npm test"}
@@ -21999,9 +22048,29 @@ def _run_self_test_in(scratch: Path) -> int:
     checks += _etag_self_test_checks(scratch)
     checks += _poll_self_test_checks()
     checks += _review_self_test_checks()
+    # The guard reads only the writes this run made (in-process registry plus
+    # the children's log file), so a live hub writing the real dir at the
+    # same time cannot flip it. The control proves it can still fail: a write
+    # into a stand-in "real" dir is reported.
+    run_writes = set(_STORE_WRITES or ())
+    children_log = os.environ.get(_STORE_WRITES_ENV)
+    if children_log:
+        try:
+            run_writes.update(
+                Path(children_log).read_text(encoding="utf-8").splitlines())
+        except OSError:
+            pass
+    stand_in = scratch / "guard-control" / "hatch-watch"
+    with _recording_store_writes() as control_writes:
+        upsert_repo(str(scratch / "guard-control" / "repo"), state_dir=stand_in)
     checks += [
         ("no self-test touched the real per-user state dir",
-         _dir_snapshot(real_state_dir) == real_before),
+         _STORE_WRITES is not None and bool(run_writes)
+         and not _store_writes_touch(real_state_dir, run_writes)),
+        ("coverage: the real-state-dir guard can fail (a store write into a "
+         "stand-in real dir is reported)",
+         _store_writes_touch(stand_in, control_writes)
+         and not _store_writes_touch(real_state_dir, control_writes)),
     ]
     failures = sum(1 for _, ok in checks if not ok)
     for name, ok in checks:

@@ -53,10 +53,32 @@ interface ChildGateVerdict {
   findings: HatchGateFinding[];
 }
 
+// The deliverable's own reviewer rules decide this. The acceptance reviewer says a
+// minor-only item never triggers a loop and is listed in the report's notes; the design
+// reviewer passes when no critical or major discrepancy remains, with minor drift listed
+// in the notes. So a `concerns` verdict from those two roles that carries findings, all of
+// them `minor`, is an effective pass. The safety auditor has no minor exemption — any
+// undeclared crossing is a violation — and every other verdict is returned unchanged.
+// Derived after the child verdict is parsed and validated; parsing and the hash binding
+// are untouched.
+export function effectiveGateVerdict(
+  roleId: HatchGateRoleId,
+  verdict: HatchGateVerdict,
+  findings: readonly HatchGateFinding[],
+): HatchGateVerdict {
+  if (verdict !== "concerns") return verdict;
+  if (roleId !== "acceptance-gate" && roleId !== "visual-gate") return verdict;
+  if (findings.length === 0) return verdict;
+  return findings.every((finding) => finding.severity === "minor") ? "pass" : verdict;
+}
+
 export interface HatchGateResult extends ChildGateVerdict {
   retry: HatchRetryClassification;
   provider: string;
   model: string;
+  // The verdict the model itself returned, present only when the reviewer doctrine
+  // reads it as an effective pass (minor-only findings). The findings stay as reported.
+  reportedVerdict?: HatchGateVerdict;
   // Present only when an operator-trusted executable provider hook carried the
   // gate child, so a result without it records no trust decision.
   trustedProviderHook?: string;
@@ -533,9 +555,15 @@ export async function executeGateOnEvidence(
     profileHash: profile.profileHash,
   });
   validateRoleToolResult(profile, parsed);
+  // The effective verdict is what every caller routes on. When it differs from what the
+  // reviewer actually said, the model's verdict is kept as reportedVerdict and the
+  // findings are kept as reported, so the record never claims the gate said "pass".
+  const verdict = effectiveGateVerdict(roleId, parsed.verdict, parsed.findings);
   return {
     ...parsed,
-    retry: classifyRetry(parsed.verdict),
+    verdict,
+    ...(verdict === parsed.verdict ? {} : { reportedVerdict: parsed.verdict }),
+    retry: classifyRetry(verdict),
     provider: runtime.provider,
     model: runtime.model,
     ...(runtime.trustedProviderHook

@@ -144,6 +144,8 @@ Emit this report (snapshot — overwrite whole each attempt; no timeline):
 
 Use the binder's zero-based assertion indices and quote each assertion exactly once. Compute the diff digest from the command's stdout bytes; do not hash a prose summary. The report checker compares it with the live dispatched range before aggregation.
 
+**Write each assertion row on one line.** The report checker reads a row from its `- assertion <i> — ` start up to the next `- assertion ` line or `**` heading, so a wrapped row, a sub-bullet under it, or any text between the last row and `**Contract conformance:**` becomes part of that row's disposition and fails it. Each row is `- assertion <i> — <assertion verbatim> — <disposition>` on a single line. A conforming inspection-verifiable row ends with exactly `inspection-verifiable — CONFORMS`, nothing after it; an execution-required row names its evidence on the same line, right after `covered-by-command`, `covered-by-test` or `declared-debt`. Put any explanation in the Notes section, never on or under a row, and never start a note with `- assertion `. The checker was deliberately not widened, so a correct report that breaks these shapes is rejected as malformed.
+
 ## Return envelope
 
 After the report, return only:

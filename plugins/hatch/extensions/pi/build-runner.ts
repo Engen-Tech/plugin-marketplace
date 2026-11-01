@@ -36,7 +36,7 @@ export interface HatchBuildItemResult {
   schema: "hatch-build-item-v1";
   binder: string;
   item: string;
-  status: "built" | "failed" | "blocked" | "no-change" | "recovered";
+  status: "built" | "failed" | "blocked" | "no-change" | "already-present" | "recovered";
   recoveryState: HatchItemRecoveryState;
   attempts: number;
   worktree?: string;
@@ -366,7 +366,11 @@ export class HatchBuildItemRunner {
               { manager: this.#processes, owner },
             );
         await this.#checkpoint("finalization-returned");
-        if (finalization.status === "built" || finalization.status === "no-change") {
+        if (
+          finalization.status === "built" ||
+          finalization.status === "no-change" ||
+          finalization.status === "already-present"
+        ) {
           return {
             schema: "hatch-build-item-v1",
             binder,

@@ -22,6 +22,21 @@ export type GuardExecutor = (
   options: GuardRunOptions,
 ) => Promise<GuardResult>;
 
+// pi-subagents marks the async runner process that hosts child sessions, and descendants inherit it.
+export const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
+
+export function isSubagentChildProcess(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[SUBAGENT_CHILD_ENV] === "1";
+}
+
+const GUARD_LABELS: Record<HatchGuard, string> = {
+  binderImmutability: "committed-binder guard",
+  packWrite: "stack-pack guard",
+  deliveryStop: "dirty-delivery check",
+  subagentWhiff: "whiffed-item check",
+  statusInjection: "status context",
+};
+
 const BINDER_PATH = /(?:^|\/)\.hatch\/binders\/(?:archive\/)?[^/]+\.json$/;
 const PACK_PATH = /(?:^|\/)\.hatch\/sme\/.+\.md$/;
 
@@ -64,26 +79,70 @@ function piDirtyDeliveryMessage(reason: string): string {
 export class HatchGuardAdapter {
   readonly extension: ExtensionAPI;
   readonly executeGuard: GuardExecutor;
+  readonly isChildSession: () => boolean;
   #stopped = false;
   #settledCheckRunning = false;
   #lastWhiff?: string;
+  readonly #reportedFailures = new Set<string>();
   readonly #shutdownController = new AbortController();
 
-  constructor(extension: ExtensionAPI, executeGuard: GuardExecutor = runHatchGuard) {
+  constructor(
+    extension: ExtensionAPI,
+    executeGuard: GuardExecutor = runHatchGuard,
+    isChildSession: () => boolean = () => isSubagentChildProcess(),
+  ) {
     this.extension = extension;
     this.executeGuard = executeGuard;
+    this.isChildSession = isChildSession;
+  }
+
+  // A guard that could not run still lets the action through, but the operator hears it once
+  // per cause per session instead of the failure passing silently.
+  #reportFailure(guard: HatchGuard, result: GuardResult, ctx: ExtensionContext): void {
+    const failure = result.failure;
+    if (!result.failedOpen || !failure || failure.kind === "aborted") return;
+    // Every guard shares the launcher, so one spawn message covers them all.
+    const key = failure.kind === "spawn" ? `spawn:${failure.detail}` : `${guard}:${failure.kind}`;
+    if (this.#reportedFailures.has(key)) return;
+    this.#reportedFailures.add(key);
+    const message =
+      failure.kind === "spawn"
+        ? `hatch: Hatch guards could not start: ${failure.detail}. Every Hatch guard is letting actions through without checking them.` +
+          (failure.detail === "uv was not found on PATH"
+            ? " Install uv or put it on PATH, then restart Pi."
+            : "")
+        : `hatch: the ${GUARD_LABELS[guard]} did not run (${failure.detail}). Hatch skipped it rather than block your work, so nothing was checked this time.`;
+    try {
+      if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      else process.stderr.write(`${message}\n`);
+    } catch {
+      // Reporting a failure must never be the thing that breaks the action.
+    }
   }
 
   async #runGuard(
     guard: HatchGuard,
     payload: unknown,
     options: GuardRunOptions,
+    ctx: ExtensionContext,
   ): Promise<GuardResult> {
+    let result: GuardResult;
     try {
-      return await this.executeGuard(guard, payload, options);
-    } catch {
-      return { code: 0, stdout: "", stderr: "", failedOpen: true };
+      result = await this.executeGuard(guard, payload, options);
+    } catch (error) {
+      result = {
+        code: 0,
+        stdout: "",
+        stderr: "",
+        failedOpen: true,
+        failure: {
+          kind: "error",
+          detail: error instanceof Error ? error.message : String(error),
+        },
+      };
     }
+    this.#reportFailure(guard, result, ctx);
+    return result;
   }
 
   async beforeToolCall(
@@ -106,10 +165,12 @@ export class HatchGuardAdapter {
       cwd: ctx.cwd,
     };
     if (guardsBinder) {
-      const immutable = await this.#runGuard("binderImmutability", payload, {
-        cwd: ctx.cwd,
-        signal: ctx.signal,
-      });
+      const immutable = await this.#runGuard(
+        "binderImmutability",
+        payload,
+        { cwd: ctx.cwd, signal: ctx.signal },
+        ctx,
+      );
       if (immutable.code === 2) {
         return {
           block: true,
@@ -118,10 +179,12 @@ export class HatchGuardAdapter {
       }
     }
     if (guardsPack && event.toolName === "write") {
-      const pack = await this.#runGuard("packWrite", payload, {
-        cwd: ctx.cwd,
-        signal: ctx.signal,
-      });
+      const pack = await this.#runGuard(
+        "packWrite",
+        payload,
+        { cwd: ctx.cwd, signal: ctx.signal },
+        ctx,
+      );
       if (pack.code === 2) {
         return { block: true, reason: decisionReason(pack, "Hatch denied an invalid stack pack") };
       }
@@ -147,6 +210,7 @@ export class HatchGuardAdapter {
         cwd: ctx.cwd,
       },
       { cwd: ctx.cwd, signal: ctx.signal },
+      ctx,
     );
     if (result.code !== 2) return undefined;
     return appendFinding(event, decisionReason(result, "Hatch found an invalid stack pack"));
@@ -163,6 +227,7 @@ export class HatchGuardAdapter {
       "statusInjection",
       { hook_event_name: "SessionStart", cwd: ctx.cwd },
       { cwd: ctx.cwd, signal: ctx.signal },
+      ctx,
     );
     const status = result.code === 0 && !result.failedOpen ? result.stdout.trim() : "";
     if (!status) return undefined;
@@ -176,6 +241,8 @@ export class HatchGuardAdapter {
     if (
       this.#stopped ||
       this.#settledCheckRunning ||
+      // A child session owns no delivery, and pi-subagents marks children with PI_SUBAGENT_CHILD=1.
+      this.isChildSession() ||
       !ctx.isProjectTrusted() ||
       !existsSync(join(ctx.cwd, ".hatch", "binders"))
     ) {
@@ -192,6 +259,7 @@ export class HatchGuardAdapter {
           stop_hook_active: false,
         },
         { cwd: ctx.cwd, signal: this.#shutdownController.signal },
+        ctx,
       );
       const whiffReason = whiff.code === 2 ? decisionReason(whiff, "Hatch found a whiffed item") : "";
       const corrections: string[] = [];
@@ -207,6 +275,7 @@ export class HatchGuardAdapter {
           stop_hook_active: false,
         },
         { cwd: ctx.cwd, signal: this.#shutdownController.signal },
+        ctx,
       );
       if (dirty.code === 2) {
         corrections.push(

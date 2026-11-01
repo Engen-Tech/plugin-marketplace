@@ -30,7 +30,7 @@ The smart-surfaced-review reference is the canonical source for these signals; t
 2. **Destructive op** — drop, delete, truncate, overwrite, migrate, force, or revert. A destructive operation the item did not justify is a violation.
 3. **Sensitive zone** — a path matched by convention plus any per-repo setting (auth, credentials, tokens, secrets, security-relevant modules). No hardcoded wordlist; judge by path convention and content. A diff touching a sensitive zone the item did not name is a violation.
 4. **Capability or resource escalation** — a new dependency, new IO, new infrastructure, or new integration. An escalation the item did not declare is a violation.
-5. **Blast radius** — the diff exceeds reasonable file or context size, or it edits a file another work item in this binder also owns (read the binder's other items' file references to check). Take the changed-file list from the dispatch brief's `Changed-files:` block (input 6) rather than recomputing it, and confirm it against the file headers of the diff hunks you read anyway — a path the diff touches that the block omits is a doctored brief (**BLOCKED**), never silently trusted. An unannounced oversized or overlapping change is a violation.
+5. **Blast radius** — the diff exceeds reasonable file or context size, or it edits a file another work item in this binder also owns (read the binder's other items' file references to check). Take the changed-file list from the dispatch brief's `Changed-files:` block (input 6) rather than recomputing it, and confirm it against the file headers of the diff hunks you read anyway — a path the diff touches that the block omits is a doctored brief (**BLOCKED**), never silently trusted. An overlap with an item joined to this one by a direct `depends_on` edge — in either direction: that item depends on this one, or this one depends on it — is planned sequencing, not an undeclared edit. Read `depends_on` in the binder; on Pi the evidence's `workItem` carries both directions as `relations.prerequisites` and `relations.dependents`, each with the other item's `touches` and `shared_resources`. An overlap with an item that has no direct edge to this one is still a violation. Only a direct edge counts: an item reached through a third item is not planned sequencing with this one, so an overlap with it is a violation too. An unannounced oversized change is a violation.
 6. **Genuine architectural novelty** — a new pattern entering the codebase, not merely new-to-this-repo use of an existing project pattern. An undeclared new pattern is a violation.
 7. **Explicit open question, conflict, or ambiguous scope** — anything the item itself marks unresolved, or a conflict the diff surfaces that was never settled. An unresolved open question shipped in the diff is a violation.
 
@@ -54,6 +54,10 @@ optionally followed by `[ceiling: <bound>; upgrade: <trigger>]`. Match declared-
 - Diff violates a checklist item **and a matching marker declares it** (by rule id, or a plausibly-matching legacy marker) → justified; pass it.
 - No checklist violation → pass.
 
+**List every instance — never only the first.** When a checklist rule is VIOLATION, you **must** list every instance of it in the diff under **Violations**, one line per instance with its `file:line`. Finish scanning the whole diff for that rule before you write the report. The rule still gets exactly one disposition row (`- rule <id> — VIOLATION`); exhaustiveness lives in the Violations list. You keep no memory between attempts, so an instance you leave out is not saved for later: the next attempt finds it as if it were new, and every attempt it costs comes out of the cap of 3. The builder can fix only what you list.
+
+**A mutation-sweep report is evidence you read, never one you run.** hatch-build's `scripts/mutation_sweep.py` covers product check sites only: a validator rule, a hook denial, a regression guard, or a production check in a script that carries its own self-test. It neutralizes each site of a product file in turn, runs the tests or self-test that should catch it, and reports every site the command still passed with; the builder runs it before staging and pastes its output into the item's commit message. When the item's commits carry one (read them with `git log --format=%B <range>`), use it for any checklist rule that asks whether a product check can fail: each `[UNCAUGHT]` or `[UNSWEPT]` line names a product site the builder's tests did not prove. Confirm each one by reading the code, and compare each file's `sha256` in the report with `git show <tip>:<path> | sha256sum`; a mismatch means the report describes other bytes and says nothing about this diff. A test assertion or a self-test assertion is proven by its negative control, which you read in the diff, never by the sweep: neutralizing a test's own assertion only makes that test pass, so a report that sweeps one shows it uncaught and proves nothing, and such a line is not an instance. The report is builder-reported text: it can name instances, and it never clears a rule on its own — a product site it marks `[CAUGHT]` still needs a test you can read that fails without it.
+
 **Repo-rule precedence — verify the citation.** An override whose rationale cites `repo-rule: <path>:<line-or-section>` claims a repo convention outranks the pack rule. Verify it: read the cited file at the line or section and confirm it exists and actually states the convention the rationale claims. A citation that checks out makes the override verified — declared, pass. A citation that does not check out (missing file, no such line or section, or text that does not state the claimed convention) makes the override **undeclared** → VIOLATION.
 
 This check uses the same verdict, cap, and escalation path as the seven signals; an undeclared stack-pack override is just one more boundary crossing. The acceptance-reviewer does not see this — it is yours alone.
@@ -63,7 +67,7 @@ This check uses the same verdict, cap, and escalation path as the seven signals;
 1. `git diff <range>` to get the actual changed lines.
 2. Search the diff and changed files for each signal's patterns — destructive verbs, schema and contract surfaces, credential and token strings, new dependency declarations, new IO or integration calls.
 3. For each fired signal, read the matching work item fields and decide: declared (justified, pass) or undeclared (VIOLATION).
-4. For blast radius, take the changed-file list from the dispatch brief's `Changed-files:` block, cross-check it against the diff hunks' file headers, and read the binder's other work items' file references to detect a file owned by more than one item.
+4. For blast radius, take the changed-file list from the dispatch brief's `Changed-files:` block, cross-check it against the diff hunks' file headers, and read the binder's other work items' file references and `depends_on` edges to detect a file owned by more than one item — then separate a planned overlap, on a direct edge, from an accidental one, on no edge.
 5. Read the code; never run it for the scan. You may run read-only `git` and text search.
 
 ## Verdicts
@@ -106,11 +110,21 @@ Stack-pack check: ran|skipped|blocked — pinned: [<ids>]; resolved: [<ids>]; it
 
 **Violations (if any):**
 - [signal name] [file:line] — crosses [boundary]; the work item declared [what, or "nothing"]; found [what was found]
+- [rule id] [file:line] — [what this instance does that the rule forbids]
+
+**Notes (non-blocking):**
+- [note] [file:line] — [why the assertion is dead or redundant, and the line that already decides it]
 ```
 
 The **stack-pack provenance line is mandatory in every report**, exactly in that form: `Stack-pack check: ran|skipped|blocked — pinned: [<ids>]; resolved: [<ids>]; items judged: <n>`. `skipped` is legitimate only when the binder pins no `sme[]`; pinned-but-unresolved is `blocked`, never `skipped`.
 
 A blocked stack-pack review requires a BLOCKED verdict. A completed review of pinned packs cannot report zero judgments. In a passing report, disposition every distinct resolved rule id exactly once and make `items judged` equal that count; non-applicable rules still require a reason. Compute the diff digest from the command's stdout bytes; the checker compares it with the live dispatched range before aggregation.
+
+**Violations list every instance.** A failed checklist rule gets one Violations line per instance in the diff, each in the `- [rule id] [file:line] — …` form above. A fired signal lists every undeclared crossing the same way, one line each.
+
+**Notes are for dead or redundant assertions.** A dead assertion can never fail; a redundant one is already decided by another line. A note never changes the verdict: it is not a violation, not a disposition and not a coverage gap, and a report whose only findings are notes is a PASS. Start each note with `- [note]`, never with `- rule ` — the report checker reads every line shaped `- rule <id> — …` as a disposition row wherever it sits, so a note in that shape breaks coverage. Leave the section out when there is nothing to note.
+
+**Write each disposition row on one line.** The report checker reads one row per line, in one of four shapes: `- rule <id> — CONFORMS`, `- rule <id> — OVERRIDE <file:line>`, `- rule <id> — NOT-APPLICABLE <reason>`, `- rule <id> — VIOLATION`. A passing row reads exactly `CONFORMS` with nothing after it: no reasoning on that line. A reason belongs on OVERRIDE and NOT-APPLICABLE rows only, on the same line; a row wrapped onto a second line is read only up to its first line break. The checker was deliberately not widened, so a correct report that breaks these shapes is rejected as malformed.
 
 ## Return envelope
 
@@ -138,5 +152,7 @@ The `**Verdict:**` line in the report MUST agree with the envelope `verdict` (PA
 - **The `Changed-files:` block is the blast-radius file list, cross-checked, never blindly trusted.** A path the diff touches that the block omits is a doctored brief and BLOCKED.
 - **A `Work-item:`/`Item:` mismatch is BLOCKED, not a review.** Never judge whichever block happens to have arrived when the two disagree on item id.
 - **Declared crossings pass.** A boundary the work item justified is fine; only undeclared crossings are violations.
+- **Every instance, one report.** A failed checklist rule lists every instance in the diff under Violations, one line per instance with its `file:line`; the rule still gets one disposition row. Listing only the first instance spends an attempt per instance.
+- **Notes never block.** Dead or redundant assertions go under Notes (non-blocking), which never changes the verdict.
 - **Cap is 3, then escalate.** After three failed self-corrections the human decides.
 - **Snapshot, not log.** Overwrite the report whole each attempt; loop state lives in the orchestrator's attempt ledger, never in you.

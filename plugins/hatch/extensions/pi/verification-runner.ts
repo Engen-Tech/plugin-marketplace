@@ -13,6 +13,7 @@ import {
   type HatchEvidenceManifest,
 } from "./evidence.ts";
 import {
+  effectiveGateVerdict,
   executeGateOnEvidence,
   type GateModelInvoker,
   type HatchGateResult,
@@ -214,7 +215,9 @@ const defaultJudgeVisual: VisualAcceptanceJudge = (ctx, input) =>
   });
 
 function gateStatus(gate: HatchGateResult): HatchVerificationStatus {
-  return gate.verdict;
+  // The aggregate reads the effective verdict, so a gate executor the caller injected
+  // cannot make a minor-only acceptance or design concern read as a blocking one.
+  return effectiveGateVerdict(gate.role, gate.verdict, gate.findings);
 }
 
 export class HatchVerificationRunner {
@@ -333,7 +336,7 @@ export class HatchVerificationRunner {
         this.#children,
         this.#invoke,
       );
-      if (gates.acceptance.verdict !== "pass") {
+      if (gateStatus(gates.acceptance) !== "pass") {
         return {
           schema: "hatch-verification-v1",
           binder,
@@ -358,7 +361,7 @@ export class HatchVerificationRunner {
     // status/blockedReason, never on gates.safety.verdict as the overall verdict.
     // 1. A non-pass safety verdict is the overall failure and is never overwritten — a
     //    safety failure is surfaced as itself, never folded into a visual reason.
-    if (gates.safety.verdict !== "pass") {
+    if (gateStatus(gates.safety) !== "pass") {
       return {
         schema: "hatch-verification-v1",
         binder,
@@ -478,10 +481,13 @@ export class HatchVerificationRunner {
     // A judged verdict: pass lifts the block, concerns retries under the acceptance cap,
     // blocked (unjudgeable evidence) fails closed as a gate error. The verdict is recorded
     // in gates.visual either way so callers can classify the retry and surface findings.
-    if (outcome.verdict === "pass") {
+    // The effective verdict applies the design reviewer's own rule: a minor-only concern
+    // is a pass with notes, so it lifts the block like any other pass.
+    const verdict = effectiveGateVerdict(outcome.role, outcome.verdict, outcome.findings);
+    if (verdict === "pass") {
       return { status: "pass", visual: outcome };
     }
-    if (outcome.verdict === "concerns") {
+    if (verdict === "concerns") {
       return { status: "concerns", visual: outcome };
     }
     return { status: "blocked", blockedReason: "visual-gate-error", visual: outcome };

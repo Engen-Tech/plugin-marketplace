@@ -291,12 +291,45 @@ function successorHalt(packet: PreflightPacket, planned: SupersedesSpec): string
   return reasons.length > 0 ? reasons.join("; ") : undefined;
 }
 
+/**
+ * The halt for a wave build that produced no mergeable checkpoint. An empty build is
+ * either a whiff (re-dispatch) or a change already on the base (a plan change through a
+ * per docs/how-to/binder-repair.md, with the oracle receipt as its evidence); neither writes a completion ref.
+ */
+function buildHaltMessage(item: string, status: string): string {
+  if (status === "already-present") {
+    return (
+      `Item '${item}' is already present on the base: its diff against the merge base is empty ` +
+      "and its oracle passes on HEAD, so there is nothing to build or merge and no done ref was written. " +
+      "The way forward is a plan change per docs/how-to/binder-repair.md: a successor binder that drops " +
+      "or amends the item when other items are done, or withdrawing the binder when none is. " +
+      "The oracle receipt in the build result is the evidence for " +
+      "that decision, and it is only as strong as the item's oracle."
+    );
+  }
+  if (status === "no-change") {
+    return (
+      `Item '${item}' produced no change, and its work is not proven present on the base; ` +
+      "no completion ref was written. Re-dispatch the item's worker."
+    );
+  }
+  return `Item '${item}' did not produce a mergeable built checkpoint.`;
+}
+
 /** The finding text of a failed merge-time integration, bounded for a prompt. */
 function integrationHaltReason(result: HatchIntegrationResult): string {
   const findings = [result.verification, result.safetyVerification]
     .flatMap((verification) => Object.values(verification?.gates ?? {}))
-    .flatMap((gate) => (gate as { findings?: { code?: string; message?: string }[] } | undefined)?.findings ?? [])
-    .map((finding) => `${finding.code ?? "finding"}: ${finding.message ?? ""}`.trim());
+    .flatMap(
+      (gate) =>
+        (gate as { findings?: { severity?: string; code?: string; message?: string }[] } | undefined)
+          ?.findings ?? [],
+    )
+    // The severity leads each finding: advisory and blocking must not read the same at
+    // the halt, where the human decides whether to fix, accept, or defer.
+    .map((finding) =>
+      `[${finding.severity ?? "unknown"}] ${finding.code ?? "finding"}: ${finding.message ?? ""}`.trim(),
+    );
   const reason = [result.message, ...findings].join(" ");
   return reason.length > 1_000 ? `${reason.slice(0, 997)}...` : reason;
 }
@@ -1433,7 +1466,7 @@ export class HatchDeliveryRunner {
               authorize: async (findings) => {
                 const details = findings.length > 0
                   ? findings.map((finding) =>
-                      `${finding.code}${finding.path ? ` — ${finding.path}${finding.line ? `:${finding.line}` : ""}` : ""}: ${finding.message}`,
+                      `[${finding.severity}] ${finding.code}${finding.path ? ` — ${finding.path}${finding.line ? `:${finding.line}` : ""}` : ""}: ${finding.message}`,
                     ).join("\n")
                   : "Fresh acceptance and safety review now pass; record why this failed checkpoint is being accepted.";
                 const confirmed = await ctx.ui.confirm(
@@ -1511,7 +1544,7 @@ export class HatchDeliveryRunner {
         };
         waves.push(waveResult);
         const failedBuild = builds.find((build) =>
-          ["failed", "blocked", "no-change"].includes(build.status),
+          ["failed", "blocked", "no-change", "already-present"].includes(build.status),
         );
         if (failedBuild) {
           return report({
@@ -1520,7 +1553,7 @@ export class HatchDeliveryRunner {
             status: "blocked",
             integrationWorktree,
             waves,
-            message: `Item '${failedBuild.item}' did not produce a mergeable built checkpoint.`,
+            message: buildHaltMessage(failedBuild.item, failedBuild.status),
           });
         }
         const anchor = await this.#waves.start(

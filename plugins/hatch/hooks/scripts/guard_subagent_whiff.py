@@ -46,8 +46,10 @@ archive/) where ALL hold:
 
 Every exclusion errs toward silence: a standing ref of any state, a branch with
 commits (worker died after committing — the Stop-gate's built-unmerged turf),
-a missing integration branch, an unreadable binder, and a dirty worktree all
-drop the item. The residual false-positive window — a wave-mate between
+a missing integration branch, an unreadable binder, a dirty worktree, and a
+superseded binder all drop the item. A superseded binder's items are excluded
+because its live successor re-plans them (a successor's `supersedes` names it).
+The residual false-positive window — a wave-mate between
 worktree creation and its first edit — is accepted and stated in the nudge,
 which asserts only the git facts and tells the orchestrator's frontier
 re-derivation to disambiguate.
@@ -136,9 +138,9 @@ def _live_slugs(root: str) -> list[str]:
     return sorted(slugs)
 
 
-def _binder_item_ids(root: str, slug: str) -> list[str] | None:
-    """Work-item ids — working tree first, else the HEAD blob. None =
-    unreadable/malformed (fail open for this binder)."""
+def _binder_doc(root: str, slug: str) -> dict | None:
+    """The binder object — working tree first, else the HEAD blob. None =
+    unreadable/malformed (the caller fails open for this binder)."""
     live = Path(root) / ".hatch" / "binders" / f"{slug}.json"
     if live.is_file():
         try:
@@ -154,13 +156,54 @@ def _binder_item_ids(root: str, slug: str) -> list[str] | None:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    items = data.get("work_items") if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def _binder_item_ids(root: str, slug: str) -> list[str] | None:
+    """Work-item ids from _binder_doc. None = unreadable/malformed (fail open
+    for this binder)."""
+    data = _binder_doc(root, slug)
+    if data is None:
+        return None
+    items = data.get("work_items")
     if not isinstance(items, list):
         return None
     ids = [it.get("id") for it in items if isinstance(it, dict)]
     if len(ids) != len(items) or not all(isinstance(i, str) for i in ids):
         return None
     return ids
+
+
+def _supersedes(binder: dict) -> tuple[str, list[str]] | None:
+    """(predecessor slug, carried item ids) for a successor binder, else None.
+    The shape is validate_binder.py's; a malformed value reads as absent — the
+    same parser as skills/hatch-status/scripts/hatch_next.py, copied because
+    this guard is a standalone stdlib script."""
+    sup = binder.get("supersedes")
+    if not isinstance(sup, dict) or not isinstance(sup.get("slug"), str):
+        return None
+    carried = sup.get("carried")
+    if not isinstance(carried, list) or not all(isinstance(c, str) for c in carried):
+        return None
+    return sup["slug"], carried
+
+
+def _superseded_slugs(root: str, live: list[str]) -> set[str]:
+    """Slugs a live successor binder supersedes. The successor re-plans every
+    non-carried predecessor item, so an empty branch left on the predecessor is
+    planned work elsewhere, not stranded work. A malformed `supersedes` and a
+    predecessor that is not live both exclude nothing (`hatch_next.py`'s
+    `sup[0] in by_slug and sup[0] != slug` rule)."""
+    live_set = set(live)
+    out: set[str] = set()
+    for slug in live:
+        doc = _binder_doc(root, slug)
+        if doc is None:
+            continue  # unreadable/malformed successor — reads as no supersedes
+        sup = _supersedes(doc)
+        if sup and sup[0] in live_set and sup[0] != slug:
+            out.add(sup[0])
+    return out
 
 
 def _items_with_any_ref(root: str, slug: str) -> set[str]:
@@ -199,7 +242,11 @@ def _whiff_items(root: str) -> list[tuple[str, str]]:
     """(slug, item-id) pairs carrying the deterministic empty-whiff signature."""
     findings: list[tuple[str, str]] = []
     worktrees: dict[str, str] | None = None  # lazy — most repos have no candidates
-    for slug in _live_slugs(root):
+    live = _live_slugs(root)
+    superseded = _superseded_slugs(root, live)
+    for slug in live:
+        if slug in superseded:
+            continue  # a live successor re-plans its items — not stranded work
         ids = _binder_item_ids(root, slug)
         if ids is None:
             continue  # unreadable/malformed binder — fail open for this slug
@@ -285,11 +332,14 @@ def _run_self_test() -> int:
         return repo
 
     def write_binder(repo: Path, slug: str, ids: list[str],
-                     malformed: bool = False) -> None:
+                     malformed: bool = False,
+                     supersedes: dict | None = None) -> None:
         d = repo / ".hatch" / "binders"
         d.mkdir(parents=True, exist_ok=True)
-        body = "{not json" if malformed else json.dumps(
-            {"slug": slug, "work_items": [{"id": i} for i in ids]})
+        binder: dict = {"slug": slug, "work_items": [{"id": i} for i in ids]}
+        if supersedes is not None:
+            binder["supersedes"] = supersedes
+        body = "{not json" if malformed else json.dumps(binder)
         (d / f"{slug}.json").write_text(body, encoding="utf-8")
         git(repo, "add", ".")
         git(repo, "commit", "-q", "-m", f"binder {slug}")
@@ -456,6 +506,49 @@ def _run_self_test() -> int:
             check("git-absent host allows (fail-open)", substop(repo), 0)
         finally:
             GIT = "git"
+
+        # 21. superseded predecessor's leftover empty branch -> allow: the
+        #     successor re-plans every non-carried item, and the carried ones
+        #     were delivered by the predecessor.
+        repo = init_repo(td, "superseded")
+        write_binder(repo, "pred", ["a", "b"])
+        write_binder(repo, "succ", ["c"],
+                     supersedes={"slug": "pred", "carried": ["b"]})
+        git(repo, "branch", "hatch/pred/integration")
+        git(repo, "branch", "hatch/pred/item-a", "hatch/pred/integration")
+        check("superseded predecessor's leftover empty branch allows",
+              substop(repo), 0)
+
+        # 22. the successor's own empty-whiff item still fires
+        git(repo, "branch", "hatch/succ/integration")
+        git(repo, "branch", "hatch/succ/item-c", "hatch/succ/integration")
+        reason = check("the successor's own empty branch still fires",
+                       substop(repo), 2)
+        flag("reason names the successor item, not the predecessor's",
+             "succ/item-c" in reason and "pred/item-a" not in reason)
+
+        # 23. malformed supersedes (carried not a list) reads as absent -> the
+        #     predecessor is checked as before.
+        repo = init_repo(td, "badsupersedes")
+        write_binder(repo, "pred", ["a"])
+        write_binder(repo, "succ", ["c"],
+                     supersedes={"slug": "pred", "carried": "b"})
+        git(repo, "branch", "hatch/pred/integration")
+        git(repo, "branch", "hatch/pred/item-a", "hatch/pred/integration")
+        reason = check("malformed supersedes (carried not a list) still fires",
+                       substop(repo), 2)
+        flag("malformed supersedes names the predecessor item",
+             "pred/item-a" in reason)
+
+        # 24. a binder naming itself in supersedes is not excluded
+        repo = init_repo(td, "selfsupersede")
+        write_binder(repo, "self", ["a"],
+                     supersedes={"slug": "self", "carried": []})
+        git(repo, "branch", "hatch/self/integration")
+        git(repo, "branch", "hatch/self/item-a", "hatch/self/integration")
+        reason = check("a binder naming itself in supersedes still fires",
+                       substop(repo), 2)
+        flag("self-supersedes names its own item", "self/item-a" in reason)
 
     total = len(results)
     failures = results.count(False)

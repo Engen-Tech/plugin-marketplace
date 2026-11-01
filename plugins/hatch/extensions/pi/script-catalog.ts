@@ -14,6 +14,7 @@ export const HATCH_SCRIPT_PATHS = {
   itemContext: "skills/hatch-build/scripts/item_context.py",
   hatchNext: "skills/hatch-status/scripts/hatch_next.py",
   mergeItem: "skills/hatch-deliver/scripts/merge_item.py",
+  mutationSweep: "skills/hatch-build/scripts/mutation_sweep.py",
   resolvePackChecklist: "skills/hatch-kaizen/scripts/resolve_pack_checklist.py",
   runOracle: "skills/hatch-build/scripts/run_oracle.py",
   scanSecrets: "skills/hatch-build/scripts/scan_secrets.py",
