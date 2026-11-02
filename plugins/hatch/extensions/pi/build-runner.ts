@@ -7,6 +7,7 @@ import { HatchBuildFinalizer, type HatchBuildFinalizationResult } from "./build-
 import type { HatchCheckPlanEntry } from "./check-convergence.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
 import { deriveItemGitState, type HatchItemRecoveryState } from "./git-state.ts";
+import { safeProgress, type HatchRunProgress } from "./run-events.ts";
 import {
   HatchProcessManager,
   type BinderLifecycleOwner,
@@ -183,7 +184,12 @@ export class HatchBuildItemRunner {
     this.#checkpoint = checkpoint;
   }
 
-  async run(ctx: ExtensionContext, binder: string, item: string): Promise<HatchBuildItemResult> {
+  async run(
+    ctx: ExtensionContext,
+    binder: string,
+    item: string,
+    progress?: HatchRunProgress,
+  ): Promise<HatchBuildItemResult> {
     const lease = await this.#locks.acquire(ctx.cwd, binder);
     let owner: BinderLifecycleOwner;
     try {
@@ -194,6 +200,8 @@ export class HatchBuildItemRunner {
       await this.#locks.release(lease);
       throw error;
     }
+    // Only now does the run own the binder; a run refused the lock never reports a start.
+    safeProgress(progress)({ kind: "run-started", binder, item });
     try {
       return await this.#runLocked(ctx, binder, item, lease, owner, [item]);
     } finally {

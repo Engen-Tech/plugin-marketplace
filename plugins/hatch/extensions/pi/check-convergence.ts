@@ -6,6 +6,11 @@ import {
   runBoundCheck,
   type UnboundCheckResult,
 } from "./check-runner.ts";
+import {
+  diagnoseCheckFailure,
+  type HatchCheckDiagnosis,
+  type HatchCheckSite,
+} from "./check-environment.ts";
 import type { HatchCheckManifest } from "./evidence.ts";
 import { readEnvironmentConfig } from "./environment.ts";
 
@@ -32,6 +37,12 @@ export interface RunCheckConvergenceOptions {
   environmentSetupRef?: string;
   signal?: AbortSignal;
   maxPasses?: number;
+  // Where the worktree sits; it only labels the diagnosis on a halt. Default "item".
+  site?: HatchCheckSite;
+  // Run the plan once on the staged tree instead of converging: stable only when the
+  // run leaves the tree unchanged, otherwise "non-converging". A confirming probe on a
+  // tree another worktree already converged.
+  singlePass?: boolean;
   onProcessStart?: (pid: number) => void;
   onProcessExit?: (pid: number) => Promise<void> | void;
   checkpoint?: (
@@ -40,11 +51,18 @@ export interface RunCheckConvergenceOptions {
   ) => Promise<void> | void;
 }
 
+// What the integration ref's .hatch/environment.json declared for this run.
+export interface CheckEnvironmentDeclaration {
+  setupDeclared: boolean;
+  preflightDeclared: boolean;
+}
+
 export interface StableCheckConvergenceResult {
   status: "stable";
   passes: number;
   targetTree: string;
   manifest: HatchCheckManifest;
+  environment: CheckEnvironmentDeclaration;
 }
 
 type HaltedUnboundCheckResult = UnboundCheckResult & {
@@ -59,6 +77,10 @@ export interface HaltedCheckConvergenceResult {
   // Set only on "precondition-unmet": the project's own remediation text
   // (environment.json on_unavailable), surfaced verbatim so the halt names the fix.
   remediation?: string;
+  environment: CheckEnvironmentDeclaration;
+  // Computed before the halt returns, while the worktree still exists. Absent only
+  // when the diagnosis itself could not be built.
+  diagnosis?: HatchCheckDiagnosis;
 }
 
 export type CheckConvergenceResult =
@@ -140,6 +162,24 @@ async function runPlan(
   return { status: "passed", results };
 }
 
+function bindManifest(
+  options: RunCheckConvergenceOptions,
+  results: UnboundCheckResult[],
+  tree: string,
+): HatchCheckManifest {
+  const entries = results.map((result, sequence) =>
+    bindCheckManifestEntry(result, {
+      id: options.checks[sequence].id,
+      sequence,
+      purpose: options.checks[sequence].purpose,
+      targetTree: tree,
+      preTree: tree,
+      postTree: tree,
+    }),
+  );
+  return createCheckManifest(tree, entries);
+}
+
 export async function runStableTreeChecks(
   options: RunCheckConvergenceOptions,
 ): Promise<CheckConvergenceResult> {
@@ -151,6 +191,48 @@ export async function runStableTreeChecks(
   const environmentConfig = options.environmentSetupRef
     ? await readEnvironmentConfig(options.worktree, options.environmentSetupRef)
     : undefined;
+  const environment: CheckEnvironmentDeclaration = {
+    setupDeclared: Boolean(environmentConfig?.setup),
+    preflightDeclared: Boolean(environmentConfig?.preflight),
+  };
+  // Every halted return goes through here, so the diagnosis is computed while the
+  // worktree (and its install directories) still exists. A diagnosis is advisory: a
+  // failure to build one never replaces the halt it describes.
+  const halt = async (
+    halted: Omit<HaltedCheckConvergenceResult, "environment" | "diagnosis">,
+    subject: { id: string; command: string; cwd: string },
+  ): Promise<HaltedCheckConvergenceResult> => {
+    let diagnosis: HatchCheckDiagnosis | undefined;
+    try {
+      diagnosis = await diagnoseCheckFailure({
+        worktree: options.worktree,
+        checkId: subject.id,
+        command: subject.command,
+        cwd: subject.cwd,
+        status: halted.status,
+        result: halted.check?.result,
+        site: options.site ?? "item",
+        setupDeclared: environment.setupDeclared,
+        environmentSetupRef: options.environmentSetupRef,
+      });
+    } catch {
+      diagnosis = undefined;
+    }
+    return { ...halted, environment, ...(diagnosis ? { diagnosis } : {}) };
+  };
+  const planCheck = (id: string) => {
+    const check = options.checks.find((entry) => entry.id === id);
+    return { id, command: check?.command ?? "", cwd: check?.cwd ?? "." };
+  };
+  // A drifting tree has no single failing command; the diagnosis names the whole plan.
+  const wholePlan = () => {
+    const cwds = new Set(options.checks.map((check) => check.cwd));
+    return {
+      id: "check-plan",
+      command: options.checks.map((check) => check.command).join("\n"),
+      cwd: cwds.size === 1 ? options.checks[0].cwd : ".",
+    };
+  };
   if (environmentConfig?.preflight) {
     // Probe the declared precondition BEFORE setup and the floor. On failure, halt
     // clean with the project's remediation rather than running the real floor command
@@ -165,13 +247,16 @@ export async function runStableTreeChecks(
       onProcessExit: options.onProcessExit,
     });
     if (probe.status !== "passed") {
-      return {
-        status: "precondition-unmet",
-        passes: 0,
-        targetTree: await stageTree(options.worktree),
-        check: { id: "environment-preflight", result: probe as HaltedUnboundCheckResult },
-        remediation: environmentConfig.onUnavailable,
-      };
+      return halt(
+        {
+          status: "precondition-unmet",
+          passes: 0,
+          targetTree: await stageTree(options.worktree),
+          check: { id: "environment-preflight", result: probe as HaltedUnboundCheckResult },
+          remediation: environmentConfig.onUnavailable,
+        },
+        { id: "environment-preflight", command: environmentConfig.preflight, cwd: "." },
+      );
     }
   }
   const environmentSetup = environmentConfig?.setup;
@@ -182,6 +267,7 @@ export async function runStableTreeChecks(
     // paths: we stage before and after and require the tree be unchanged, so a setup
     // that mutates a tracked file cannot ride unreviewed into the merged tree and
     // the target-tree stability invariant is preserved.
+    const setupSubject = { id: "environment-setup", command: environmentSetup, cwd: "." };
     const preSetupTree = await stageTree(options.worktree);
     const preSetupIndex = await indexIdentity(options.worktree);
     const setup = await runBoundCheck({
@@ -193,32 +279,63 @@ export async function runStableTreeChecks(
       onProcessExit: options.onProcessExit,
     });
     if (setup.status !== "passed") {
-      return {
-        status: setup.status,
-        passes: 0,
-        targetTree: preSetupTree,
-        check: { id: "environment-setup", result: setup as HaltedUnboundCheckResult },
-      };
+      return halt(
+        {
+          status: setup.status,
+          passes: 0,
+          targetTree: preSetupTree,
+          check: { id: "environment-setup", result: setup as HaltedUnboundCheckResult },
+        },
+        setupSubject,
+      );
     }
     const postSetupTree = await stageTree(options.worktree);
     const postSetupIndex = await indexIdentity(options.worktree);
     if (postSetupTree !== preSetupTree || postSetupIndex !== preSetupIndex) {
-      return {
-        status: "failed",
-        passes: 0,
-        targetTree: postSetupTree,
-        check: {
-          id: "environment-setup",
-          result: {
-            ...setup,
-            status: "failed",
-            stderr:
-              `${setup.stderr}\nHatch environment setup mutated tracked files; it must provision only gitignored paths.`
-                .trim(),
-          } as HaltedUnboundCheckResult,
+      return halt(
+        {
+          status: "failed",
+          passes: 0,
+          targetTree: postSetupTree,
+          check: {
+            id: "environment-setup",
+            result: {
+              ...setup,
+              status: "failed",
+              stderr:
+                `${setup.stderr}\nHatch environment setup mutated tracked files; it must provision only gitignored paths.`
+                  .trim(),
+            } as HaltedUnboundCheckResult,
+          },
         },
-      };
+        setupSubject,
+      );
     }
+  }
+  if (options.singlePass) {
+    const candidateTree = await stageTree(options.worktree);
+    await options.checkpoint?.("candidate-staged", { pass: 1, tree: candidateTree });
+    const run = await runPlan(options);
+    if (run.status === "halted") {
+      return halt(
+        {
+          status: run.result.status,
+          passes: 1,
+          targetTree: candidateTree,
+          check: { id: run.id, result: run.result },
+        },
+        planCheck(run.id),
+      );
+    }
+    await options.checkpoint?.("final-checks-complete", { pass: 1, tree: candidateTree });
+    const finalTree = await stageTree(options.worktree);
+    if (finalTree !== candidateTree) {
+      await options.checkpoint?.("tree-drifted", { pass: 1, tree: finalTree });
+      return halt({ status: "non-converging", passes: 1, targetTree: finalTree }, wholePlan());
+    }
+    const manifest = bindManifest(options, run.results, candidateTree);
+    await options.checkpoint?.("manifest-bound", { pass: 1, tree: candidateTree });
+    return { status: "stable", passes: 1, targetTree: candidateTree, manifest, environment };
   }
   let lastTree = "";
   for (let pass = 1; pass <= maxPasses; pass += 1) {
@@ -227,12 +344,15 @@ export async function runStableTreeChecks(
     await options.checkpoint?.("candidate-staged", { pass, tree: candidateTree });
     const stabilization = await runPlan(options);
     if (stabilization.status === "halted") {
-      return {
-        status: stabilization.result.status,
-        passes: pass,
-        targetTree: candidateTree,
-        check: { id: stabilization.id, result: stabilization.result },
-      };
+      return halt(
+        {
+          status: stabilization.result.status,
+          passes: pass,
+          targetTree: candidateTree,
+          check: { id: stabilization.id, result: stabilization.result },
+        },
+        planCheck(stabilization.id),
+      );
     }
     await options.checkpoint?.("stabilization-checks-complete", {
       pass,
@@ -247,12 +367,15 @@ export async function runStableTreeChecks(
 
     const finalRun = await runPlan(options);
     if (finalRun.status === "halted") {
-      return {
-        status: finalRun.result.status,
-        passes: pass,
-        targetTree: candidateTree,
-        check: { id: finalRun.id, result: finalRun.result },
-      };
+      return halt(
+        {
+          status: finalRun.result.status,
+          passes: pass,
+          targetTree: candidateTree,
+          check: { id: finalRun.id, result: finalRun.result },
+        },
+        planCheck(finalRun.id),
+      );
     }
     await options.checkpoint?.("final-checks-complete", { pass, tree: candidateTree });
     const finalTree = await stageTree(options.worktree);
@@ -261,23 +384,16 @@ export async function runStableTreeChecks(
       await options.checkpoint?.("tree-drifted", { pass, tree: finalTree });
       continue;
     }
-    const entries = finalRun.results.map((result, sequence) =>
-      bindCheckManifestEntry(result, {
-        id: options.checks[sequence].id,
-        sequence,
-        purpose: options.checks[sequence].purpose,
-        targetTree: candidateTree,
-        preTree: candidateTree,
-        postTree: finalTree,
-      }),
-    );
-    const manifest = createCheckManifest(candidateTree, entries);
+    const manifest = bindManifest(options, finalRun.results, candidateTree);
     await options.checkpoint?.("manifest-bound", { pass, tree: candidateTree });
-    return { status: "stable", passes: pass, targetTree: candidateTree, manifest };
+    return { status: "stable", passes: pass, targetTree: candidateTree, manifest, environment };
   }
-  return {
-    status: "non-converging",
-    passes: maxPasses,
-    targetTree: lastTree,
-  };
+  return halt(
+    {
+      status: "non-converging",
+      passes: maxPasses,
+      targetTree: lastTree,
+    },
+    wholePlan(),
+  );
 }

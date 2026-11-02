@@ -116,6 +116,37 @@ function failedCheckId(convergence: CheckConvergenceResult): string | undefined 
   return convergence.status === "stable" ? undefined : convergence.check?.id;
 }
 
+// The merge-time failure message. It names the worktree the check ran in, the command
+// verbatim and its exit code, because the fresh merge worktree is provisioned only by
+// .hatch/environment.json and that is the first thing a reader needs to know.
+function proposedCheckFailureMessage(
+  convergence: CheckConvergenceResult,
+  plan: HatchCheckPlanEntry[],
+): string {
+  if (convergence.status === "stable") {
+    return "Proposed integration checks passed in a fresh merge worktree but changed the exact merge tree.";
+  }
+  const diagnosis = convergence.diagnosis;
+  const id = diagnosis?.checkId ?? convergence.check?.id;
+  if (convergence.status === "non-converging" || !id) {
+    return "Proposed integration checks kept changing the tree in a fresh merge worktree.";
+  }
+  const command = diagnosis?.command ?? plan.find((check) => check.id === id)?.command;
+  const code = diagnosis?.exitCode ?? convergence.check?.result.code ?? null;
+  const exited = code === null ? "exited without an exit code" : `exited ${code}`;
+  const subject = command ? `: \`${command}\`` : "";
+  switch (convergence.status) {
+    case "failed":
+      return `Proposed integration check '${id}' failed in a fresh merge worktree${subject} ${exited}.`;
+    case "precondition-unmet":
+      return `Proposed integration environment preflight '${id}' failed in a fresh merge worktree${subject} ${exited}.`;
+    case "timed-out":
+      return `Proposed integration check '${id}' timed out in a fresh merge worktree${subject}.`;
+    case "aborted":
+      return `Proposed integration check '${id}' was aborted in a fresh merge worktree${subject}.`;
+  }
+}
+
 function plannedCheckSummary(plan: HatchCheckPlanEntry[]): HatchCheckPlanEntry[] {
   return plan.map(({ id, command, cwd, purpose }) => ({ id, command, cwd, purpose }));
 }
@@ -254,6 +285,7 @@ export class HatchIntegrationRunner {
         worktree: integrationWorktree,
         checks: plan,
         environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
+        site: "integration",
         signal: ctx.signal,
         onProcessStart: processContext
           ? (pid) => processContext.manager.registerProcess(pid, {
@@ -439,6 +471,7 @@ export class HatchIntegrationRunner {
           worktree: proposedWorktree,
           checks: plan,
           environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
+          site: "fresh-merge",
           signal: ctx.signal,
           onProcessStart: processContext
             ? (pid) => processContext.manager.registerProcess(pid, {
@@ -453,7 +486,6 @@ export class HatchIntegrationRunner {
             : undefined,
         });
         if (convergence.status !== "stable" || convergence.targetTree !== targetTree) {
-          const failingId = failedCheckId(convergence);
           return {
             schema: "hatch-integration-item-v1",
             binder,
@@ -464,9 +496,7 @@ export class HatchIntegrationRunner {
             targetTree: convergence.targetTree,
             checkFailure: convergence,
             plannedChecks: plannedCheckSummary(plan),
-            message: failingId
-              ? `Proposed integration check '${failingId}' failed or changed the exact merge tree.`
-              : "Proposed integration checks failed or changed the exact merge tree.",
+            message: proposedCheckFailureMessage(convergence, plan),
           };
         }
         checks = convergence.manifest;
@@ -591,7 +621,7 @@ export class HatchIntegrationRunner {
           checks,
           verification,
           message: verification.blockedReason
-            ? visualBlockedMessage(verification.blockedReason)
+            ? visualBlockedMessage(verification.blockedReason, verification.remediation)
             : "Proposed integration tree did not pass fresh verification.",
         };
       }
@@ -690,6 +720,7 @@ export class HatchIntegrationRunner {
           worktree: integrationWorktree,
           checks: plan,
           environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
+          site: "integration",
           signal: ctx.signal,
           onProcessStart: processContext
             ? (pid) => processContext.manager.registerProcess(pid, {

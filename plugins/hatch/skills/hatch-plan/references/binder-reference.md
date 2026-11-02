@@ -185,6 +185,8 @@ Do **not** add a root `package.json`, a `bin/` wrapper, or a hand-assembled `PAT
 
 When the project declares a runtime floor (see The runtime contract), a command may also route through the repo's own version manager — e.g. `mise exec -- <command>` — so the declared runtime is the one that resolves.
 
+**On Pi, merge checks run in a fresh worktree.** At merge time the Pi host reruns every floor and oracle command in a fresh worktree that holds no gitignored directory — no `node_modules`, no `.venv` — and provisions it only by the `setup` in `.hatch/environment.json` on the integration ref. So when any command needs installed packages (`npm test`, `npx tsc`, `poetry run pytest`), the project needs that file with a `setup` such as `npm ci`. The project commits it by its own commit, never inside the plan commit: a plan commit is the binder plus its review record and nothing else. Claude Code and Codex do not read this file.
+
 ## Optional and nullable fields
 
 State a field's optionality and nullability explicitly so an oracle can verify it. The two are different:

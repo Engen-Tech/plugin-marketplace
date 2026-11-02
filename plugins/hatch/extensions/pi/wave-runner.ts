@@ -177,6 +177,7 @@ export class HatchWaveRunner {
         worktree: integrationWorktree,
         checks: plan,
         environmentSetupRef: `refs/heads/hatch/${anchor.binder}/integration`,
+        site: "integration",
         signal: ctx.signal,
         onProcessStart: processContext
           ? (pid) => processContext.manager.registerProcess(pid, {
@@ -264,6 +265,9 @@ export class HatchWaveRunner {
       status: "rolled-back",
       anchor,
       tip: anchor.base,
+      // The items whose merges failed, so a reader can tell a wave where nothing landed
+      // from one whose landed merges were undone.
+      ...(failedItems.length > 0 ? { failedItems } : {}),
       message: "Post-wave validation failed; integration and item completion refs were rolled back exactly.",
     };
   }

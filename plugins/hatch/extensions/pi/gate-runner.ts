@@ -3,6 +3,7 @@ import type { AgentSession, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   ChildRegistry,
   createGateChildSession,
+  type ChildModelTarget,
   type ChildRuntimeReport,
   type GateProviderPreflightReport,
 } from "./child-runtime.ts";
@@ -19,6 +20,7 @@ import {
 } from "./evidence.ts";
 import type { CheckToolDetails } from "./check-tool.ts";
 import { loadHatchRole } from "./role-catalog.ts";
+import { requireRoleModel } from "./role-models.ts";
 import { promptForJsonEnvelope } from "./child-envelope.ts";
 import { clampSummary } from "./worker-runner.ts";
 
@@ -82,10 +84,18 @@ export interface HatchGateResult extends ChildGateVerdict {
   // Present only when an operator-trusted executable provider hook carried the
   // gate child, so a result without it records no trust decision.
   trustedProviderHook?: string;
+  // The thinking level Pi applied to the gate child and where its model came
+  // from. Not part of the hash-bound evidence, the same as trustedProviderHook.
+  thinkingLevel?: ChildRuntimeReport["thinkingLevel"];
+  modelSource?: ChildRuntimeReport["modelSource"];
 }
 
 interface GatePreflight {
-  ensure(ctx: ExtensionContext, registry: ChildRegistry): Promise<GateProviderPreflightReport>;
+  ensure(
+    ctx: ExtensionContext,
+    registry: ChildRegistry,
+    target?: ChildModelTarget,
+  ): Promise<GateProviderPreflightReport>;
 }
 
 export interface GateModelInvocation {
@@ -93,6 +103,8 @@ export interface GateModelInvocation {
   cwd: string;
   registry: ChildRegistry;
   profile: GateCapabilityProfile;
+  // The pinned model for this gate's role; the child is built on it.
+  target: ChildModelTarget;
   systemPrompt: string;
   userPrompt: string;
   // The same expectations the host's strict parse will apply, so the corrective
@@ -436,6 +448,7 @@ export async function invokeGateModel(
     invocation.systemPrompt,
     invocation.profile.tools,
     invocation.cwd,
+    invocation.target,
   );
   invocation.registry.add(session, {
     cwd: invocation.cwd,
@@ -518,16 +531,20 @@ export async function executeGateOnEvidence(
   registry: ChildRegistry,
   invoke: GateModelInvoker = invokeGateModel,
 ): Promise<HatchGateResult> {
+  // Resolved once, before any work: the preflight and the child run on the same
+  // pinned target, and an unpinned context fails here.
+  const target = requireRoleModel(ctx, roleId);
   verifyEvidenceIntegrity(manifest);
   await verifyEvidenceFreshness(manifest);
   const profile = createGateCapabilityProfile(roleId, manifest);
   const { systemPrompt, promptHash } = composeGateSystemPrompt(profile);
-  const preflightReport = await preflight.ensure(ctx, registry);
+  const preflightReport = await preflight.ensure(ctx, registry, target);
   const { text, runtime } = await invoke({
     ctx,
     cwd: manifest.repositoryRoot,
     registry,
     profile,
+    target,
     systemPrompt,
     userPrompt: `Review Hatch evidence ${manifest.evidenceHash} for ${roleId}. Use only your fixed tools and return the required JSON object.`,
     expected: {
@@ -566,6 +583,8 @@ export async function executeGateOnEvidence(
     retry: classifyRetry(verdict),
     provider: runtime.provider,
     model: runtime.model,
+    ...(runtime.thinkingLevel ? { thinkingLevel: runtime.thinkingLevel } : {}),
+    ...(runtime.modelSource ? { modelSource: runtime.modelSource } : {}),
     ...(runtime.trustedProviderHook
       ? { trustedProviderHook: runtime.trustedProviderHook }
       : {}),

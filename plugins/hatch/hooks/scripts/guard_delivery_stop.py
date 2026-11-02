@@ -29,6 +29,19 @@ built-unmerged, and a suspect done ref is a finding of its own even with
 no built or accepted ref beside it. When the engine cannot be found beside this plugin, done refs
 are trusted as present: the fail-open direction for a nudge.
 
+A binder whose dispatch lock a live process holds is skipped whole: none of
+the four findings (built-unmerged, accepted-unmerged, suspect-done,
+complete-unarchived) is checked for it and it writes nothing to the sentinel,
+because a running hatch_dispatch changes those refs on purpose. The lock is
+`<git-common-dir>/hatch-locks/<slug>.lock/owner.json` (extensions/pi/dispatch-lock.ts).
+Its edges: an owner on another host, or a pid whose state cannot be read, counts
+as live (silence is the fail-open direction for a nudge); a dead pid, a missing,
+unreadable, or malformed owner.json, a binder or schema mismatch, or a pid that
+is not a positive int is not a lock, so a stale or corrupt lock never silences
+the guard. A reused pid reads as live — a missed nudge, never a false block.
+Once the lock is gone the identical state blocks once as before. On Windows the
+probe uses OpenProcess/GetExitCodeProcess, never os.kill(pid, 0).
+
 On a finding it blocks the stop (exit 2, one-paragraph reason on stderr naming
 each finding and its fix) at most once per (session, state): a fingerprint of
 the findings is recorded in `<git-common-dir>/hatch-stop-gate.json` and an
@@ -44,7 +57,7 @@ are expected results that feed the finding, not internal errors.
   guard_delivery_stop.py --self-test  # run embedded fixtures, exit 0/1
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, subprocess, sys, tempfile
+import argparse, hashlib, json, os, socket, subprocess, sys, tempfile
 from pathlib import Path
 
 def _read_stdin_text() -> str:
@@ -239,14 +252,97 @@ def _archive_committed(root: str, slug: str) -> bool:
                for rev in revs)
 
 
-def _sentinel_path(root: str) -> Path | None:
+def _common_dir(root: str) -> Path | None:
     r = _git(root, "rev-parse", "--git-common-dir")
     if r.returncode != 0 or not r.stdout.strip():
         return None
     common = Path(r.stdout.strip())
     if not common.is_absolute():
         common = Path(root) / common
-    return common / SENTINEL_NAME
+    return common
+
+
+def _sentinel_path(root: str) -> Path | None:
+    common = _common_dir(root)
+    return None if common is None else common / SENTINEL_NAME
+
+
+def _pid_alive(pid: int) -> bool | None:
+    """True alive, False gone, None unknown. Never os.kill(pid, 0) on Windows:
+    signal 0 there is CTRL_C_EVENT, which could reach the console we share."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.OpenProcess.restype = wintypes.HANDLE
+            k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            k.GetExitCodeProcess.restype = wintypes.BOOL
+            k.GetExitCodeProcess.argtypes = (wintypes.HANDLE,
+                                             ctypes.POINTER(wintypes.DWORD))
+            k.CloseHandle.restype = wintypes.BOOL
+            k.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = k.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                err = ctypes.get_last_error()
+                if err == 87:   # ERROR_INVALID_PARAMETER: no such process
+                    return False
+                if err == 5:    # ERROR_ACCESS_DENIED: exists, not ours
+                    return True
+                return None
+            try:
+                code = wintypes.DWORD()
+                if not k.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                k.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _read_lock_owner(path: Path, slug: str) -> dict | None:
+    """The lock's owner record, or None when it is missing, unreadable,
+    malformed, or names another binder — none of which is a lock. Undecodable
+    bytes are replaced, so they fail the JSON or shape checks below."""
+    try:
+        owner = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(owner, dict) or owner.get("schema") != 1 \
+            or owner.get("binder") != slug:
+        return None
+    pid, host = owner.get("pid"), owner.get("hostname")
+    # 2**31 bounds every real pid and keeps os.kill clear of OverflowError.
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2 ** 31 \
+            or not isinstance(host, str):
+        return None
+    return owner
+
+
+def _lock_live(common: Path, slug: str) -> bool:
+    """Is this binder's dispatch lock held by a live process? Unknown is live
+    (silence is the fail-open direction for a nudge); a missing, unreadable,
+    malformed, or mismatched owner.json is not a lock at all."""
+    try:
+        owner = _read_lock_owner(
+            common / "hatch-locks" / f"{slug}.lock" / "owner.json", slug)
+        if owner is None:
+            return False
+        if owner["hostname"] != socket.gethostname():
+            return True  # another host's process cannot be probed
+        return _pid_alive(owner["pid"]) is not False
+    except Exception:  # noqa: BLE001
+        return True  # one odd lock must not disable the guard for other binders
 
 
 def _load_sentinel(path: Path) -> dict[str, str]:
@@ -300,7 +396,10 @@ def decide(payload: object) -> tuple[int, str]:
         return 0, ""  # not a git repo — nothing to check
     findings: list[tuple[str, str, tuple[str, ...]]] = []
     messages: list[str] = []
+    common = _common_dir(root)
     for slug in _live_slugs(root):
+        if common is not None and _lock_live(common, slug):
+            continue  # a live dispatch owns this binder; its state is mid-flight
         ids = _binder_item_ids(root, slug)
         if ids is None:
             continue  # unreadable/malformed binder — fail open for this slug
@@ -626,6 +725,109 @@ def _run_self_test() -> int:
              len(sessions) == SENTINEL_MAX_SESSIONS
              and "p1" not in sessions and "p5" not in sessions
              and "p6" in sessions and "p25" in sessions)
+
+        # Live dispatch lock (L1-L7): a binder whose lock a live process holds
+        # is skipped whole; a dead, malformed, or absent lock is not a lock.
+        def lock_dir(repo: Path, slug: str) -> Path:
+            common = Path(git(repo, "rev-parse", "--path-format=absolute",
+                              "--git-common-dir").stdout.strip())
+            return common / "hatch-locks" / f"{slug}.lock"
+
+        def lock(repo: Path, slug: str, raw: str | None = None,
+                 **over: object) -> Path:
+            owner: dict = {"schema": 1, "binder": slug, "pid": os.getpid(),
+                           "hostname": socket.gethostname(),
+                           "processStartedAt": "2026-11-01T00:00:00.000Z",
+                           "nonce": "selftest", "packageVersion": "0.0.0",
+                           "acquiredAt": "2026-11-01T00:00:00.000Z"}
+            owner.update(over)
+            d = lock_dir(repo, slug)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "owner.json").write_text(
+                json.dumps(owner) if raw is None else raw, encoding="utf-8")
+            return d
+
+        reaped = subprocess.run([sys.executable, "-c",
+                                 "import os; print(os.getpid())"],
+                                capture_output=True, text=True,
+                                encoding="utf-8").stdout.strip()
+        reaped_pid = int(reaped) if reaped.isdigit() else 0
+        flag("pid probe: this process is alive", _pid_alive(os.getpid()) is True)
+        flag("pid probe: a reaped child is dead",
+             reaped_pid > 0 and _pid_alive(reaped_pid) is False)
+
+        # L1. live lock on the only dirty binder -> allow, sentinel untouched
+        repo = dirty_repo(td, "lock1")
+        held = lock(repo, "wip")
+        sentinel = _sentinel_path(str(repo))
+        before = sentinel.read_bytes() if sentinel and sentinel.exists() else None
+        check("a live dispatch lock skips its binder", stop(repo), 0)
+        after = sentinel.read_bytes() if sentinel and sentinel.exists() else None
+        flag("a skipped binder writes no sentinel", before == after)
+
+        # L2. lock released -> the identical state blocks
+        (held / "owner.json").unlink()
+        held.rmdir()
+        check("the same state blocks once the lock dir is removed",
+              stop(repo), 2)
+
+        # L3. lock owned by a dead pid -> not live
+        repo = dirty_repo(td, "lock3")
+        lock(repo, "wip", pid=reaped_pid)
+        check("a lock whose owner pid is dead does not silence the guard",
+              stop(repo), 2)
+
+        # L4. lock owned on another host -> unknown, treated as live
+        repo = dirty_repo(td, "lock4")
+        lock(repo, "wip", hostname="elsewhere.invalid")
+        check("a lock held on another host skips its binder", stop(repo), 0)
+
+        # L5. malformed owner.json -> not a lock
+        repo = dirty_repo(td, "lock5")
+        lock(repo, "wip", raw="{")
+        check("an unparseable owner.json does not silence the guard",
+              stop(repo, session="m1"), 2)
+        lock(repo, "wip", binder="other")
+        check("an owner.json naming another binder does not silence the guard",
+              stop(repo, session="m2"), 2)
+        lock(repo, "wip", pid=0)
+        check("an owner.json with pid 0 does not silence the guard",
+              stop(repo, session="m3"), 2)
+        lock(repo, "wip", pid=True)
+        check("an owner.json with a boolean pid does not silence the guard",
+              stop(repo, session="m4"), 2)
+
+        # L6. two binders: live lock on wip, other built-unmerged -> names other only
+        repo = dirty_repo(td, "lock6")
+        write_binder(repo, "other", ["x"])
+        set_ref(repo, "other", "x", "built")
+        lock(repo, "wip")
+        reason = check("a live lock on one binder still blocks on another",
+                       stop(repo), 2)
+        flag("block reason names the unlocked binder and not the locked one",
+             "binder other" in reason and "binder wip" not in reason)
+
+        # L7. complete-unarchived binder under a live lock -> allow
+        repo = complete_repo(td, "lock7")
+        lock(repo, "comp")
+        check("a live lock skips complete-unarchived too", stop(repo), 0)
+
+        # L8. an owner.json that breaks the reader -> that binder counts as
+        #     live, and every other binder is still checked
+        repo = dirty_repo(td, "lock8")
+        write_binder(repo, "other", ["x"])
+        set_ref(repo, "other", "x", "built")
+        lock(repo, "wip", raw="[" * 100000 + "]" * 100000)
+        reason = check("a lock that breaks the reader skips only its binder",
+                       stop(repo), 2)
+        flag("block reason names the other binder and not the unreadable one",
+             "binder other" in reason and "binder wip" not in reason)
+
+        # L9. a pid beyond the platform range is malformed, not live
+        repo = dirty_repo(td, "lock9")
+        lock(repo, "wip", pid=2 ** 40)
+        check("an owner.json with an out-of-range pid does not silence the guard",
+              stop(repo), 2)
 
     total = len(results)
     failures = results.count(False)

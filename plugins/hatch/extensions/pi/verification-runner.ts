@@ -2,6 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   ChildRegistry,
   runGateAuthProbe,
+  type ChildModelTarget,
   type ChildRuntimeReport,
   type GateProviderPreflightReport,
 } from "./child-runtime.ts";
@@ -18,6 +19,8 @@ import {
   type GateModelInvoker,
   type HatchGateResult,
 } from "./gate-runner.ts";
+import { requireRoleModel } from "./role-models.ts";
+import { safeProgress, type HatchRunProgress } from "./run-events.ts";
 import {
   captureVisualEvidence,
   type CaptureVisualEvidenceOptions,
@@ -27,6 +30,7 @@ import {
 import {
   createFileCurrencySource,
   judgeVisualEvidence,
+  visionModelRemediation,
   type VisualGateOutcome,
   type VisualGateResult,
   type VisualTreeRange,
@@ -68,6 +72,9 @@ export interface HatchVerificationResult {
   // Set only for a blocked status whose cause is a typed visual prerequisite, never
   // opt-out prose. The free-text reason field stays reserved for opt-out.
   blockedReason?: HatchVerificationBlockedReason;
+  // The operator fix for a typed visual block when the cause names one, such as the
+  // visual-gate role's model, the file and key that chose it, and how to change it.
+  remediation?: string;
   gates: {
     acceptance?: HatchGateResult;
     safety?: HatchGateResult;
@@ -76,7 +83,11 @@ export interface HatchVerificationResult {
 }
 
 interface GatePreflight {
-  ensure(ctx: ExtensionContext, registry: ChildRegistry): Promise<GateProviderPreflightReport>;
+  ensure(
+    ctx: ExtensionContext,
+    registry: ChildRegistry,
+    target?: ChildModelTarget,
+  ): Promise<GateProviderPreflightReport>;
 }
 
 export type EvidenceBuilder = (options: BuildEvidenceOptions) => Promise<HatchEvidenceManifest>;
@@ -105,6 +116,7 @@ export interface HatchVisualLifecycleContext {
 export type VisionPreflightProbe = (
   ctx: ExtensionContext,
   registry: ChildRegistry,
+  target?: ChildModelTarget,
 ) => Promise<ChildRuntimeReport>;
 
 // The capture-orchestration seam: bring the app up over the candidate tree-ish, capture
@@ -132,6 +144,7 @@ export type VisualAcceptanceJudge = (
 interface VisualDerivation {
   status: HatchVerificationStatus;
   blockedReason?: HatchVerificationBlockedReason;
+  remediation?: string;
   visual?: VisualGateResult;
 }
 
@@ -141,7 +154,7 @@ const VISUAL_BLOCKED_MESSAGES: Record<HatchVerificationBlockedReason, string> = 
   "visual-no-env":
     "Visual acceptance needs a running app: declare visual_env in .hatch/environment.json at the candidate tree. No capture ran and no ref moved.",
   "visual-no-vision-model":
-    "Visual acceptance needs a vision-capable gate model, but the configured model does not accept image input. Select a vision model and rebuild; no capture was attempted and no ref moved.",
+    "Visual acceptance needs a vision-capable gate model, but the visual-gate role's model does not accept image input. Fix the role's model and rebuild; no ref moved.",
   "visual-capture-failed":
     "Visual capture failed closed (dev-server startup, playwright-cli availability, or an unhealthy render). Inspect the capture remediation and rebuild; no ref moved.",
   "visual-gate-error":
@@ -153,8 +166,10 @@ const VISUAL_BLOCKED_MESSAGES: Record<HatchVerificationBlockedReason, string> = 
 // The actionable, package-owned message for each typed visual block, shared by the
 // build-finalizer and integration-runner consumers so both hold by default with the same
 // wording and neither falls through to move a ref on a blocked seam.
-export function visualBlockedMessage(reason: HatchVerificationBlockedReason): string {
-  return VISUAL_BLOCKED_MESSAGES[reason];
+// A remediation the block carries (the visual-gate model's fix) follows the message.
+export function visualBlockedMessage(reason: HatchVerificationBlockedReason, remediation?: string): string {
+  const message = VISUAL_BLOCKED_MESSAGES[reason];
+  return remediation ? `${message}\n\n${remediation}` : message;
 }
 
 function oracle(manifest: HatchEvidenceManifest): Record<string, unknown> {
@@ -250,7 +265,8 @@ export class HatchVerificationRunner {
     this.#buildEvidence = options.buildEvidence ?? buildHatchEvidence;
     this.#executeGate = options.executeGate ?? executeGateOnEvidence;
     this.#invoke = options.invoke;
-    this.#visionPreflight = options.visionPreflight ?? ((ctx) => runGateAuthProbe(ctx));
+    this.#visionPreflight =
+      options.visionPreflight ?? ((ctx, _registry, target) => runGateAuthProbe(ctx, target));
     this.#captureVisual = options.captureVisual ?? captureVisualEvidence;
     this.#judgeVisual = options.judgeVisual ?? defaultJudgeVisual;
   }
@@ -260,10 +276,13 @@ export class HatchVerificationRunner {
     binder: string,
     item: string,
     requestedMode: HatchVerificationMode,
+    progress?: HatchRunProgress,
   ): Promise<HatchVerificationResult> {
     if (ctx.signal?.aborted) throw new Error("Hatch verification was cancelled before dispatch");
     const lease = await this.#locks.acquire(ctx.cwd, binder);
     try {
+      // Only now does the run own the binder; a run refused the lock never reports a start.
+      safeProgress(progress)({ kind: "run-started", binder, item });
       // The context-less entrypoint (hatch_dispatch runVerification / the index.ts
       // construction) has no lifecycle owner, so a visual oracle blocks visual-no-context.
       return await this.#runLocked(ctx, binder, item, requestedMode, {}, undefined);
@@ -388,6 +407,7 @@ export class HatchVerificationRunner {
         evidenceHash: evidence.evidenceHash,
         status: derivation.status,
         ...(derivation.blockedReason ? { blockedReason: derivation.blockedReason } : {}),
+        ...(derivation.remediation ? { remediation: derivation.remediation } : {}),
         gates,
       };
     }
@@ -417,11 +437,16 @@ export class HatchVerificationRunner {
     if (!visualContext) {
       return { status: "blocked", blockedReason: "visual-no-context" };
     }
-    // FIRST the vision-capability preflight, before any capture. A text-only gate model
-    // fails closed here with no capture attempted.
-    const visionReport = await this.#visionPreflight(ctx, this.#children);
+    // FIRST the vision-capability preflight on the pinned visual-gate model, before any
+    // capture. A text-only model fails closed here with no capture attempted.
+    const visualTarget = requireRoleModel(ctx, "visual-gate");
+    const visionReport = await this.#visionPreflight(ctx, this.#children, visualTarget);
     if (visionReport.advertisesImageInput !== true) {
-      return { status: "blocked", blockedReason: "visual-no-vision-model" };
+      return {
+        status: "blocked",
+        blockedReason: "visual-no-vision-model",
+        remediation: visionModelRemediation(visualTarget, visionReport),
+      };
     }
     // Resolve the design path (binder design_facts.source) and app route (item
     // design_reference). Either unresolved is a fail-closed visual-no-design.
@@ -473,7 +498,7 @@ export class HatchVerificationRunner {
       return { status: "blocked", blockedReason: "visual-gate-error" };
     }
     if (outcome.status === "vision-unsupported") {
-      return { status: "blocked", blockedReason: "visual-no-vision-model" };
+      return { status: "blocked", blockedReason: "visual-no-vision-model", remediation: outcome.remediation };
     }
     if (outcome.status === "dispatch-failed") {
       return { status: "blocked", blockedReason: "visual-gate-error" };

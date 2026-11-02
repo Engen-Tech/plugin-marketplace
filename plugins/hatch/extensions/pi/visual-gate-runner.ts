@@ -10,6 +10,7 @@ import {
   ChildRegistry,
   createGateChildSession,
   runGateAuthProbe,
+  type ChildModelTarget,
   type ChildRuntimeReport,
 } from "./child-runtime.ts";
 import { canonicalJson } from "./evidence.ts";
@@ -21,6 +22,12 @@ import {
   type HatchRetryClassification,
 } from "./gate-runner.ts";
 import { loadHatchRole } from "./role-catalog.ts";
+import {
+  hatchModelsConfigPath,
+  requireRoleModel,
+  STEWARD_ROLE_DEFAULTS,
+  type RoleModelSource,
+} from "./role-models.ts";
 import {
   VISUAL_EVIDENCE_SCHEMA,
   type RenderHealthSummary,
@@ -107,6 +114,8 @@ export interface VisualGateInvocation {
   ctx: ExtensionContext;
   cwd: string;
   registry: ChildRegistry;
+  // The pinned visual-gate model; the child is built on it.
+  target: ChildModelTarget;
   systemPrompt: string;
   userPrompt: string;
   images: VisualImageAttachment[];
@@ -129,6 +138,7 @@ export type VisualGateInvoker = (
 export type VisionPreflight = (
   ctx: ExtensionContext,
   registry: ChildRegistry,
+  target?: ChildModelTarget,
 ) => Promise<ChildRuntimeReport>;
 
 export interface VisualGateResult {
@@ -148,6 +158,10 @@ export interface VisualGateResult {
   // Present only when an operator-trusted executable provider hook carried the
   // visual gate child, so a result without it records no trust decision.
   trustedProviderHook?: string;
+  // The thinking level Pi applied to the visual gate child and where its model
+  // came from. Not part of the dispatch hash, the same as trustedProviderHook.
+  thinkingLevel?: ChildRuntimeReport["thinkingLevel"];
+  modelSource?: RoleModelSource;
 }
 
 export type VisualGateOutcome =
@@ -158,6 +172,8 @@ export type VisualGateOutcome =
       model: string;
       modelInputs: string[];
       remediation: string;
+      // Where the text-only model came from, so the fix names the right file.
+      modelSource: RoleModelSource;
       // The same trust provenance the capability preflight report carried.
       trustedProviderHook?: string;
     }
@@ -322,6 +338,7 @@ export async function realVisualGateInvoke(
     invocation.systemPrompt,
     [groundingTool],
     invocation.cwd,
+    invocation.target,
   );
   invocation.registry.add(session, {
     cwd: invocation.cwd,
@@ -354,15 +371,72 @@ export async function realVisualGateInvoke(
 // The default vision-capability preflight: resolve the exact gate model with the same
 // isolated gate resolution the acceptance/safety gates use, and read its declared input
 // list. No session is spawned and no image is captured — a pure capability check.
-const defaultVisionPreflight: VisionPreflight = (ctx) => runGateAuthProbe(ctx);
+const defaultVisionPreflight: VisionPreflight = (ctx, _registry, target) => runGateAuthProbe(ctx, target);
 
-function visionUnsupportedRemediation(report: ChildRuntimeReport): string {
+// Where a role's model was chosen, as a file and key the operator can open.
+function describeVisualModelSource(source: RoleModelSource): string {
+  switch (source.kind) {
+    case "steward": {
+      const from = source.model ? `${source.model.file} key '${source.model.key}'` : source.agentFile;
+      return source.inheritsSession
+        ? `steward profile '${source.agent}' (${source.agentFile}), which inherits Pi's session model`
+        : `steward profile '${source.agent}', set by ${from}`;
+    }
+    case "hatch-config":
+      return source.agent
+        ? `agent '${source.agent}' (${source.agentFile ?? "file unknown"}), which ${source.file} key '${source.key}' maps this role to`
+        : `${source.file} key '${source.key}'`;
+    case "session":
+      return source.file && source.key
+        ? `Pi's session model, which ${source.file} key '${source.key}' pins this role to`
+        : `Pi's session model (${source.reason})`;
+  }
+}
+
+// The second fix: change whatever actually chose the model, never a profile that did not.
+function visualModelFix(role: ChildModelTarget["role"], source: RoleModelSource): string {
+  switch (source.kind) {
+    case "steward":
+      // A settings override outranks the profile file, so the fix names the override.
+      return source.model && source.model.file !== source.agentFile
+        ? `- Change ${source.model.file} key '${source.model.key}', which sets the model of the steward profile '${source.agent}', to one that accepts image input.`
+        : `- Change the model of the steward profile '${source.agent}' to one that accepts image input.`;
+    case "hatch-config":
+      return source.agent
+        ? `- Change the model of the agent '${source.agent}' to one that accepts image input, or change ${source.file} key '${source.key}' to an agent whose model does.`
+        : `- Change ${source.file} key '${source.key}' to a model that accepts image input.`;
+    case "session":
+      if (source.file && source.key) {
+        return `- Change ${source.file} key '${source.key}' so the ${role} role does not run on Pi's session model, or make Pi's session model one that accepts image input.`;
+      }
+      if (source.reason === "profile-missing" && source.agent) {
+        return `- Add the steward profile '${source.agent}' with a model that accepts image input, or make Pi's session model one that does.`;
+      }
+      if (source.reason === "steward-not-installed") {
+        return `- Make Pi's session model one that accepts image input, or install steward so its '${STEWARD_ROLE_DEFAULTS[role]}' profile decides.`;
+      }
+      return "- Make Pi's session model one that accepts image input.";
+  }
+}
+
+/**
+ * The operator remediation for a visual-gate model that does not accept image input:
+ * the role, the model, where it was chosen, and the two fixes. Built once here from the
+ * pinned target and used by both the verification preflight and the visual gate.
+ */
+export function visionModelRemediation(
+  target: Pick<ChildModelTarget, "role" | "source">,
+  report: { provider: string; model: string; modelInputs?: readonly string[] },
+): string {
+  const { role, source } = target;
   const inputs =
     report.modelInputs && report.modelInputs.length > 0 ? report.modelInputs.join(", ") : "text only";
   return [
-    `The Hatch visual gate needs a vision-capable model, but the configured gate model '${report.provider}/${report.model}' does not advertise image input (it declares: ${inputs}).`,
+    `The Hatch visual gate needs a vision-capable model, but the ${role} role's model '${report.provider}/${report.model}' does not advertise image input (it declares: ${inputs}). That model comes from ${describeVisualModelSource(source)}.`,
     "",
-    `Make Pi's active model one that accepts image input (a vision-capable Opus/GPT model) and retry; Hatch never swaps the model for you.`,
+    "Fix one of these and retry; Hatch never swaps the model for you:",
+    `- Pin "${role}" in ${hatchModelsConfigPath()} to a model that accepts image input: {"roles": {"${role}": {"model": "<provider>/<model>"}}}.`,
+    visualModelFix(role, source),
   ].join("\n");
 }
 
@@ -566,16 +640,19 @@ export async function judgeVisualEvidence(
   }
   if (ctx.signal?.aborted) throw new Error("Hatch visual gate was cancelled before dispatch");
 
-  // 1. Vision-capability preflight — before any image encoding or dispatch. A text-only
-  //    gate model fails closed with an actionable remediation naming the configured model.
-  const visionReport = await preflight(ctx, registry);
+  // 1. Vision-capability preflight — before any image encoding or dispatch, on the
+  //    pinned visual-gate model. A text-only model fails closed with a remediation
+  //    naming the role, where its model came from, and the two fixes.
+  const target = requireRoleModel(ctx, VISUAL_GATE_ROLE);
+  const visionReport = await preflight(ctx, registry, target);
   if (visionReport.advertisesImageInput !== true) {
     return {
       status: "vision-unsupported",
       provider: visionReport.provider,
       model: visionReport.model,
       modelInputs: visionReport.modelInputs ?? [],
-      remediation: visionUnsupportedRemediation(visionReport),
+      remediation: visionModelRemediation(target, visionReport),
+      modelSource: target.source,
       ...(visionReport.trustedProviderHook
         ? { trustedProviderHook: visionReport.trustedProviderHook }
         : {}),
@@ -615,6 +692,7 @@ export async function judgeVisualEvidence(
     ctx,
     cwd,
     registry,
+    target,
     systemPrompt,
     userPrompt: visualUserPrompt(evidence, dispatchHash),
     images,
@@ -665,6 +743,8 @@ export async function judgeVisualEvidence(
     retry: classifyRetry(verdict),
     provider: runtime.provider,
     model: runtime.model,
+    ...(runtime.thinkingLevel ? { thinkingLevel: runtime.thinkingLevel } : {}),
+    ...(runtime.modelSource ? { modelSource: runtime.modelSource } : {}),
     ...(runtime.trustedProviderHook
       ? { trustedProviderHook: runtime.trustedProviderHook }
       : {}),

@@ -14,8 +14,35 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { LifecycleRegistry, type LifecycleRole } from "./lifecycle-registry.ts";
+import type { HatchModelRole, RoleModelSource, RoleModelTarget } from "./role-models.ts";
 
 export type ChildRuntimePolicy = "probe" | "gate" | "worker";
+
+type ThinkingLevel = NonNullable<RoleModelTarget["thinkingLevel"]>;
+
+/**
+ * The part of a resolved role model a child needs: which provider and model to
+ * run, the thinking level the role asked for, and where that choice came from.
+ * A structural subset of RoleModelTarget, so a pinned plan's target passes as is.
+ */
+export type ChildModelTarget = Pick<RoleModelTarget, "role" | "provider" | "id" | "source"> & {
+  thinkingLevel?: ThinkingLevel;
+};
+
+// A child built without a target runs on the session model. Production callers
+// always pass a target; this source makes any that does not visible in the report.
+const UNPINNED_SOURCE: RoleModelSource = { kind: "session", reason: "unpinned-caller" };
+
+function describeModelSource(source: RoleModelSource): string {
+  switch (source.kind) {
+    case "steward":
+      return `steward ${source.agent}`;
+    case "hatch-config":
+      return `${source.file} ${source.key}`;
+    case "session":
+      return `session (${source.reason})`;
+  }
+}
 
 export interface ChildRuntimeReport {
   provider: string;
@@ -38,6 +65,15 @@ export interface ChildRuntimeReport {
   // trust file. Present only when a gate or worker child actually ran on such a
   // hook, so a report without it says no trust decision carried the run.
   trustedProviderHook?: string;
+  // Which role the child serves and where its model came from. Optional so
+  // existing report fixtures stay valid; a child built without a target records
+  // the session source with reason "unpinned-caller" and no role.
+  role?: HatchModelRole;
+  modelSource?: RoleModelSource;
+  // The thinking level the child asked for, and the level Pi actually applied
+  // after clamping it to the model's capabilities.
+  requestedThinkingLevel?: ThinkingLevel;
+  thinkingLevel?: ThinkingLevel;
 }
 
 const TRUSTED_PROVIDER_HOOKS_DIR = "hatch";
@@ -163,16 +199,19 @@ export async function createIsolatedResourceLoader(
 export async function createMirroredModelRuntime(
   ctx: ExtensionContext,
   policy: ChildRuntimePolicy = "probe",
+  target?: ChildModelTarget,
 ): Promise<{
   runtime: ModelRuntime;
   model: NonNullable<ExtensionContext["model"]>;
   report: ChildRuntimeReport;
 }> {
+  // The session model stays required even with a target: it anchors fallbacks
+  // and the provider overrides the role resolution read.
   if (!ctx.model) {
     throw new Error("Pi has no active model");
   }
 
-  const providerId = ctx.model.provider;
+  const providerId = target?.provider ?? ctx.model.provider;
   const nativeProvider = ctx.modelRegistry.getRegisteredNativeProvider(providerId);
   const providerConfig = ctx.modelRegistry.getRegisteredProviderConfig(providerId);
   const isolatedPolicy = policy === "gate" || policy === "worker";
@@ -199,6 +238,14 @@ export async function createMirroredModelRuntime(
     );
   }
 
+  const parentModel = target ? ctx.modelRegistry.find(target.provider, target.id) : ctx.model;
+  if (!parentModel) {
+    throw new Error(
+      `Hatch ${policy} runtime cannot find '${target?.provider}/${target?.id}' (role ${target?.role}, from ${target ? describeModelSource(target.source) : "session"}) in Pi's model registry`,
+    );
+  }
+  const modelId = parentModel.id;
+
   const runtime = await ModelRuntime.create({ allowModelNetwork: false });
   let copiedProvider: ChildRuntimeReport["copiedProvider"] = "builtin";
 
@@ -212,7 +259,7 @@ export async function createMirroredModelRuntime(
   }
 
   const parentAuthStatus = ctx.modelRegistry.getProviderAuthStatus(providerId);
-  const resolvedParentAuth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+  const resolvedParentAuth = await ctx.modelRegistry.getApiKeyAndHeaders(parentModel);
   let copiedRuntimeCredential = false;
   let unresolvedEnvironmentKeys: string[] = [];
 
@@ -224,13 +271,13 @@ export async function createMirroredModelRuntime(
     }
   }
 
-  const exactModel = runtime.getModel(providerId, ctx.model.id);
+  const exactModel = runtime.getModel(providerId, modelId);
   if (isolatedPolicy && !exactModel) {
     throw new Error(
-      `Hatch ${policy} runtime cannot resolve exact model '${providerId}/${ctx.model.id}' without the parent runtime`,
+      `Hatch ${policy} runtime cannot resolve exact model '${providerId}/${modelId}' without the parent runtime`,
     );
   }
-  const childModel = exactModel ?? ctx.model;
+  const childModel = exactModel ?? parentModel;
   const childAuthStatus = runtime.getProviderAuthStatus(providerId);
   const modelInputs = Array.isArray(childModel.input) ? [...childModel.input] : [];
   return {
@@ -238,7 +285,7 @@ export async function createMirroredModelRuntime(
     model: childModel,
     report: {
       provider: providerId,
-      model: ctx.model.id,
+      model: modelId,
       policy,
       exactModelResolved: exactModel !== undefined,
       parentAuthConfigured: parentAuthStatus.configured,
@@ -250,6 +297,9 @@ export async function createMirroredModelRuntime(
       advertisesImageInput: modelInputs.includes("image"),
       modelInputs,
       ...(trustedProviderHook ? { trustedProviderHook } : {}),
+      ...(target ? { role: target.role } : {}),
+      modelSource: target?.source ?? UNPINNED_SOURCE,
+      ...(target?.thinkingLevel ? { requestedThinkingLevel: target.thinkingLevel } : {}),
     },
   };
 }
@@ -260,14 +310,16 @@ async function createChild(
   customTools: ToolDefinition[] = [],
   policy: ChildRuntimePolicy = "probe",
   cwd = ctx.cwd,
+  target?: ChildModelTarget,
 ): Promise<{ session: AgentSession; report: ChildRuntimeReport }> {
-  const { runtime, model, report } = await createMirroredModelRuntime(ctx, policy);
+  const { runtime, model, report } = await createMirroredModelRuntime(ctx, policy, target);
   const { loader, settings } = await createIsolatedResourceLoader(cwd, systemPrompt);
+  const requestedThinkingLevel = target?.thinkingLevel ?? ctx.thinkingLevel ?? "minimal";
   const { session } = await createAgentSession({
     cwd,
     modelRuntime: runtime,
     model,
-    thinkingLevel: ctx.thinkingLevel ?? "minimal",
+    thinkingLevel: requestedThinkingLevel,
     resourceLoader: loader,
     settingsManager: settings,
     sessionManager: SessionManager.inMemory(ctx.cwd),
@@ -275,6 +327,9 @@ async function createChild(
     tools: customTools.map((tool) => tool.name),
     customTools,
   });
+  // Pi clamps the requested level to what the model supports; record both.
+  report.requestedThinkingLevel = requestedThinkingLevel;
+  report.thinkingLevel = session.thinkingLevel;
   return { session, report };
 }
 
@@ -283,9 +338,10 @@ export async function createGateChildSession(
   systemPrompt: string,
   customTools: ToolDefinition[],
   cwd: string,
+  target?: ChildModelTarget,
 ): Promise<{ session: AgentSession; report: ChildRuntimeReport }> {
   if (customTools.length === 0) throw new Error("Hatch gate child requires explicit tools");
-  return createChild(ctx, systemPrompt, customTools, "gate", cwd);
+  return createChild(ctx, systemPrompt, customTools, "gate", cwd, target);
 }
 
 export async function createWorkerChildSession(
@@ -293,9 +349,10 @@ export async function createWorkerChildSession(
   systemPrompt: string,
   customTools: ToolDefinition[],
   cwd: string,
+  target?: ChildModelTarget,
 ): Promise<{ session: AgentSession; report: ChildRuntimeReport }> {
   if (customTools.length === 0) throw new Error("Hatch worker child requires explicit tools");
-  return createChild(ctx, systemPrompt, customTools, "worker", cwd);
+  return createChild(ctx, systemPrompt, customTools, "worker", cwd, target);
 }
 
 function bindAbort(session: AgentSession, signal: AbortSignal | undefined): () => void {
@@ -311,8 +368,11 @@ export async function runAuthProbe(ctx: ExtensionContext): Promise<ChildRuntimeR
   return report;
 }
 
-export async function runGateAuthProbe(ctx: ExtensionContext): Promise<ChildRuntimeReport> {
-  const { report } = await createMirroredModelRuntime(ctx, "gate");
+export async function runGateAuthProbe(
+  ctx: ExtensionContext,
+  target?: ChildModelTarget,
+): Promise<ChildRuntimeReport> {
+  const { report } = await createMirroredModelRuntime(ctx, "gate", target);
   return report;
 }
 
@@ -325,12 +385,15 @@ export interface GateProviderPreflightReport extends ChildRuntimeReport {
 export async function runGateResponseProbe(
   ctx: ExtensionContext,
   registry: ChildRegistry,
+  target?: ChildModelTarget,
 ): Promise<ChildRuntimeReport> {
   const { session, report } = await createChild(
     ctx,
     `Reply with exactly ${GATE_PREFLIGHT_RESPONSE} and no other text.`,
     [],
     "gate",
+    ctx.cwd,
+    target,
   );
   registry.add(session, {
     cwd: ctx.cwd,
@@ -357,7 +420,27 @@ export async function runGateResponseProbe(
 export type GatePreflightProbe = (
   ctx: ExtensionContext,
   registry: ChildRegistry,
+  target?: ChildModelTarget,
 ) => Promise<ChildRuntimeReport>;
+
+// Roles that resolve to the same model share one probe, so a shared report is
+// handed back under the requesting role. The effective thinking level belongs to
+// the probe that ran; it is dropped when the requesting role asked for another.
+function forRole(
+  ctx: ExtensionContext,
+  report: ChildRuntimeReport,
+  target?: ChildModelTarget,
+): ChildRuntimeReport {
+  const { role: _role, modelSource: _source, requestedThinkingLevel, thinkingLevel, ...rest } = report;
+  const requested = target?.thinkingLevel ?? ctx.thinkingLevel ?? "minimal";
+  return {
+    ...rest,
+    ...(target ? { role: target.role } : {}),
+    modelSource: target?.source ?? UNPINNED_SOURCE,
+    requestedThinkingLevel: requested,
+    ...(thinkingLevel && requestedThinkingLevel === requested ? { thinkingLevel } : {}),
+  };
+}
 
 export class GateProviderPreflight {
   readonly #successful = new Map<string, ChildRuntimeReport>();
@@ -369,10 +452,15 @@ export class GateProviderPreflight {
     this.#probe = probe;
   }
 
-  #key(ctx: ExtensionContext): string {
+  // Keyed on the provider, model, credential path, provider identity and trust
+  // decision the probe proved. The thinking level is not part of it: it does not
+  // change which provider, model or credential carries the child.
+  #key(ctx: ExtensionContext, target?: ChildModelTarget): string {
     if (!ctx.model) throw new Error("Pi has no active model");
-    const auth = ctx.modelRegistry.getProviderAuthStatus(ctx.model.provider);
-    const providerConfig = ctx.modelRegistry.getRegisteredProviderConfig?.(ctx.model.provider);
+    const provider = target?.provider ?? ctx.model.provider;
+    const modelId = target?.id ?? ctx.model.id;
+    const auth = ctx.modelRegistry.getProviderAuthStatus(provider);
+    const providerConfig = ctx.modelRegistry.getRegisteredProviderConfig?.(provider);
     const providerIdentity = createHash("sha256")
       .update(
         JSON.stringify(providerConfig ?? null, (_key, value) =>
@@ -381,33 +469,34 @@ export class GateProviderPreflight {
       )
       .digest("hex");
     return [
-      ctx.model.provider,
-      ctx.model.id,
+      provider,
+      modelId,
       auth.source ?? "unconfigured",
       providerIdentity,
       // The trust decision is part of the identity, so trusting or untrusting a
       // provider re-arms a cached success instead of reusing it.
-      readTrustedProviderHooks().has(ctx.model.provider) ? "trusted" : "untrusted",
+      readTrustedProviderHooks().has(provider) ? "trusted" : "untrusted",
     ].join("\u0000");
   }
 
   async ensure(
     ctx: ExtensionContext,
     registry: ChildRegistry,
+    target?: ChildModelTarget,
   ): Promise<GateProviderPreflightReport> {
-    const key = this.#key(ctx);
+    const key = this.#key(ctx, target);
     const successful = this.#successful.get(key);
-    if (successful) return { ...successful, cached: true };
+    if (successful) return { ...forRole(ctx, successful, target), cached: true };
     const pending = this.#pending.get(key);
-    if (pending) return { ...(await pending), cached: true };
+    if (pending) return { ...forRole(ctx, await pending, target), cached: true };
 
     const generation = this.#generation;
-    const probe = this.#probe(ctx, registry);
+    const probe = this.#probe(ctx, registry, target);
     this.#pending.set(key, probe);
     try {
       const report = await probe;
       if (generation === this.#generation) this.#successful.set(key, report);
-      return { ...report, cached: false };
+      return { ...forRole(ctx, report, target), cached: false };
     } finally {
       this.#pending.delete(key);
     }

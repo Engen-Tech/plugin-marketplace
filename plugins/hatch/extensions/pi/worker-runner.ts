@@ -1,5 +1,10 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ChildRegistry, createWorkerChildSession, type ChildRuntimeReport } from "./child-runtime.ts";
+import {
+  ChildRegistry,
+  createWorkerChildSession,
+  type ChildModelTarget,
+  type ChildRuntimeReport,
+} from "./child-runtime.ts";
 import { parseJsonEnvelope, promptForJsonEnvelope } from "./child-envelope.ts";
 import {
   attestWaveWorkerAuthority,
@@ -8,6 +13,7 @@ import {
   type WorkerAuthorityAttestation,
   type WorkerAuthoritySnapshot,
 } from "./worker-attestation.ts";
+import { requireRoleModel } from "./role-models.ts";
 import type { WaveHostLedger } from "./wave-host-ledger.ts";
 import {
   loadWorkerProjectInstructions,
@@ -46,6 +52,8 @@ export interface BuildWorkerInvocation {
   ctx: ExtensionContext;
   registry: ChildRegistry;
   profile: BuildWorkerCapabilityProfile;
+  // The pinned build-worker model; every mode builds its child on it.
+  target: ChildModelTarget;
   // Carried so the corrective turn can validate identity on the same terms as
   // the strict parse; without them the predicate would be the looser of the two.
   binder: string;
@@ -215,6 +223,7 @@ async function invokeBuildWorker(
     invocation.systemPrompt,
     invocation.profile.tools,
     invocation.profile.worktree,
+    invocation.target,
   );
   invocation.registry.add(session, {
     cwd: invocation.profile.worktree,
@@ -365,6 +374,9 @@ export class HatchBuildWorkerRunner {
     waveMates: readonly string[] = [],
     ledger?: WaveHostLedger,
   ): Promise<HatchWorkerResult> {
+    // Resolved before any work, so an unpinned call fails before the authority
+    // snapshot. All three modes run on the same pinned target.
+    const target = requireRoleModel(ctx, "build-worker");
     const instructions = await this.#loadInstructions(worktree);
     const profile = createBuildWorkerCapabilityProfile(
       worktree,
@@ -386,6 +398,7 @@ export class HatchBuildWorkerRunner {
         ctx,
         registry: this.#registry,
         profile,
+        target,
         binder,
         item,
         parentId,

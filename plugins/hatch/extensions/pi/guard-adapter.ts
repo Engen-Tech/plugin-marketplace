@@ -29,6 +29,13 @@ export function isSubagentChildProcess(env: NodeJS.ProcessEnv = process.env): bo
   return env[SUBAGENT_CHILD_ENV] === "1";
 }
 
+export interface LiveRunView {
+  hasLiveRuns(): boolean;
+  liveSummaries(): string[];
+}
+
+const NO_LIVE_RUNS: LiveRunView = { hasLiveRuns: () => false, liveSummaries: () => [] };
+
 const GUARD_LABELS: Record<HatchGuard, string> = {
   binderImmutability: "committed-binder guard",
   packWrite: "stack-pack guard",
@@ -76,10 +83,21 @@ function piDirtyDeliveryMessage(reason: string): string {
     );
 }
 
+// The text changes only when a run starts or ends, so the system prompt cache misses twice per
+// run, not once per progress event.
+function liveRunsBlock(summaries: string[]): string {
+  if (summaries.length === 0) return "";
+  return (
+    `Hatch background runs are live: ${summaries.join(", ")}. ` +
+    "Their Git state is changing; do not act on those binders until the hatch-run-result message arrives."
+  );
+}
+
 export class HatchGuardAdapter {
   readonly extension: ExtensionAPI;
   readonly executeGuard: GuardExecutor;
   readonly isChildSession: () => boolean;
+  readonly liveRuns: LiveRunView;
   #stopped = false;
   #settledCheckRunning = false;
   #lastWhiff?: string;
@@ -90,10 +108,12 @@ export class HatchGuardAdapter {
     extension: ExtensionAPI,
     executeGuard: GuardExecutor = runHatchGuard,
     isChildSession: () => boolean = () => isSubagentChildProcess(),
+    liveRuns: LiveRunView = NO_LIVE_RUNS,
   ) {
     this.extension = extension;
     this.executeGuard = executeGuard;
     this.isChildSession = isChildSession;
+    this.liveRuns = liveRuns;
   }
 
   // A guard that could not run still lets the action through, but the operator hears it once
@@ -230,8 +250,10 @@ export class HatchGuardAdapter {
       ctx,
     );
     const status = result.code === 0 && !result.failedOpen ? result.stdout.trim() : "";
-    if (!status) return undefined;
-    return { systemPrompt: `${event.systemPrompt}\n\n${status}` };
+    const runs = liveRunsBlock(this.liveRuns.liveSummaries());
+    const injected = [status, runs].filter(Boolean).join("\n\n");
+    if (!injected) return undefined;
+    return { systemPrompt: `${event.systemPrompt}\n\n${injected}` };
   }
 
   async agentSettled(
@@ -241,6 +263,10 @@ export class HatchGuardAdapter {
     if (
       this.#stopped ||
       this.#settledCheckRunning ||
+      // A live background run is mid-flight on purpose: its refs and branches change under it, and
+      // a wave-mate between worktree creation and first edit reads as a whiff. Both settle guards
+      // wait; the settle that the run's result message causes runs them on the final state.
+      this.liveRuns.hasLiveRuns() ||
       // A child session owns no delivery, and pi-subagents marks children with PI_SUBAGENT_CHILD=1.
       this.isChildSession() ||
       !ctx.isProjectTrusted() ||
@@ -300,8 +326,11 @@ export class HatchGuardAdapter {
   }
 }
 
-export function registerGuardAdapters(extension: ExtensionAPI): HatchGuardAdapter {
-  const adapter = new HatchGuardAdapter(extension);
+export function registerGuardAdapters(
+  extension: ExtensionAPI,
+  liveRuns?: LiveRunView,
+): HatchGuardAdapter {
+  const adapter = new HatchGuardAdapter(extension, undefined, undefined, liveRuns);
   extension.on("tool_call", (event, ctx) => adapter.beforeToolCall(event, ctx));
   extension.on("tool_result", (event, ctx) => adapter.afterToolResult(event, ctx));
   extension.on("before_agent_start", (event, ctx) => adapter.beforeAgentStart(event, ctx));

@@ -7,6 +7,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   runStableTreeChecks,
   type CheckConvergenceResult,
+  type HaltedCheckConvergenceResult,
   type HatchCheckPlanEntry,
 } from "./check-convergence.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
@@ -172,16 +173,95 @@ function blockedFinalizationMessage(
   verification: HatchVerificationResult,
   fallback: string,
 ): string {
-  return verification.blockedReason ? visualBlockedMessage(verification.blockedReason) : fallback;
+  return verification.blockedReason
+    ? visualBlockedMessage(verification.blockedReason, verification.remediation)
+    : fallback;
+}
+
+// A command as a halt message shows it: whitespace collapsed, clipped to 200 characters.
+// The verbatim command travels in the check failure's diagnosis.
+function shownCommand(command: string): string {
+  const text = command.replace(/\s+/g, " ").trim();
+  return text.length > 200 ? `${text.slice(0, 199)}…` : text;
 }
 
 // A precondition-unmet convergence means the declared environment probe failed before
 // any floor or oracle command ran. It maps to blocked — a missing daemon is not fixed by
-// a worker retry — and echoes the project's own remediation so the halt is actionable
-// instead of an opaque wall of tool errors from a command run into a wall.
-function preconditionHaltMessage(convergence: { remediation?: string }): string {
-  const base = "Declared environment precondition unmet; the floor was not run.";
-  return convergence.remediation ? `${base} ${convergence.remediation}` : base;
+// a worker retry. The message names the preflight command and its exit; the project's
+// own remediation (on_unavailable) travels in `checkFailure.remediation`, and the
+// delivery runner adds it to the halt reason once.
+function preconditionHaltMessage(convergence: HaltedCheckConvergenceResult): string {
+  const command = convergence.diagnosis?.command;
+  const exit = convergence.diagnosis?.exitCode ?? convergence.check?.result.code ?? null;
+  const code = exit === null ? "without an exit code" : `exited ${exit}`;
+  const probe = command ? `the preflight \`${shownCommand(command)}\` ${code}` : `the preflight ${code}`;
+  return `Declared environment precondition unmet: ${probe}; the floor was not run.`;
+}
+
+// "`<command>` exited <code>." for a halted check, from its diagnosis or its plan entry.
+// The formatted diagnosis is not repeated here: it travels in `checkFailure`, and the
+// delivery runner renders it once into the halt reason.
+function checkOutcome(convergence: HaltedCheckConvergenceResult, plan: HatchCheckPlanEntry[]): string {
+  const id = convergence.check?.id ?? convergence.diagnosis?.checkId;
+  const command = convergence.diagnosis?.command ?? plan.find((check) => check.id === id)?.command;
+  const exit = convergence.check?.result.code ?? convergence.diagnosis?.exitCode ?? null;
+  const code = exit === null ? "without an exit code" : `exited ${exit}`;
+  return command ? `\`${shownCommand(command)}\` ${code}.` : `It ${code}.`;
+}
+
+// A final check that failed in the item worktree. Nothing returns it to the worker:
+// build-runner halts any finalization no gate classified as retryable, so the message
+// says the item halts blocked and names the check, its command and exit code.
+function finalCheckFailedMessage(
+  convergence: HaltedCheckConvergenceResult,
+  plan: HatchCheckPlanEntry[],
+): string {
+  const id = convergence.check?.id ?? convergence.diagnosis?.checkId ?? "check-plan";
+  return (
+    `Final check '${id}' failed in the item worktree: ${checkOutcome(convergence, plan)} ` +
+    "The item halts blocked, and no worker retry follows."
+  );
+}
+
+// The parity probe's halt. The carrier phrase "would fail at merge" is registered as
+// INV-37 in docs/conventions/invariants.md; reword it there in the same diff. It is
+// said only when the check really failed or moved the tree in the fresh worktree; a
+// probe that stopped short (aborted, precondition unmet) says so instead.
+function parityHaltMessage(parity: CheckConvergenceResult, plan: HatchCheckPlanEntry[]): string {
+  if (parity.status === "stable") {
+    return (
+      "The check plan passed in a fresh worktree set up only by .hatch/environment.json but " +
+      "changed the converged tree there, so it would fail at merge."
+    );
+  }
+  const id = parity.check?.id ?? parity.diagnosis?.checkId ?? "check-plan";
+  switch (parity.status) {
+    case "failed":
+    case "non-converging": {
+      const base =
+        `Check '${id}' passed in the item worktree but fails in a fresh worktree set up only by ` +
+        ".hatch/environment.json, so it would fail at merge.";
+      return parity.status === "failed" ? `${base} ${checkOutcome(parity, plan)}` : base;
+    }
+    case "precondition-unmet": {
+      const base: string =
+        "Final checks stopped as precondition-unmet in a fresh worktree set up only by " +
+        ".hatch/environment.json: the declared environment preflight failed there, so no floor or " +
+        "oracle check ran and no built ref was written.";
+      // The project's on_unavailable text travels in checkFailure.remediation; the
+      // delivery runner adds it to the halt reason once.
+      return base;
+    }
+    case "timed-out":
+      // runStableTreeChecks exposes no timeout option, so this status cannot occur in the
+      // parity probe today; it is worded here so a later timeout cannot fall through to
+      // the "would fail at merge" text.
+    case "aborted":
+      return (
+        `Final checks stopped as ${parity.status} in a fresh worktree set up only by ` +
+        ".hatch/environment.json; no built ref was written."
+      );
+  }
 }
 
 export class HatchBuildFinalizer {
@@ -250,6 +330,7 @@ export class HatchBuildFinalizer {
           worktree,
           checks: checkPlan,
           environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
+          site: "fresh-merge",
           signal: ctx.signal,
           onProcessStart: processContext
             ? (pid) => processContext.manager.registerProcess(pid, {
@@ -385,6 +466,7 @@ export class HatchBuildFinalizer {
         worktree,
         checks: checkPlan,
         environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
+        site: "item",
         signal: ctx.signal,
         onProcessStart: processContext
           ? (pid) => processContext.manager.registerProcess(pid, {
@@ -418,6 +500,20 @@ export class HatchBuildFinalizer {
           targetTree: convergence.targetTree,
           checkFailure: convergence,
           message: "Recovery checks generated changes; a new exact candidate commit is required.",
+        };
+      }
+      const parity = await this.#parityProbe(
+        ctx, binder, item, worktree, committedTree, checkPlan, processContext,
+      );
+      if (parity) {
+        return {
+          status: "blocked",
+          binder,
+          item,
+          targetTree: committedTree,
+          commit,
+          checkFailure: parity,
+          message: parityHaltMessage(parity, checkPlan),
         };
       }
       checks = convergence.manifest;
@@ -646,6 +742,58 @@ export class HatchBuildFinalizer {
     };
   }
 
+  // Build/merge parity (INV-37). The item worktree carries whatever the worker
+  // installed; the merge reruns the same plan in a fresh worktree provisioned only by
+  // the integration ref's .hatch/environment.json. Run the plan once more on the
+  // converged tree, in such a worktree, before any gate call and before built is
+  // written. A worker cannot change .hatch/, so a failure here halts blocked.
+  // Cost: one worktree materialization, one setup run, and one more run of the floor
+  // and oracle per finalization, repeated on every gate retry.
+  // Returns undefined when the tree passes unchanged; otherwise the probe's result.
+  async #parityProbe(
+    ctx: ExtensionContext,
+    binder: string,
+    item: string,
+    worktree: string,
+    tree: string,
+    plan: HatchCheckPlanEntry[],
+    processContext?: { manager: HatchProcessManager; owner: BinderLifecycleOwner },
+  ): Promise<CheckConvergenceResult | undefined> {
+    const root = await mkdtemp(join(tmpdir(), "hatch-build-parity-"));
+    const parity = join(root, "worktree");
+    let registered = false;
+    try {
+      await git(worktree, ["worktree", "add", "--detach", "--no-checkout", parity, "HEAD"]);
+      registered = true;
+      await git(parity, ["read-tree", "--reset", "-u", tree]);
+      const result = await runStableTreeChecks({
+        worktree: parity,
+        checks: plan,
+        environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
+        site: "fresh-parity",
+        singlePass: true,
+        signal: ctx.signal,
+        onProcessStart: processContext
+          ? (pid) => processContext.manager.registerProcess(pid, {
+              cwd: parity,
+              parentId: processContext.owner.id,
+              label: `${item} build/merge parity check`,
+              role: "host-check",
+            })
+          : undefined,
+        onProcessExit: processContext
+          ? (pid) => processContext.manager.forgetProcess(pid)
+          : undefined,
+      });
+      return result.status === "stable" && result.targetTree === tree ? undefined : result;
+    } finally {
+      if (registered) {
+        await git(worktree, ["worktree", "remove", "--force", parity], true).catch(() => undefined);
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
   // The staged tree equals HEAD. Tell a whiff from a change already on the base before
   // halting: already-present needs the item's own diff against its merge base (the base
   // the evidence builder uses) to be empty AND its oracle to pass on HEAD's exact tree.
@@ -689,6 +837,7 @@ export class HatchBuildFinalizer {
       worktree,
       checks: [oracle],
       environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
+      site: "item",
       signal: ctx.signal,
       onProcessStart: processContext
         ? (pid) =>
@@ -777,6 +926,7 @@ export class HatchBuildFinalizer {
         worktree,
         checks: checkPlan,
         environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
+        site: "item",
         signal: ctx.signal,
         onProcessStart: processContext
           ? (pid) =>
@@ -802,8 +952,21 @@ export class HatchBuildFinalizer {
             convergence.status === "precondition-unmet"
               ? preconditionHaltMessage(convergence)
               : convergence.status === "failed"
-                ? "A final floor check failed; return the candidate to the worker."
+                ? finalCheckFailedMessage(convergence, checkPlan)
                 : `Final checks stopped as ${convergence.status}; the candidate remains staged for recovery.`,
+        };
+      }
+      const parity = await this.#parityProbe(
+        ctx, binder, item, worktree, convergence.targetTree, checkPlan, processContext,
+      );
+      if (parity) {
+        return {
+          status: "blocked",
+          binder,
+          item,
+          targetTree: convergence.targetTree,
+          checkFailure: parity,
+          message: parityHaltMessage(parity, checkPlan),
         };
       }
       checks = convergence.manifest;

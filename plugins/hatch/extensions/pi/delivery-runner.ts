@@ -5,17 +5,30 @@ import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HatchBuildItemResult, HatchBuildItemRunner } from "./build-runner.ts";
-import type { HatchCheckPlanEntry } from "./check-convergence.ts";
+import type { CheckConvergenceResult, HatchCheckPlanEntry } from "./check-convergence.ts";
+import {
+  environmentPreflight,
+  formatCheckDiagnosis,
+  type HatchCheckDiagnosis,
+  type HatchEnvironmentFinding,
+} from "./check-environment.ts";
 import {
   validateRecoveredCompanionCommit,
   type HatchCompanionResult,
   type ProcessContext,
 } from "./companion-runner.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
+import { readEnvironmentConfig } from "./environment.ts";
 import { deriveItemGitState, isItemMergeSubject } from "./git-state.ts";
 import type { HatchIntegrationResult, HatchIntegrationRunner } from "./integration-runner.ts";
 import { validateCandidateHooks, validateMergeHooks } from "./hook-runner.ts";
 import { HatchProcessManager } from "./process-manager.ts";
+import {
+  safeProgress,
+  type HatchRunEventCheck,
+  type HatchRunProgress,
+  type HatchWaveNext,
+} from "./run-events.ts";
 import { resolveHatchScript } from "./script-catalog.ts";
 import type {
   HatchWaveFinalizationResult,
@@ -84,6 +97,15 @@ export interface HatchDeliveryWave {
   finalization?: HatchWaveFinalizationResult;
 }
 
+/** One item that halted in this run, so a result reader need not dig through `waves`. */
+export interface HatchDeliveryHalt {
+  item: string;
+  phase: "build" | "merge";
+  status: string;
+  reason: string;
+  diagnosis?: HatchCheckDiagnosis;
+}
+
 export interface HatchDeliveryResult {
   schema: "hatch-delivery-v1";
   binder: string;
@@ -93,6 +115,9 @@ export interface HatchDeliveryResult {
   message: string;
   companions?: HatchCompanionResult;
   supersedes?: HatchSupersedesReport;
+  halts?: HatchDeliveryHalt[];
+  // Set when the environment preflight stopped the run before any build.
+  environmentFinding?: HatchEnvironmentFinding;
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -333,12 +358,47 @@ interface DeferredItem {
  */
 function buildHaltReason(build: HatchBuildItemResult): string {
   const detail = build.message?.trim();
+  const checkFailure = build.finalization?.checkFailure;
   if (build.status === "failed") {
-    const reason = haltReasonWithFindings(build.message ?? "", [build.finalization?.verification]);
+    const reason = haltReasonWithFindings(build.message ?? "", checkFailure, [build.finalization?.verification]);
     if (reason.trim()) return reason;
   }
-  if (build.status === "blocked" && detail) return detail;
+  // A blocked build is how a failing floor, oracle, or setup check halts, so its
+  // diagnosis follows the message here too.
+  if (build.status === "blocked" && detail) return haltReasonWithFindings(detail, checkFailure, []);
   return buildHaltMessage(build.item, build.status);
+}
+
+/** The diagnosis of a halted check, when the convergence carries one. */
+function checkDiagnosis(checkFailure: CheckConvergenceResult | undefined): HatchCheckDiagnosis | undefined {
+  return checkFailure && checkFailure.status !== "stable" ? checkFailure.diagnosis : undefined;
+}
+
+function withCheck(check: HatchRunEventCheck | undefined): { check?: HatchRunEventCheck } {
+  return check ? { check } : {};
+}
+
+function haltRecord(
+  item: string,
+  phase: HatchDeliveryHalt["phase"],
+  status: string,
+  reason: string,
+  checkFailure: CheckConvergenceResult | undefined,
+): HatchDeliveryHalt {
+  const diagnosis = checkDiagnosis(checkFailure);
+  return { item, phase, status, reason, ...(diagnosis ? { diagnosis } : {}) };
+}
+
+/** The structured check an `item-halted` event carries, from a halted check's diagnosis. */
+function eventCheck(diagnosis: HatchCheckDiagnosis | undefined): HatchRunEventCheck | undefined {
+  if (!diagnosis) return undefined;
+  return {
+    id: diagnosis.checkId,
+    command: diagnosis.command,
+    exitCode: diagnosis.exitCode,
+    excerpt: diagnosis.excerpt,
+    ...(diagnosis.remediation ? { remediation: diagnosis.remediation } : {}),
+  };
 }
 
 /**
@@ -378,14 +438,38 @@ function deferredHaltMessage(
 
 /** The finding text of a failed merge-time integration, bounded for a prompt. */
 function integrationHaltReason(result: HatchIntegrationResult): string {
-  return haltReasonWithFindings(result.message, [result.verification, result.safetyVerification]);
+  return haltReasonWithFindings(result.message, result.checkFailure, [
+    result.verification,
+    result.safetyVerification,
+  ]);
 }
 
-/** A halt message followed by every gate finding of the given verifications, bounded for a prompt. */
+const HALT_REASON_LIMIT = 1_500;
+// The environment preflight's prompt title keeps this much of the finding.
+const PREFLIGHT_TITLE_LIMIT = 700;
+
+function clipText(text: string, limit: number): string {
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+const DIAGNOSIS_BUDGET = 700;
+
+/**
+ * A halt message, then the failing check's diagnosis and any project remediation, then
+ * every gate finding of the given verifications, bounded for a prompt. The diagnosis
+ * keeps its own budget and comes before the findings, so findings give way first.
+ */
 function haltReasonWithFindings(
   message: string,
+  checkFailure: CheckConvergenceResult | undefined,
   verifications: (HatchIntegrationResult["verification"] | undefined)[],
 ): string {
+  const halted = checkFailure && checkFailure.status !== "stable" ? checkFailure : undefined;
+  const diagnosis = halted?.diagnosis ? formatCheckDiagnosis(halted.diagnosis, DIAGNOSIS_BUDGET) : "";
+  // The project's own on_unavailable text, set only on precondition-unmet; the
+  // diagnosis's remediation (install guidance) is already inside its block.
+  const projectRemediation = halted?.remediation?.trim()
+    ? `Project remediation: ${halted.remediation.trim()}`.slice(0, 300)
+    : "";
   const findings = verifications
     .flatMap((verification) => Object.values(verification?.gates ?? {}))
     .flatMap(
@@ -398,8 +482,14 @@ function haltReasonWithFindings(
     .map((finding) =>
       `[${finding.severity ?? "unknown"}] ${finding.code ?? "finding"}: ${finding.message ?? ""}`.trim(),
     );
-  const reason = [message, ...findings].join(" ").trim();
-  return reason.length > 1_000 ? `${reason.slice(0, 997)}...` : reason;
+  // With a diagnosis present the message gets what the diagnosis and remediation leave,
+  // so a long verbatim command in the message cannot push the diagnosis out.
+  const room = HALT_REASON_LIMIT - diagnosis.length - projectRemediation.length - 2;
+  const text = message.trim();
+  const lead = diagnosis && text.length > room ? `${text.slice(0, Math.max(0, room - 3))}...` : text;
+  const head = [lead, diagnosis, projectRemediation].filter(Boolean).join("\n");
+  const reason = [head, findings.join(" ")].filter(Boolean).join("\n").trim();
+  return reason.length > HALT_REASON_LIMIT ? `${reason.slice(0, HALT_REASON_LIMIT - 3)}...` : reason;
 }
 
 function supersedesReport(packet: PreflightPacket): HatchSupersedesReport | undefined {
@@ -868,6 +958,52 @@ export class HatchDeliveryRunner {
   }
 
   /**
+   * The environment preflight over committed bytes: every item not yet done, its oracle
+   * resolved against `source`'s tree and `.hatch/environment.json`. A lockfile counts by
+   * existence (`git cat-file -e`), so its size never matters; a file whose content cannot
+   * be read counts as absent, since the rule only decides whether to ask. A malformed
+   * environment file throws, failing closed before any build.
+   */
+  async #environmentPreflight(
+    repoRoot: string,
+    binder: string,
+    items: DeliveryItem[],
+    source: string,
+  ): Promise<HatchEnvironmentFinding | undefined> {
+    const pending: DeliveryItem[] = [];
+    for (const item of items) {
+      if ((await deriveItemGitState(repoRoot, binder, item.id)).state !== "done") pending.push(item);
+    }
+    if (pending.length === 0) return undefined;
+    const config = await readEnvironmentConfig(repoRoot, source);
+    const fileExists = async (path: string): Promise<boolean> => {
+      try {
+        await exec("git", ["-C", repoRoot, "cat-file", "-e", `${source}:${path}`]);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    return environmentPreflight(
+      pending,
+      config,
+      async (path) => {
+        if (!await fileExists(path)) return undefined;
+        try {
+          const { stdout } = await exec("git", ["-C", repoRoot, "show", `${source}:${path}`], {
+            encoding: "utf8",
+            maxBuffer: MAX_OUTPUT,
+          });
+          return stdout;
+        } catch {
+          return undefined;
+        }
+      },
+      fileExists,
+    );
+  }
+
+  /**
    * Every worktree this binder owns, found by branch ref *or* by the path the runner gives it.
    * Matching on the ref alone misses a worktree left detached by an interrupted operation —
    * which is precisely the one that would later trip `#ensureIntegrationWorktree`.
@@ -1093,7 +1229,12 @@ export class HatchDeliveryRunner {
     }));
   }
 
-  async run(ctx: ExtensionContext, binder: string): Promise<HatchDeliveryResult> {
+  async run(
+    ctx: ExtensionContext,
+    binder: string,
+    progress?: HatchRunProgress,
+  ): Promise<HatchDeliveryResult> {
+    const emit = safeProgress(progress);
     const lease = await this.#locks.acquire(ctx.cwd, binder);
     let owner;
     try {
@@ -1102,6 +1243,8 @@ export class HatchDeliveryRunner {
       await this.#locks.release(lease);
       throw error;
     }
+    // Only now does the run own the binder; a run refused the lock never reports a start.
+    emit({ kind: "run-started", binder });
     try {
       const repoRoot = await git(ctx.cwd, ["rev-parse", "--show-toplevel"]);
       const integrationRef = `refs/heads/hatch/${binder}/integration`;
@@ -1157,14 +1300,72 @@ export class HatchDeliveryRunner {
       // A successor binder (`supersedes`) inherits its predecessor's delivered work. Every
       // result from here on carries the preflight's supersedes report.
       let successorReport: HatchSupersedesReport | undefined;
-      const report = (result: HatchDeliveryResult): HatchDeliveryResult =>
-        successorReport ? { ...result, supersedes: successorReport } : result;
+      // Every halt recorded in this run, in order. The result reports the latest halt per
+      // item and drops an item that is done when the run returns, so an item that halted
+      // and then landed after Fix and rerun is not reported as halted.
+      const halts: HatchDeliveryHalt[] = [];
+      const report = async (result: HatchDeliveryResult): Promise<HatchDeliveryResult> => {
+        const latest = new Map<string, HatchDeliveryHalt>();
+        for (const halt of halts) {
+          latest.delete(halt.item);
+          latest.set(halt.item, halt);
+        }
+        const open: HatchDeliveryHalt[] = [];
+        for (const halt of latest.values()) {
+          if ((await deriveItemGitState(repoRoot, binder, halt.item)).state !== "done") open.push(halt);
+        }
+        return {
+          ...result,
+          ...(successorReport ? { supersedes: successorReport } : {}),
+          ...(open.length > 0 ? { halts: open } : {}),
+        };
+      };
       const integrationExists = await git(repoRoot, ["show-ref", "--verify", "--quiet", integrationRef])
         .then(() => true, () => false);
       const planned = await this.#plannedBinder(repoRoot, binder, integrationExists);
+      // Before any build, and before this run writes any branch, worktree, ref or tag: an
+      // oracle that needs installed dependencies cannot pass in the fresh merge worktree
+      // unless the integration branch declares a setup. A first run reads the tree it is
+      // about to branch from (HEAD); a later run reads the integration branch. The human
+      // decides each run; nothing is stored.
+      if (planned) {
+        const carriedByPlan = new Set(planned.supersedes?.carried ?? []);
+        const finding = await this.#environmentPreflight(
+          repoRoot,
+          binder,
+          planned.work_items.filter((item) => !carriedByPlan.has(item.id)),
+          integrationExists ? integrationRef : "HEAD",
+        );
+        if (finding) {
+          emit({
+            kind: "environment-preflight",
+            items: [...new Set(finding.needs.map((need) => need.item))],
+            suggestedSetup: finding.suggestedSetup,
+            message: finding.message,
+          });
+          // The prompt title is bounded; the event and the result keep the full finding.
+          const choice = ctx.hasUI
+            ? await ctx.ui.select(
+              `Hatch binder '${binder}' environment preflight:\n${clipText(finding.message, PREFLIGHT_TITLE_LIMIT)}`,
+              ["Stop to add the setup", "Build anyway"],
+            )
+            : undefined;
+          if (choice !== "Build anyway") {
+            return report({
+              schema: "hatch-delivery-v1",
+              binder,
+              status: "blocked",
+              integrationWorktree: "",
+              waves: [],
+              message: `Delivery stopped before any build: ${finding.message}`,
+              environmentFinding: finding,
+            });
+          }
+        }
+      }
       if (planned?.supersedes && !integrationExists) {
         const plannedPath = `.hatch/binders/${binder}.json`;
-        const blocked = (message: string): HatchDeliveryResult => report({
+        const blocked = (message: string): Promise<HatchDeliveryResult> => report({
           schema: "hatch-delivery-v1",
           binder,
           status: "blocked",
@@ -1216,7 +1417,7 @@ export class HatchDeliveryRunner {
           successorReport = proven && (archive ? { ...proven, archive } : proven);
           return successorHalt(packet, supersedes);
         };
-        const blocked = (halt: string): HatchDeliveryResult => report({
+        const blocked = (halt: string): Promise<HatchDeliveryResult> => report({
           schema: "hatch-delivery-v1",
           binder,
           status: "blocked",
@@ -1240,9 +1441,18 @@ export class HatchDeliveryRunner {
         }
         for (const id of supersedes.carried) carried.add(id);
       }
+      // After a wave that leaves an item failed, the next pass prompts the human, or with
+      // no host to ask, stops naming the item.
+      const afterWave = (leftFailed: boolean): HatchWaveNext =>
+        leftFailed ? (ctx.hasUI ? "prompt" : "stop") : "continue";
       const isDone = (states: Map<string, { state: string }>, id: string): boolean =>
         carried.has(id) || states.get(id)?.state === "done";
       const activeItems = document.work_items.filter((item) => !carried.has(item.id));
+      emit({
+        kind: "binder-loaded",
+        items: document.work_items.map((item) => item.id),
+        carried: [...carried],
+      });
       // Why each item halted in this run, shown at the human's fix/accept/defer prompt.
       const haltReasons = new Map<string, string>();
       // Items whose build halted in this run, with the status and reason. In memory only:
@@ -1341,6 +1551,16 @@ export class HatchDeliveryRunner {
               { manager: this.#processes, owner },
             );
             waveResult.finalization = finalization;
+            emit({
+              kind: "wave-finished",
+              wave: pending.wave,
+              status: finalization.status,
+              landed: waveResult.integrations
+                .filter((integration) => integration.status === "integrated")
+                .map((integration) => integration.item),
+              failed: finalization.failedItems ?? [],
+              next: finalization.status === "passed" ? "continue" : "stop",
+            });
             if (finalization.status !== "passed") {
               return report({
                 schema: "hatch-delivery-v1",
@@ -1364,6 +1584,7 @@ export class HatchDeliveryRunner {
               message: "Every binder item is durably done and the binder is archived.",
             });
           }
+          emit({ kind: "companions-started" });
           const companions = await this.#companions.finishDelivery(
             ctx,
             binder,
@@ -1464,6 +1685,14 @@ export class HatchDeliveryRunner {
             { manager: this.#processes, owner },
           );
           waveResult.finalization = finalization;
+          emit({
+            kind: "wave-finished",
+            wave: anchor.wave,
+            status: finalization.status,
+            landed: [recovered.item],
+            failed: finalization.failedItems ?? [],
+            next: finalization.status === "passed" ? "continue" : "stop",
+          });
           if (finalization.status !== "passed") {
             return report({
               schema: "hatch-delivery-v1",
@@ -1577,7 +1806,32 @@ export class HatchDeliveryRunner {
             { manager: this.#processes, owner },
           );
           waveResult.finalization = finalization;
-          if (integrated.status !== "integrated" || finalization.status !== "passed") {
+          if (integrated.status !== "integrated") {
+            // Accept did not land the item: the human declined at the confirm or reason
+            // prompt, or the accepted integration itself failed. The item keeps its failed
+            // ref, and the run stops naming why.
+            const reason = integrationHaltReason(integrated);
+            haltReasons.set(failed.id, reason);
+            halts.push(haltRecord(failed.id, "merge", "failed", reason, integrated.checkFailure));
+            emit({
+              kind: "item-halted",
+              wave: waveNumber,
+              item: failed.id,
+              status: "failed",
+              reason,
+              ...withCheck(eventCheck(checkDiagnosis(integrated.checkFailure))),
+            });
+          }
+          const acceptLanded = integrated.status === "integrated" && finalization.status === "passed";
+          emit({
+            kind: "wave-finished",
+            wave: waveNumber,
+            status: finalization.status,
+            landed: integrated.status === "integrated" ? [failed.id] : [],
+            failed: finalization.failedItems ?? [],
+            next: acceptLanded ? "continue" : "stop",
+          });
+          if (!acceptLanded) {
             return report({
               schema: "hatch-delivery-v1",
               binder,
@@ -1627,10 +1881,35 @@ export class HatchDeliveryRunner {
             message: "No dependency-ready item exists; the binder graph or Git state is stuck.",
           });
         }
+        emit({ kind: "wave-started", wave: waveNumber, items: waveMates });
         const builds = await mapWithConcurrencyLimit(
           batch,
           MAX_PARALLEL_BUILDS,
-          (item) => this.#builds.runWithLease(ctx, binder, item.id, lease, owner, waveMates, ledger),
+          (item) =>
+            this.#builds
+              .runWithLease(ctx, binder, item.id, lease, owner, waveMates, ledger)
+              // Reported as each build settles, not at the wave barrier, so a long wave shows motion.
+              .then((build) => {
+                emit(
+                  BUILD_HALT_STATUSES.includes(build.status)
+                    ? {
+                        kind: "item-halted",
+                        wave: waveNumber,
+                        item: item.id,
+                        status: build.status,
+                        reason: buildHaltReason(build),
+                        ...withCheck(eventCheck(checkDiagnosis(build.finalization?.checkFailure))),
+                      }
+                    : {
+                        kind: "item-built",
+                        wave: waveNumber,
+                        item: item.id,
+                        status: build.status,
+                        attempts: build.attempts,
+                      },
+                );
+                return build;
+              }),
         );
         const waveResult: HatchDeliveryWave = {
           wave: waveNumber,
@@ -1647,12 +1926,25 @@ export class HatchDeliveryRunner {
           if (!BUILD_HALT_STATUSES.includes(build.status)) continue;
           const reason = buildHaltReason(build);
           deferred.set(item.id, { status: build.status, message: reason });
+          halts.push(haltRecord(item.id, "build", build.status, reason, build.finalization?.checkFailure));
           // A failed build leaves a failed ref, so the next pass asks the human about
           // it; the prompt names this run's reason rather than an earlier run's.
           if (build.status === "failed") haltReasons.set(item.id, reason);
         }
+        // A failed build holds a failed ref, so the next pass asks the human about it.
+        const buildFailed = pairs.some(({ build }) => build.status === "failed");
         const mergeable = pairs.filter(({ build }) => !BUILD_HALT_STATUSES.includes(build.status));
-        if (mergeable.length === 0) continue;
+        if (mergeable.length === 0) {
+          emit({
+            kind: "wave-finished",
+            wave: waveNumber,
+            status: "nothing-to-merge",
+            landed: [],
+            failed: [],
+            next: afterWave(buildFailed),
+          });
+          continue;
+        }
         // The anchor is written only when a merge follows: a started wave that never
         // finishes leaves an anchor the pending-wave recovery cannot resolve.
         const anchor = await this.#waves.start(
@@ -1675,6 +1967,12 @@ export class HatchDeliveryRunner {
           let state = await deriveItemGitState(repoRoot, binder, item.id);
           if (state.state === "done") {
             landed.add(item.id);
+            emit({
+              kind: "item-merged",
+              wave: waveNumber,
+              item: item.id,
+              accepted: Boolean(state.refs.accepted),
+            });
             continue;
           }
           if (state.state === "merged-unmarked") {
@@ -1684,12 +1982,19 @@ export class HatchDeliveryRunner {
             state = await deriveItemGitState(repoRoot, binder, item.id);
             if (state.state === "done") {
               landed.add(item.id);
+              emit({
+                kind: "item-merged",
+                wave: waveNumber,
+                item: item.id,
+                accepted: Boolean(state.refs.accepted),
+              });
               continue;
             }
           }
           if (state.state !== "built") {
             const reason = `Item '${item.id}' is not in a serially mergeable built state.`;
             deferred.set(item.id, { status: state.state, message: reason });
+            halts.push(haltRecord(item.id, "merge", state.state, reason, undefined));
             // Should that state be failed, the next pass's prompt names this run's reason.
             haltReasons.set(item.id, reason);
             continue;
@@ -1724,7 +2029,15 @@ export class HatchDeliveryRunner {
             { manager: this.#processes, owner },
           );
           waveResult.integrations.push(integrated);
-          if (integrated.status === "integrated") landed.add(item.id);
+          if (integrated.status === "integrated") {
+            landed.add(item.id);
+            emit({
+              kind: "item-merged",
+              wave: waveNumber,
+              item: item.id,
+              accepted: Boolean(integrated.accepted),
+            });
+          }
           if (integrated.status !== "integrated") {
             // The documented halt shape for a merge-time review failure: the committed
             // item branch plus a failed ref at its tip, with built gone. That routes the
@@ -1732,7 +2045,19 @@ export class HatchDeliveryRunner {
             // it built, where every later run would re-integrate it and fail the same way.
             // The rest of the wave keeps merging: only this item halts.
             await this.#markIntegrationFailed(repoRoot, binder, item.id, integrated.itemTip);
-            haltReasons.set(item.id, integrationHaltReason(integrated));
+            const reason = integrationHaltReason(integrated);
+            haltReasons.set(item.id, reason);
+            // The item now holds a failed ref and waits for the human: "failed", never
+            // the integration's retry, since nothing retries it.
+            halts.push(haltRecord(item.id, "merge", "failed", reason, integrated.checkFailure));
+            emit({
+              kind: "item-halted",
+              wave: waveNumber,
+              item: item.id,
+              status: "failed",
+              reason,
+              ...withCheck(eventCheck(checkDiagnosis(integrated.checkFailure))),
+            });
             integrationFailed = true;
           }
         }
@@ -1750,7 +2075,18 @@ export class HatchDeliveryRunner {
         );
         waveResult.finalization = waveFinalization;
         const landedAny = waveResult.integrations.some((value) => value.status === "integrated");
-        if (waveFinalization.status === "rolled-back" && (landedAny || !integrationFailed)) {
+        // A rollback stops the run unless it undid nothing: no merge landed and the
+        // failures were merge-time ones, which the next pass puts to the human.
+        const waveStops = waveFinalization.status === "rolled-back" && (landedAny || !integrationFailed);
+        emit({
+          kind: "wave-finished",
+          wave: waveNumber,
+          status: waveFinalization.status,
+          landed: [...landed],
+          failed: waveFinalization.failedItems ?? [],
+          next: waveStops ? "stop" : afterWave(integrationFailed || buildFailed),
+        });
+        if (waveStops) {
           return report({
             schema: "hatch-delivery-v1",
             binder,

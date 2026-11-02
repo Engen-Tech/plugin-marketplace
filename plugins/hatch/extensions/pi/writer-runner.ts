@@ -1,5 +1,11 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ChildRegistry, createWorkerChildSession, type ChildRuntimeReport } from "./child-runtime.ts";
+import {
+  ChildRegistry,
+  createWorkerChildSession,
+  type ChildModelTarget,
+  type ChildRuntimeReport,
+} from "./child-runtime.ts";
+import { requireRoleModel } from "./role-models.ts";
 import { clampSummary } from "./worker-runner.ts";
 import {
   attestWorkerAuthority,
@@ -110,6 +116,8 @@ export interface WriterInvocation {
   ctx: ExtensionContext;
   registry: ChildRegistry;
   profile: WriterCapabilityProfile;
+  // The pinned model for this writer's role (doc-gardner or kaizen).
+  target: ChildModelTarget;
   // Carried so the corrective turn can apply the strict parse's own rules rather
   // than a looser stand-in for them.
   binder: string;
@@ -130,6 +138,7 @@ async function invokeWriter(
     invocation.systemPrompt,
     invocation.profile.tools,
     invocation.profile.worktree,
+    invocation.target,
   );
   invocation.registry.add(session, {
     cwd: invocation.profile.worktree,
@@ -321,6 +330,8 @@ export class HatchWriterRunner {
     },
     parentId?: string,
   ): Promise<HatchWriterResult> {
+    // Resolved before any work, so an unpinned call fails before the authority snapshot.
+    const target = requireRoleModel(ctx, writer);
     const profile = createWriterCapabilityProfile(worktree, writer);
     const projectInstructions = await loadWorkerProjectInstructions(worktree);
     const instructions = projectInstructions.map((instruction) =>
@@ -334,6 +345,7 @@ export class HatchWriterRunner {
         ctx,
         registry: this.#registry,
         profile,
+        target,
         binder,
         parentId,
         systemPrompt: writerSystemPrompt(profile, instructions),

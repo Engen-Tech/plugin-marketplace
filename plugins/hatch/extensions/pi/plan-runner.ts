@@ -30,6 +30,8 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { environmentPreflight, type ReadTreeFile } from "./check-environment.ts";
+import { readEnvironmentConfig, type HatchEnvironmentConfig } from "./environment.ts";
 import { resolveHatchScript, type HatchScriptAction } from "./script-catalog.ts";
 
 const exec = promisify(execFile);
@@ -39,6 +41,19 @@ const BINDER_ID = /^[a-z0-9][a-z0-9-]*$/;
 const BINDER_ROOT = ".hatch/binders";
 const ROUNDTABLE_ROOT = ".hatch/roundtable/";
 const ROUNDTABLE_CONFIG = ".hatch/roundtable.json";
+// The lockfile kinds the environment preflight recognizes (check-environment.ts).
+const LOCKFILES = new Set([
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  "poetry.lock",
+  "Pipfile.lock",
+  "pdm.lock",
+  "Gemfile.lock",
+]);
 
 export const HATCH_PLAN_COMMIT_SUBJECT = (binder: string): string => `hatch: commit binder ${binder}`;
 
@@ -49,10 +64,24 @@ export interface HatchPlanScriptRun {
   stderr: string;
 }
 
+/**
+ * What the Pi planner needs to draft `.hatch/environment.json`: the directories that hold a
+ * lockfile and whether HEAD already declares a setup. Read from HEAD, never the working tree,
+ * because a delivery reads the committed file.
+ */
+export interface HatchPlanCheckEnvironment {
+  manifestDirs: { dir: string; lockfiles: string[] }[];
+  environmentFile: boolean;
+  setupDeclared: boolean;
+  setup?: string;
+  error?: string;
+}
+
 export interface HatchPlanSurveyResult {
   schema: "hatch-plan-survey-v1";
   root: string;
   runs: HatchPlanScriptRun[];
+  checkEnvironment: HatchPlanCheckEnvironment;
 }
 
 export interface HatchPlanCommitResult {
@@ -115,6 +144,78 @@ interface BinderCardFacts {
   items: number;
   after: string[];
   sme: string[];
+  workItems: Record<string, unknown>[];
+}
+
+function headFileReader(root: string): ReadTreeFile {
+  return async (path) => {
+    try {
+      const { stdout } = await exec("git", ["show", `HEAD:${path}`], {
+        cwd: root,
+        encoding: "utf8",
+        maxBuffer: MAX_OUTPUT,
+      });
+      return stdout;
+    } catch {
+      return undefined;
+    }
+  };
+}
+
+async function headEnvironment(
+  root: string,
+): Promise<{ present: boolean; config?: HatchEnvironmentConfig; error?: string }> {
+  try {
+    const config = await readEnvironmentConfig(root, "HEAD");
+    return { present: config !== undefined, config };
+  } catch (error) {
+    return { present: true, error: (error as Error).message };
+  }
+}
+
+async function surveyCheckEnvironment(root: string): Promise<HatchPlanCheckEnvironment> {
+  const listing = await git(root, ["ls-tree", "-r", "--name-only", "-z", "HEAD"], true);
+  const byDir = new Map<string, string[]>();
+  for (const path of listing.split("\0")) {
+    const slash = path.lastIndexOf("/");
+    const name = path.slice(slash + 1);
+    if (!LOCKFILES.has(name)) continue;
+    const dir = slash < 0 ? "." : path.slice(0, slash);
+    byDir.set(dir, [...(byDir.get(dir) ?? []), name]);
+  }
+  const environment = await headEnvironment(root);
+  const facts: HatchPlanCheckEnvironment = {
+    manifestDirs: [...byDir.entries()]
+      .sort(([a], [b]) => (a === "." ? -1 : b === "." ? 1 : a.localeCompare(b)))
+      .map(([dir, lockfiles]) => ({ dir, lockfiles: lockfiles.sort() })),
+    environmentFile: environment.present,
+    setupDeclared: Boolean(environment.config?.setup),
+  };
+  if (environment.config?.setup) facts.setup = environment.config.setup;
+  if (environment.error) facts.error = environment.error;
+  return facts;
+}
+
+/**
+ * One card line when the binder's oracles would trip the Pi environment preflight against
+ * HEAD. The file it asks for lands by its own commit: a plan commit is the binder plus its
+ * review record and nothing else.
+ */
+async function environmentCardLine(root: string, facts: BinderCardFacts[]): Promise<string | undefined> {
+  const environment = await headEnvironment(root);
+  if (environment.error) return undefined;
+  const finding = await environmentPreflight(
+    facts.flatMap((binder) => binder.workItems),
+    environment.config,
+    headFileReader(root),
+  );
+  if (!finding) return undefined;
+  const items = [...new Set(finding.needs.map((need) => need.item))].join(", ");
+  return (
+    `Environment: the oracles of ${items} need installed dependencies and HEAD declares no setup in ` +
+    `.hatch/environment.json, so the Pi merge check would stop. Suggested setup: ` +
+    `${JSON.stringify(finding.suggestedSetup)}. Commit that file by its own commit, never in this plan commit.`
+  );
 }
 
 function cardFacts(slug: string, raw: string): BinderCardFacts {
@@ -139,6 +240,9 @@ function cardFacts(slug: string, raw: string): BinderCardFacts {
   const sme = Array.isArray(document.sme)
     ? document.sme.filter((value): value is string => typeof value === "string")
     : [];
+  const items = workItems.filter(
+    (value): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value),
+  );
   return {
     slug,
     title: typeof document.title === "string" && document.title.trim() ? document.title.trim() : slug,
@@ -146,6 +250,7 @@ function cardFacts(slug: string, raw: string): BinderCardFacts {
     items: workItems.length,
     after,
     sme,
+    workItems: items,
   };
 }
 
@@ -154,6 +259,7 @@ function buildCard(
   sme: string[],
   validation: string,
   provenance: string,
+  environment?: string,
 ): string {
   const set = facts.length > 1;
   const lines: string[] = [
@@ -176,8 +282,9 @@ function buildCard(
       );
     }
   }
+  lines.push(`Experts applied (sme): ${sme.length ? sme.join(", ") : "none"}`);
+  if (environment) lines.push(environment);
   lines.push(
-    `Experts applied (sme): ${sme.length ? sme.join(", ") : "none"}`,
     "",
     "Validation passed. Recorded escapes:",
     validation || "(the validator printed no escape summary)",
@@ -230,6 +337,7 @@ export class HatchPlanRunner {
       schema: "hatch-plan-survey-v1",
       root: ctx.cwd,
       runs: [detectStack, checkPackProvenance],
+      checkEnvironment: await surveyCheckEnvironment(ctx.cwd),
     };
   }
 
@@ -336,7 +444,8 @@ export class HatchPlanRunner {
       facts.push(cardFacts(slug, await readFile(join(root, paths[index]), "utf8")));
     }
     const sme = [...new Set(facts.flatMap((binder) => binder.sme))];
-    const card = `${buildCard(facts, sme, escapeBlocks.join("\n\n"), output(provenance))}\n\n${
+    const environmentLine = await environmentCardLine(root, facts);
+    const card = `${buildCard(facts, sme, escapeBlocks.join("\n\n"), output(provenance), environmentLine)}\n\n${
       roundtable.required.length
         ? `Review record staged: ${roundtable.required.join(", ")}`
         : "Review record: this repository's roundtable settings require none for a plan commit."
