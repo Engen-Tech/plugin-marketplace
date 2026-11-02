@@ -40,15 +40,20 @@ export function parseJsonEnvelope(text: string, label: string): unknown {
 // the parse will reject spends the corrective turn on nothing and then discards
 // the work anyway. `repairPrompt` may be a function so the turn can name the
 // specific violation instead of restating the format in general.
+//
+// `canRepair` lets a caller skip that turn when it knows the first one cannot be
+// repaired, such as a turn that already ended in a provider error: the repair would
+// meet the same quota and spend one more failed call.
 export async function promptForJsonEnvelope(
   session: EnvelopePrompter,
   userPrompt: string,
   isValid: (text: string) => boolean,
   repairPrompt: string | ((text: string) => string),
+  canRepair?: () => boolean,
 ): Promise<string> {
   await session.prompt(userPrompt);
   let text = session.getLastAssistantText() ?? "";
-  if (!isValid(text)) {
+  if (!isValid(text) && (canRepair?.() ?? true)) {
     await session.prompt(typeof repairPrompt === "function" ? repairPrompt(text) : repairPrompt);
     text = session.getLastAssistantText() ?? text;
   }

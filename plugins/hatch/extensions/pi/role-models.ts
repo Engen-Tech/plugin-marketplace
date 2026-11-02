@@ -78,6 +78,26 @@ export function hatchModelsConfigPath(agentDir = getAgentDir()): string {
   return join(agentDir, HATCH_MODELS_DIR, HATCH_MODELS_FILE);
 }
 
+// Where a role's model was chosen, as a file and key the operator can open.
+export function describeRoleModelSource(source: RoleModelSource): string {
+  switch (source.kind) {
+    case "steward": {
+      const from = source.model ? `${source.model.file} key '${source.model.key}'` : source.agentFile;
+      return source.inheritsSession
+        ? `steward profile '${source.agent}' (${source.agentFile}), which inherits Pi's session model`
+        : `steward profile '${source.agent}', set by ${from}`;
+    }
+    case "hatch-config":
+      return source.agent
+        ? `agent '${source.agent}' (${source.agentFile ?? "file unknown"}), which ${source.file} key '${source.key}' maps this role to`
+        : `${source.file} key '${source.key}'`;
+    case "session":
+      return source.file && source.key
+        ? `Pi's session model, which ${source.file} key '${source.key}' pins this role to`
+        : `Pi's session model (${source.reason})`;
+  }
+}
+
 interface HatchRoleEntry {
   agent?: string;
   model?: string;

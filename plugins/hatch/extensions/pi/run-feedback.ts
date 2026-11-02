@@ -131,6 +131,12 @@ export function describeRunEvent(event: HatchRunEvent): string {
       return `wave ${event.wave} started: ${list(event.items)}`;
     case "item-built":
       return `${event.item} ${event.status} (${event.attempts} attempt${event.attempts === 1 ? "" : "s"})`;
+    case "item-kicked-back":
+      return `${event.item} kicked back by the ${event.gate} (attempt ${event.attempt} of ${event.cap})`;
+    case "item-hand-fixed":
+      return `${event.item} hand fix ${event.tip.slice(0, 7)} found past failed ${event.failed.slice(0, 7)}; re-validating`;
+    case "gate-ledger-unrecorded":
+      return `${event.item} gate verdicts not recorded${event.file ? ` in ${event.file}` : ""}: ${event.error}`;
     case "item-halted": {
       const line = `${event.item} halted (${event.status}): ${event.reason}`;
       if (!event.check) return line;

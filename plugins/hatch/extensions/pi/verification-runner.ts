@@ -11,11 +11,14 @@ import type { EnvServerContext } from "./env-server-runner.ts";
 import {
   buildHatchEvidence,
   type BuildEvidenceOptions,
+  citationDefectSentence,
+  type EvidenceCitationDefect,
   type HatchEvidenceManifest,
 } from "./evidence.ts";
 import {
   effectiveGateVerdict,
   executeGateOnEvidence,
+  hostNextStepWithRerun,
   type GateModelInvoker,
   type HatchGateResult,
 } from "./gate-runner.ts";
@@ -80,6 +83,10 @@ export interface HatchVerificationResult {
     safety?: HatchGateResult;
     visual?: VisualGateResult;
   };
+  // Host observations about the reviewed bytes, copied from the evidence manifest: the
+  // repo-rule citations this item added that the host cannot resolve. Metadata beside
+  // the gate verdicts, never inside them. Absent when the evidence lists none.
+  citationDefects?: EvidenceCitationDefect[];
 }
 
 interface GatePreflight {
@@ -170,6 +177,49 @@ const VISUAL_BLOCKED_MESSAGES: Record<HatchVerificationBlockedReason, string> = 
 export function visualBlockedMessage(reason: HatchVerificationBlockedReason, remediation?: string): string {
   const message = VISUAL_BLOCKED_MESSAGES[reason];
   return remediation ? `${message}\n\n${remediation}` : message;
+}
+
+// The gate verdict the host wrote because a gate child returned no verdict, when
+// there is one. Keyed on `verdictSource`, never on a finding code: a model can write
+// a finding with code `quota-exhausted`, but it cannot set `verdictSource`.
+export function hostBlockedGate(
+  verification: HatchVerificationResult | undefined,
+): HatchGateResult | undefined {
+  if (!verification) return undefined;
+  const { acceptance, safety } = verification.gates;
+  return [acceptance, safety].find((gate) => gate?.verdictSource === "host" && gate.verdict === "blocked");
+}
+
+// A blocked verification names its cause. A typed visual prerequisite gets the shared,
+// actionable per-reason message. A host-written gate verdict (a gate child with no
+// verdict) leads with its cause and ends with its next step, because a blocked build's
+// halt reason carries the message and drops gate findings. Anything else keeps the
+// site's fallback. None of this moves a ref: the caller keys on status.
+// `rerun` says how the item stands after the halt. `kept` (build time) keeps the gate's
+// own rerun sentence. `failed` (a merge or accept site, where the delivery writes a
+// failed ref) says the rerun stops at the prompt and "Fix and rerun" re-validates it.
+export function blockedVerificationMessage(
+  verification: HatchVerificationResult,
+  fallback: string,
+  rerun: "kept" | "failed" = "kept",
+  citationDefects: readonly EvidenceCitationDefect[] = [],
+): string {
+  // The citation defects of the evidence that was verified are appended, so a block
+  // that survives the gate's corrective turn still names the real cause and the
+  // required shape.
+  const citations = citationDefects.length === 0 ? "" : ` ${citationDefectSentence(citationDefects)}`;
+  if (verification.blockedReason) {
+    return `${visualBlockedMessage(verification.blockedReason, verification.remediation)}${citations}`;
+  }
+  const finding = hostBlockedGate(verification)?.findings[0];
+  if (!finding) return `${fallback}${citations}`;
+  const step = finding.nextStep && rerun === "failed"
+    ? hostNextStepWithRerun(
+        finding.nextStep,
+        'rerun the same Hatch action and choose "Fix and rerun". The item is marked failed, and that choice re-validates it.',
+      )
+    : finding.nextStep;
+  return `${finding.message} ${fallback}${citations}${step ? ` Next: ${step}` : ""}`;
 }
 
 function oracle(manifest: HatchEvidenceManifest): Record<string, unknown> {
@@ -322,6 +372,19 @@ export class HatchVerificationRunner {
       item,
       ...targetOptions,
     });
+    const result = await this.#judge(ctx, binder, item, requestedMode, evidence, visualContext);
+    const defects = evidence.payload.citationDefects ?? [];
+    return defects.length > 0 ? { ...result, citationDefects: defects } : result;
+  }
+
+  async #judge(
+    ctx: ExtensionContext,
+    binder: string,
+    item: string,
+    requestedMode: HatchVerificationMode,
+    evidence: HatchEvidenceManifest,
+    visualContext: HatchVisualLifecycleContext | undefined,
+  ): Promise<HatchVerificationResult> {
     const itemOracle = oracle(evidence);
     if (itemOracle.opt_out === true) {
       return {

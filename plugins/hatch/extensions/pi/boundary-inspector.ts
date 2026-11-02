@@ -1,6 +1,12 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { verifyEvidenceIntegrity, type HatchEvidenceManifest } from "./evidence.ts";
+import {
+  citationReviewState,
+  verifyEvidenceIntegrity,
+  type CitationReviewState,
+  type EvidenceCitationDefect,
+  type HatchEvidenceManifest,
+} from "./evidence.ts";
 
 const MAX_CUES = 50;
 const SENSITIVE_PATH = /(^|\/)(auth|credential|crypto|permission|secret|security|token)(\/|\.|$)/i;
@@ -29,6 +35,7 @@ export interface BoundaryInspection {
     state: "present" | "deleted" | "missing";
     omitted?: "too-large" | "non-blob";
   }>;
+  citationDefects: EvidenceCitationDefect[];
   packs: Array<{
     id: string;
     source: "project" | "package";
@@ -128,6 +135,7 @@ export function inspectBoundaries(manifest: HatchEvidenceManifest): BoundaryInsp
       state,
       omitted,
     })),
+    citationDefects: manifest.payload.citationDefects ?? [],
     packs: manifest.payload.packs.map(({ id, source, sha256, checklist }) => ({
       id,
       source,
@@ -144,7 +152,7 @@ export function createBoundaryInspectionTool(
   manifest: HatchEvidenceManifest,
 ): ToolDefinition<
   typeof boundaryParameters,
-  { evidenceHash: string; citationsComplete: boolean }
+  { evidenceHash: string; citationReview: CitationReviewState }
 > {
   verifyEvidenceIntegrity(manifest);
   return {
@@ -160,19 +168,14 @@ export function createBoundaryInspectionTool(
           content: [{ type: "text", text: JSON.stringify(inspection, null, 2) }],
           details: {
             evidenceHash: manifest.evidenceHash,
-            citationsComplete: manifest.payload.citations.every(
-              (citation) =>
-                citation.state === "present" &&
-                citation.omitted === undefined &&
-                citation.content !== undefined,
-            ),
+            citationReview: citationReviewState(manifest),
           },
           isError: false,
         };
       } catch (error) {
         return {
           content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-          details: { evidenceHash: manifest.evidenceHash, citationsComplete: false },
+          details: { evidenceHash: manifest.evidenceHash, citationReview: citationReviewState(manifest) },
           isError: true,
         };
       }

@@ -17,6 +17,22 @@ const MAX_PACK_BYTES = 1024 * 1024;
 const MAX_EVIDENCE_FILE_BYTES = 512 * 1024;
 const MAX_EVIDENCE_FILES_BYTES = 2 * 1024 * 1024;
 const MAX_EVIDENCE_CITATIONS = 8;
+export const MAX_EVIDENCE_CITATION_DEFECTS = 20;
+const MAX_CITATION_DEFECT_TEXT = 300;
+// A repo-rule line counts as a citation attempt only this close below an override marker.
+export const MARKER_WINDOW_LINES = 8;
+const OVERRIDE_MARKER = "HATCH-SME-OVERRIDE(";
+const STRICT_REPO_RULE = /repo-rule:\s+([^\s:]+):([^\]\n;]+)/i;
+const LOOSE_REPO_RULE = /repo-rule:\s+(\S+)/i;
+
+// The one citation grammar every runtime documents. It reads as a placeholder, so
+// grammar documentation that quotes it is never taken for a citation.
+export const REPO_RULE_CITATION_SHAPE = "repo-rule: <path>:<line-or-section>";
+export const CITATION_DEFECT_CODES = {
+  malformed: "repo-rule-citation-malformed",
+  missing: "repo-rule-citation-file-missing",
+  "not-a-file": "repo-rule-citation-not-a-file",
+} as const;
 const DEFAULT_DIFF_PAGE = 30_000;
 export const MAX_DIFF_PAGE = 50_000;
 
@@ -87,6 +103,22 @@ export interface EvidenceFile {
 export interface EvidenceCitation extends EvidenceFile {
   locator: string;
 }
+
+// A repo-rule line this item added next to an override marker that the host cannot
+// resolve. Host observation about the reviewed bytes, bound by the evidence hash.
+export interface EvidenceCitationDefect {
+  path: string;
+  line: number;
+  text: string;
+  problem: "malformed" | "missing" | "not-a-file";
+  cited?: string;
+  citation?: number;
+}
+
+export type RepoRuleLine =
+  | { kind: "placeholder" }
+  | { kind: "citation"; path: string; locator: string }
+  | { kind: "malformed"; cited?: string };
 
 export interface HatchCheckReceipt {
   schema: "hatch-check-receipt-v1";
@@ -166,6 +198,8 @@ export interface HatchEvidencePayload {
   checks: { manifest: HatchCheckManifestEvidence };
   files: EvidenceFile[];
   citations: EvidenceCitation[];
+  // Present only when non-empty, so a defect-free payload keeps its earlier shape.
+  citationDefects?: EvidenceCitationDefect[];
   packs: EvidencePack[];
 }
 
@@ -331,15 +365,35 @@ function parseBinder(raw: string, expectedSlug: string, item: string): {
   return { document: binder, workItem: matches[0] };
 }
 
-function validateGitPath(path: string): void {
+function isSafeGitPath(path: string): boolean {
   const normalized = path.replaceAll("\\", "/");
-  if (
+  return !(
     !normalized ||
     normalized.startsWith("/") ||
     normalized.split("/").some((part) => part === "..")
-  ) {
+  );
+}
+
+function validateGitPath(path: string): void {
+  if (!isSafeGitPath(path)) {
     throw new Error(`Git returned an unsafe evidence path: ${path}`);
   }
+}
+
+// undefined: the line has no `repo-rule:` followed by whitespace and a token.
+export function parseRepoRuleLine(line: string): RepoRuleLine | undefined {
+  const strict = line.match(STRICT_REPO_RULE);
+  if (strict) {
+    const path = strict[1];
+    if (path.startsWith("<")) return { kind: "placeholder" };
+    if (!isSafeGitPath(path)) return { kind: "malformed", cited: path };
+    return { kind: "citation", path, locator: strict[2].trim() };
+  }
+  const loose = line.match(LOOSE_REPO_RULE);
+  if (!loose) return undefined;
+  const cited = loose[1].replace(/[:.,;]+$/, "");
+  if (cited.startsWith("<")) return { kind: "placeholder" };
+  return cited ? { kind: "malformed", cited } : { kind: "malformed" };
 }
 
 async function candidateTree(
@@ -492,21 +546,53 @@ async function loadTouchedFiles(
   return files;
 }
 
-function addCitationRequests(
+interface RepoRuleOccurrence {
+  path: string;
+  line: number;
+  text: string;
+  parsed: RepoRuleLine;
+}
+
+interface RepoRuleScan {
+  requests: Array<{ path: string; locator: string }>;
+  occurrences: RepoRuleOccurrence[];
+  markers: Map<string, number[]>;
+}
+
+// File content numbers its own lines; `git grep -n` output carries each line number
+// after the known `<tree>:<path>:` prefix.
+function scanRepoRuleLines(
+  file: EvidenceFile,
   text: string,
-  requests: Array<{ path: string; locator: string }>,
+  source: "content" | "grep",
+  scan: RepoRuleScan,
   seen: Set<string>,
 ): void {
-  for (const line of text.split("\n")) {
-    const marker = line.match(/repo-rule:\s+([^\s:]+):([^\]\n;]+)/i);
-    if (!marker) continue;
-    const path = marker[1];
-    const locator = marker[2].trim();
-    validateGitPath(path);
-    const key = `${path}\0${locator}`;
+  const grepPrefix = `${file.sourceTree}:${file.path}:`;
+  for (const [index, raw] of text.split("\n").entries()) {
+    let line = index + 1;
+    let body = raw;
+    if (source === "grep") {
+      if (!raw.startsWith(grepPrefix)) continue;
+      const rest = raw.slice(grepPrefix.length);
+      const colon = rest.indexOf(":");
+      line = Number(rest.slice(0, colon));
+      if (colon < 0 || !Number.isSafeInteger(line)) continue;
+      body = rest.slice(colon + 1);
+    }
+    if (body.includes(OVERRIDE_MARKER)) {
+      const markers = scan.markers.get(file.path) ?? [];
+      markers.push(line);
+      scan.markers.set(file.path, markers);
+    }
+    const parsed = parseRepoRuleLine(body);
+    if (!parsed) continue;
+    scan.occurrences.push({ path: file.path, line, text: body.trim(), parsed });
+    if (parsed.kind !== "citation") continue;
+    const key = `${parsed.path}\0${parsed.locator}`;
     if (!seen.has(key)) {
       seen.add(key);
-      requests.push({ path, locator });
+      scan.requests.push({ path: parsed.path, locator: parsed.locator });
     }
   }
 }
@@ -515,7 +601,23 @@ async function grepOmittedFileForCitations(cwd: string, file: EvidenceFile): Pro
   try {
     const { stdout } = await exec(
       "git",
-      ["-C", cwd, "grep", "-n", "-I", "-e", "repo-rule:", file.sourceTree, "--", file.path],
+      [
+        "-C",
+        cwd,
+        "grep",
+        "-n",
+        "-I",
+        // Fixed strings: grep.patternType or grep.extendedRegexp in the user's config
+        // would otherwise read the marker's "(" as an unmatched group and exit 128.
+        "-F",
+        "-e",
+        "repo-rule:",
+        "-e",
+        OVERRIDE_MARKER,
+        file.sourceTree,
+        "--",
+        file.path,
+      ],
       { encoding: "utf8", maxBuffer: 2 * 1024 * 1024 },
     );
     return stdout;
@@ -526,35 +628,32 @@ async function grepOmittedFileForCitations(cwd: string, file: EvidenceFile): Pro
   }
 }
 
-async function citationRequests(
-  cwd: string,
-  files: EvidenceFile[],
-): Promise<Array<{ path: string; locator: string }>> {
-  const requests: Array<{ path: string; locator: string }> = [];
+async function scanCitations(cwd: string, files: EvidenceFile[]): Promise<RepoRuleScan> {
+  const scan: RepoRuleScan = { requests: [], occurrences: [], markers: new Map() };
   const seen = new Set<string>();
   for (const file of files) {
     if (file.content !== undefined) {
-      addCitationRequests(file.content, requests, seen);
+      scanRepoRuleLines(file, file.content, "content", scan, seen);
     } else if (file.objectType === "blob" && file.omitted === "too-large") {
-      addCitationRequests(await grepOmittedFileForCitations(cwd, file), requests, seen);
+      scanRepoRuleLines(file, await grepOmittedFileForCitations(cwd, file), "grep", scan, seen);
     }
   }
-  if (requests.length > MAX_EVIDENCE_CITATIONS) {
+  if (scan.requests.length > MAX_EVIDENCE_CITATIONS) {
     throw new Error(
-      `Hatch evidence contains ${requests.length} repo-rule citations; limit is ${MAX_EVIDENCE_CITATIONS}`,
+      `Hatch evidence contains ${scan.requests.length} repo-rule citations; limit is ${MAX_EVIDENCE_CITATIONS}`,
     );
   }
-  return requests;
+  return scan;
 }
 
 async function loadCitations(
   cwd: string,
   diffBase: string,
   targetTree: string,
-  files: EvidenceFile[],
+  requests: RepoRuleScan["requests"],
 ): Promise<EvidenceCitation[]> {
   const citations: EvidenceCitation[] = [];
-  for (const [index, request] of (await citationRequests(cwd, files)).entries()) {
+  for (const [index, request] of requests.entries()) {
     let file = await treeFile(cwd, targetTree, request.path, index, "present");
     if (file.state === "missing") {
       file = await treeFile(cwd, diffBase, request.path, index, "present");
@@ -562,6 +661,139 @@ async function loadCitations(
     citations.push({ ...file, locator: request.locator });
   }
   return citations;
+}
+
+// Line ranges `[start, end)` this diff added to one file, read from the `-U0` hunk
+// headers only, so diff prefix settings in the user's config cannot change them.
+// `--inter-hunk-context=0` keeps diff.interHunkContext from merging unchanged lines
+// into an added range, and `--text` keeps a `-diff` attribute from hiding the hunks.
+async function addedLineRanges(
+  cwd: string,
+  diffBase: string,
+  targetTree: string,
+  path: string,
+): Promise<Array<[number, number]>> {
+  const diff = await git(cwd, [
+    "diff",
+    "-U0",
+    "--inter-hunk-context=0",
+    "--text",
+    "--no-color",
+    "--no-ext-diff",
+    diffBase,
+    targetTree,
+    "--",
+    path,
+  ]);
+  const ranges: Array<[number, number]> = [];
+  for (const header of diff.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const start = Number(header[1]);
+    const count = header[2] === undefined ? 1 : Number(header[2]);
+    if (count > 0) ranges.push([start, start + count]);
+  }
+  return ranges;
+}
+
+// A defect is a repo-rule line the item added within the marker window below a
+// HATCH-SME-OVERRIDE marker that the host cannot resolve: a line it cannot parse, or
+// a citation whose path is missing or is not a file. Only present touched files are
+// scanned, so every line number is a line in the reviewed tree.
+async function loadCitationDefects(
+  cwd: string,
+  diffBase: string,
+  targetTree: string,
+  files: EvidenceFile[],
+  scan: RepoRuleScan,
+  citations: EvidenceCitation[],
+): Promise<EvidenceCitationDefect[]> {
+  const present = new Set(files.filter((file) => file.state === "present").map((file) => file.path));
+  const byRequest = new Map(citations.map((citation) => [`${citation.path}\0${citation.locator}`, citation]));
+  const candidates: EvidenceCitationDefect[] = [];
+  for (const occurrence of scan.occurrences) {
+    if (!present.has(occurrence.path)) continue;
+    const { parsed } = occurrence;
+    let defect: Pick<EvidenceCitationDefect, "problem" | "cited" | "citation">;
+    if (parsed.kind === "malformed") {
+      defect = { problem: "malformed", ...(parsed.cited ? { cited: parsed.cited } : {}) };
+    } else if (parsed.kind === "citation") {
+      const citation = byRequest.get(`${parsed.path}\0${parsed.locator}`);
+      if (!citation) continue;
+      const problem = citation.state === "missing"
+        ? "missing"
+        : citation.omitted === "non-blob"
+          ? "not-a-file"
+          : undefined;
+      if (!problem) continue;
+      defect = { problem, cited: parsed.path, citation: citation.index };
+    } else {
+      continue;
+    }
+    const markers = scan.markers.get(occurrence.path) ?? [];
+    if (!markers.some((marker) => occurrence.line >= marker && occurrence.line - marker <= MARKER_WINDOW_LINES)) {
+      continue;
+    }
+    candidates.push({
+      path: occurrence.path,
+      line: occurrence.line,
+      text: occurrence.text.slice(0, MAX_CITATION_DEFECT_TEXT),
+      ...defect,
+    });
+  }
+  const added = new Map<string, Array<[number, number]>>();
+  for (const path of new Set(candidates.map((candidate) => candidate.path))) {
+    added.set(path, await addedLineRanges(cwd, diffBase, targetTree, path));
+  }
+  return candidates
+    .filter((candidate) =>
+      (added.get(candidate.path) ?? []).some(([start, end]) => candidate.line >= start && candidate.line < end),
+    )
+    .sort((left, right) => left.path.localeCompare(right.path) || left.line - right.line)
+    .slice(0, MAX_EVIDENCE_CITATION_DEFECTS);
+}
+
+export interface CitationReviewState {
+  // Citation indexes the host could not show although the file exists (too large or
+  // binary): a host limit the worker cannot repair.
+  tooLarge: number[];
+  // Citation indexes whose path is missing from both trees or is not a file.
+  unverifiable: number[];
+  // payload.citationDefects length.
+  defects: number;
+}
+
+// The single source of the safety gate's citation rules.
+export function citationReviewState(manifest: HatchEvidenceManifest): CitationReviewState {
+  const tooLarge: number[] = [];
+  const unverifiable: number[] = [];
+  for (const citation of manifest.payload.citations) {
+    if (citation.state === "missing" || citation.omitted === "non-blob") {
+      unverifiable.push(citation.index);
+    } else if (citation.omitted !== undefined || citation.content === undefined) {
+      tooLarge.push(citation.index);
+    }
+  }
+  return { tooLarge, unverifiable, defects: manifest.payload.citationDefects?.length ?? 0 };
+}
+
+// Each defect as `<path>:<line> (<problem>)`, then each unverifiable citation as
+// Up to three defects by path and line, then the required shape, for a halt message.
+export function citationDefectSentence(defects: readonly EvidenceCitationDefect[]): string {
+  const shown = defects.slice(0, 3).map((defect) => `${defect.path}:${defect.line} (${defect.problem})`);
+  const more = defects.length > 3 ? `, and ${defects.length - 3} more` : "";
+  return `The evidence lists ${defects.length} repo-rule citation problem(s): ${shown.join(", ")}${more}.` +
+    ` The required shape is \`${REPO_RULE_CITATION_SHAPE}\`.`;
+}
+
+// `citation <index> (<state>)`, for the safety gate's corrective turn.
+export function citationProblemLabels(manifest: HatchEvidenceManifest): string[] {
+  return [
+    ...(manifest.payload.citationDefects ?? []).map(
+      (defect) => `${defect.path}:${defect.line} (${defect.problem})`,
+    ),
+    ...manifest.payload.citations
+      .filter((citation) => citation.state === "missing" || citation.omitted === "non-blob")
+      .map((citation) => `citation ${citation.index} (${citation.state === "missing" ? "missing" : "non-blob"})`),
+  ];
 }
 
 function packExtends(content: string): string | undefined {
@@ -841,11 +1073,20 @@ export async function buildHatchEvidence(
     loadPacks(repositoryRoot, policyTip, document.sme ?? []),
     loadTouchedFiles(repositoryRoot, diffBase, target.tree, touchedPaths),
   ]);
+  const citationScan = await scanCitations(repositoryRoot, files);
   const citations = await loadCitations(
     repositoryRoot,
     diffBase,
     target.tree,
+    citationScan.requests,
+  );
+  const citationDefects = await loadCitationDefects(
+    repositoryRoot,
+    diffBase,
+    target.tree,
     files,
+    citationScan,
+    citations,
   );
   const checks = {
     manifest: checkManifestEvidence(workItem, target.tree, options.checkManifest),
@@ -880,6 +1121,7 @@ export async function buildHatchEvidence(
     checks,
     files,
     citations,
+    ...(citationDefects.length > 0 ? { citationDefects } : {}),
     packs,
   };
   return {
@@ -1011,6 +1253,7 @@ export function createEvidenceReadTool(
               },
               files: manifest.payload.files.map(({ content: _content, ...metadata }) => metadata),
               citations: manifest.payload.citations.map(({ content: _content, ...metadata }) => metadata),
+              citationDefects: manifest.payload.citationDefects ?? [],
               packs: manifest.payload.packs.map(({ id, source, path, blob, sha256: packHash, checklist }) => ({
                 id,
                 source,

@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { LifecycleRegistry, type LifecycleRole } from "./lifecycle-registry.ts";
+import { describeLastTurn, GateProviderUnavailableError, readLastTurn } from "./child-last-turn.ts";
 import type { HatchModelRole, RoleModelSource, RoleModelTarget } from "./role-models.ts";
 
 export type ChildRuntimePolicy = "probe" | "gate" | "worker";
@@ -401,16 +402,30 @@ export async function runGateResponseProbe(
     label: `${report.provider}/${report.model}`,
   });
   const unbind = bindAbort(session, ctx.signal);
+  let providerRetries = 0;
+  const unsubscribe = session.subscribe((event) => {
+    if (event.type === "auto_retry_start") providerRetries += 1;
+  });
   try {
     await session.prompt("Run the isolated Hatch gate provider preflight.");
     const response = session.getLastAssistantText()?.trim() ?? "";
     if (response !== GATE_PREFLIGHT_RESPONSE) {
+      const lastTurn = readLastTurn({
+        messages: session.messages,
+        prompts: 1,
+        providerRetries,
+        stats: session.getSessionStats(),
+      });
+      // A provider error at the probe is named, so the gate can turn it into a
+      // blocked verdict; any other wrong answer stays a plain preflight failure.
+      if (lastTurn.stopReason === "error") throw new GateProviderUnavailableError(report, lastTurn);
       throw new Error(
-        `Hatch gate provider preflight returned an unexpected response for '${report.provider}/${report.model}'`,
+        `Hatch gate provider preflight returned an unexpected response for '${report.provider}/${report.model}' (${describeLastTurn(lastTurn)})`,
       );
     }
     return report;
   } finally {
+    unsubscribe();
     unbind();
     registry.delete(session);
     session.dispose();

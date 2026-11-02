@@ -17,6 +17,17 @@ export type HatchRunEvent =
   | { kind: "binder-loaded"; items: string[]; carried: string[] }
   | { kind: "wave-started"; wave: number; items: string[] }
   | { kind: "item-built"; wave?: number; item: string; status: string; attempts: number }
+  // A merge-time gate concern sent the item back to its own worker with the findings,
+  // while that gate's shared attempt budget remains. `attempt` counts the gate's concerns
+  // so far, out of `cap`.
+  | { kind: "item-kicked-back"; wave?: number; item: string; gate: string; attempt: number; cap: number }
+  // A marked fix was committed past the item's failed ref: the stale ref is dropped and
+  // the new tip re-validates without a prompt.
+  | { kind: "item-hand-fixed"; item: string; failed: string; tip: string }
+  // A merge-time or accept-time review's verdicts could not be written to the gate-attempt
+  // ledger, because the ledger cannot be read or appended. Nothing was recorded; the
+  // item's landing is decided as before. `file` is the ledger file, when known.
+  | { kind: "gate-ledger-unrecorded"; wave?: number; item: string; file?: string; error: string }
   | {
       kind: "item-halted";
       wave?: number;

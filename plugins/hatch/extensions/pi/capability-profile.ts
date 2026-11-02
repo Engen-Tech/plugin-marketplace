@@ -4,13 +4,16 @@ import { createBoundaryInspectionTool } from "./boundary-inspector.ts";
 import { createCheckEvidenceTool } from "./check-tool.ts";
 import {
   canonicalJson,
+  citationProblemLabels,
+  citationReviewState,
   createEvidenceReadTool,
   verifyEvidenceIntegrity,
+  type CitationReviewState,
   type HatchEvidenceManifest,
 } from "./evidence.ts";
 import { loadHatchRole, type HatchRoleDefinition, type HatchRoleId } from "./role-catalog.ts";
 
-export const GATE_CAPABILITY_PROFILE_VERSION = 3;
+export const GATE_CAPABILITY_PROFILE_VERSION = 4;
 
 export type HatchGateRoleId = Extract<HatchRoleId, "acceptance-gate" | "safety-gate" | "visual-gate">;
 
@@ -27,6 +30,9 @@ export interface GateEvidenceToolState {
   citations: Set<number>;
   requiredPacks: string[];
   requiredCitations: number[];
+  // What the host can prove about repo-rule citations; the safety rules read this.
+  citationReview: CitationReviewState;
+  citationProblems: string[];
   diffReads: Array<[number, number]>;
   diffTotal: number;
 }
@@ -70,6 +76,8 @@ export function createGateCapabilityProfile(
     citations: new Set(),
     requiredPacks: manifest.payload.packs.map((pack) => pack.id),
     requiredCitations: manifest.payload.citations.map((citation) => citation.index),
+    citationReview: citationReviewState(manifest),
+    citationProblems: citationProblemLabels(manifest),
     diffReads: [],
     diffTotal: 0,
   };

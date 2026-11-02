@@ -23,6 +23,7 @@ import {
 } from "./gate-runner.ts";
 import { loadHatchRole } from "./role-catalog.ts";
 import {
+  describeRoleModelSource,
   hatchModelsConfigPath,
   requireRoleModel,
   STEWARD_ROLE_DEFAULTS,
@@ -373,25 +374,6 @@ export async function realVisualGateInvoke(
 // list. No session is spawned and no image is captured — a pure capability check.
 const defaultVisionPreflight: VisionPreflight = (ctx, _registry, target) => runGateAuthProbe(ctx, target);
 
-// Where a role's model was chosen, as a file and key the operator can open.
-function describeVisualModelSource(source: RoleModelSource): string {
-  switch (source.kind) {
-    case "steward": {
-      const from = source.model ? `${source.model.file} key '${source.model.key}'` : source.agentFile;
-      return source.inheritsSession
-        ? `steward profile '${source.agent}' (${source.agentFile}), which inherits Pi's session model`
-        : `steward profile '${source.agent}', set by ${from}`;
-    }
-    case "hatch-config":
-      return source.agent
-        ? `agent '${source.agent}' (${source.agentFile ?? "file unknown"}), which ${source.file} key '${source.key}' maps this role to`
-        : `${source.file} key '${source.key}'`;
-    case "session":
-      return source.file && source.key
-        ? `Pi's session model, which ${source.file} key '${source.key}' pins this role to`
-        : `Pi's session model (${source.reason})`;
-  }
-}
 
 // The second fix: change whatever actually chose the model, never a profile that did not.
 function visualModelFix(role: ChildModelTarget["role"], source: RoleModelSource): string {
@@ -432,7 +414,7 @@ export function visionModelRemediation(
   const inputs =
     report.modelInputs && report.modelInputs.length > 0 ? report.modelInputs.join(", ") : "text only";
   return [
-    `The Hatch visual gate needs a vision-capable model, but the ${role} role's model '${report.provider}/${report.model}' does not advertise image input (it declares: ${inputs}). That model comes from ${describeVisualModelSource(source)}.`,
+    `The Hatch visual gate needs a vision-capable model, but the ${role} role's model '${report.provider}/${report.model}' does not advertise image input (it declares: ${inputs}). That model comes from ${describeRoleModelSource(source)}.`,
     "",
     "Fix one of these and retry; Hatch never swaps the model for you:",
     `- Pin "${role}" in ${hatchModelsConfigPath()} to a model that accepts image input: {"roles": {"${role}": {"model": "<provider>/<model>"}}}.`,

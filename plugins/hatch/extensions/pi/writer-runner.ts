@@ -19,9 +19,28 @@ import {
   type HatchWriterRole,
   type WriterCapabilityProfile,
 } from "./writer-profile.ts";
-import { parseJsonEnvelope, promptForJsonEnvelope } from "./child-envelope.ts";
+import { parseJsonEnvelope, promptForJsonEnvelope, type EnvelopePrompter } from "./child-envelope.ts";
+import { lastTurnEndedInError } from "./child-last-turn.ts";
 
 const WRITER_SCHEMA = "hatch-writer-result-v1";
+
+// The seeded-cache rule, stated once: the kaizen brief carries it, and the
+// corrective prompt after a seeded-cache refusal starts with it.
+export const KAIZEN_SEEDED_CACHE_RULE =
+  "A pack file whose frontmatter carries `seeded_from` is a seeded cache and is never edited: " +
+  "a narrowing of one of its rules goes into a project pack that already `extends` that built-in " +
+  "(its `exclude_rules` plus a rule beginning `Narrows <rule-id>:`), a new rule goes beside the " +
+  "rules of an existing project pack (a pack file without `seeded_from`), and anything else goes " +
+  "into `proposedScaffolds` with no file changed.";
+
+// The writer changed host authority (refs, index, config, hooks, protected
+// paths). Typed so the companion runner records it as a confinement refusal.
+export class HatchWriterAuthorityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HatchWriterAuthorityError";
+  }
+}
 
 const WRITER_ENVELOPE_REPAIR_PROMPT =
   'Your previous message was not the required result. Reply now with ONLY the single JSON writer-result object described in your instructions (schema "hatch-writer-result-v1") — no prose, no headings, no code fence, and nothing before or after the object.';
@@ -108,7 +127,7 @@ export interface HatchKaizenResult extends WriterResultBase {
 }
 
 export type HatchWriterResult = HatchDocGardnerResult | HatchKaizenResult;
-type HatchUnattestedWriterResult =
+export type HatchUnattestedWriterResult =
   | Omit<HatchDocGardnerResult, "attestation">
   | Omit<HatchKaizenResult, "attestation">;
 
@@ -124,6 +143,49 @@ export interface WriterInvocation {
   systemPrompt: string;
   userPrompt: string;
   parentId?: string;
+  surfaceReview?: WriterSurfaceReview;
+}
+
+// The host's review of the writer's changes, run while the session is open. A
+// string is the corrective prompt, sent once; null means no turn.
+export type WriterSurfaceReview = (result: HatchUnattestedWriterResult) => Promise<string | null>;
+
+export interface WriterSession extends EnvelopePrompter {
+  readonly messages: readonly unknown[];
+}
+
+// At most four prompts: the request, an envelope repair, the correction, an
+// envelope repair. A provider error skips every repair and the correction. The
+// review runs only on an envelope the strict parse accepts, so it judges exactly
+// what the host will parse after the session closes.
+export async function promptWriterChild(
+  session: WriterSession,
+  invocation: Pick<WriterInvocation, "userPrompt" | "binder" | "profile" | "surfaceReview">,
+  runtime: ChildRuntimeReport,
+): Promise<string> {
+  const expected = { binder: invocation.binder, profile: invocation.profile, runtime };
+  const canRepair = () => !lastTurnEndedInError(session.messages);
+  const ask = (message: string) =>
+    promptForJsonEnvelope(
+      session,
+      message,
+      (candidate) => writerEnvelopeViolation(candidate, expected) === null,
+      (candidate) => {
+        const violation = writerEnvelopeViolation(candidate, expected);
+        return violation === null
+          ? WRITER_ENVELOPE_REPAIR_PROMPT
+          : `${WRITER_ENVELOPE_REPAIR_PROMPT} The result you sent was rejected because: ${violation}.`;
+      },
+      canRepair,
+    );
+  const text = await ask(invocation.userPrompt);
+  if (!invocation.surfaceReview || writerEnvelopeViolation(text, expected) !== null || !canRepair()) {
+    return text;
+  }
+  const correction = await invocation.surfaceReview(
+    parseWriterResult(text, invocation.binder, invocation.profile, runtime),
+  );
+  return correction === null ? text : ask(correction);
 }
 
 export type WriterModelInvoker = (
@@ -150,18 +212,7 @@ async function invokeWriter(
   invocation.ctx.signal?.addEventListener("abort", abort, { once: true });
   if (invocation.ctx.signal?.aborted) abort();
   try {
-    const expected = { binder: invocation.binder, profile: invocation.profile, runtime: report };
-    const text = await promptForJsonEnvelope(
-      session,
-      invocation.userPrompt,
-      (candidate) => writerEnvelopeViolation(candidate, expected) === null,
-      (candidate) => {
-        const violation = writerEnvelopeViolation(candidate, expected);
-        return violation === null
-          ? WRITER_ENVELOPE_REPAIR_PROMPT
-          : `${WRITER_ENVELOPE_REPAIR_PROMPT} The result you sent was rejected because: ${violation}.`;
-      },
-    );
+    const text = await promptWriterChild(session, invocation, report);
     return { text, runtime: report };
   } finally {
     invocation.ctx.signal?.removeEventListener("abort", abort);
@@ -271,7 +322,7 @@ function parseWriterResult(
   };
 }
 
-function attestWriterAuthority(
+export function attestWriterAuthority(
   writer: HatchWriterRole,
   before: WorkerAuthoritySnapshot,
   after: WorkerAuthoritySnapshot,
@@ -298,7 +349,8 @@ You are an isolated ${profile.writer} writer in a disposable worktree. You have 
 
 Edit only your declared surface. Never stage, commit, create refs, or modify Git administration. The host independently attests every changed path, validates applicable files, scans the exact candidate, reproduces hooks, and alone creates or moves commits.${
     profile.writer === "kaizen"
-      ? "\n\nAn existing checklist rule's text is immutable and the host compares it byte for byte. Any change to a rule already in the pack — a reword, an appended clause, a typo fix — is refused and your whole run is rejected. Sharpen by adding a new rule beside the old one; leave the wording of an existing rule to a human. The host cannot tell a tightening from a loosening, so it permits neither. Existing prose outside the checklist must also survive in order, and pack frontmatter is fixed."
+      ? "\n\nAn existing checklist rule's text is immutable and the host compares it byte for byte. Any change to a rule already in the pack — a reword, an appended clause, a typo fix — is refused: the host restores the file and gives you one corrective turn, and a second refusal discards the run. Sharpen by adding a new rule beside the old one; leave the wording of an existing rule to a human. The host cannot tell a tightening from a loosening, so it permits neither. Existing prose outside the checklist must also survive in order, and pack frontmatter is fixed. " +
+        KAIZEN_SEEDED_CACHE_RULE
       : ""
   }
 
@@ -329,6 +381,7 @@ export class HatchWriterRunner {
       overrideEvidence?: HatchOverrideEvidence[];
     },
     parentId?: string,
+    surfaceReview?: WriterSurfaceReview,
   ): Promise<HatchWriterResult> {
     // Resolved before any work, so an unpinned call fails before the authority snapshot.
     const target = requireRoleModel(ctx, writer);
@@ -348,16 +401,18 @@ export class HatchWriterRunner {
         target,
         binder,
         parentId,
+        surfaceReview,
         systemPrompt: writerSystemPrompt(profile, instructions),
         userPrompt: JSON.stringify({ binder, writer, ...input }),
       });
     } catch (error) {
       invocationError = error;
     }
-    const after = await snapshotWorkerAuthority(worktree);
+    // Compared against `before` config first, so no status runs under a config the writer changed.
+    const after = await snapshotWorkerAuthority(worktree, undefined, undefined, { before });
     const attestation = attestWriterAuthority(writer, before, after);
     if (!attestation.passed) {
-      throw new Error(`Hatch writer violated host authority: ${attestation.issues.join("; ")}`);
+      throw new HatchWriterAuthorityError(`Hatch writer violated host authority: ${attestation.issues.join("; ")}`);
     }
     if (invocationError) throw invocationError;
     if (!response) throw new Error("Hatch writer returned no response");

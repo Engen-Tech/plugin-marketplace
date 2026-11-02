@@ -23,13 +23,26 @@ import {
   type BinderLifecycleOwner,
 } from "./process-manager.ts";
 import {
-  visualBlockedMessage,
+  blockedVerificationMessage,
   type HatchVerificationResult,
   type HatchVerificationRunner,
 } from "./verification-runner.ts";
 
 const exec = promisify(execFile);
 const MAX_OUTPUT = 8 * 1024 * 1024;
+
+// A merge-time verification that did not pass names its cause, then up to three citation
+// defects with the required shape, as a blocked build finalization does. A host-written
+// gate verdict leads with its cause and ends with the merge-time next step: the item is
+// marked failed, and "Fix and rerun" re-validates it.
+function verificationHaltMessage(verification: HatchVerificationResult): string {
+  return blockedVerificationMessage(
+    verification,
+    "Proposed integration tree did not pass fresh verification.",
+    "failed",
+    verification.citationDefects ?? [],
+  );
+}
 
 export type HatchIntegrationCheckpoint = (
   name:
@@ -574,7 +587,11 @@ export class HatchIntegrationRunner {
               checks,
               verification,
               safetyVerification,
-              message: "Human acceptance cannot waive a safety-gate failure.",
+              message: blockedVerificationMessage(
+                safetyVerification,
+                "Human acceptance cannot waive a safety-gate failure.",
+                "failed",
+              ),
             };
           }
         } else if (verification.status !== "pass" && verification.status !== "skipped") {
@@ -588,7 +605,11 @@ export class HatchIntegrationRunner {
             targetTree,
             checks,
             verification,
-            message: "Failed item could not be freshly reviewed for human acceptance.",
+            message: blockedVerificationMessage(
+              verification,
+              "Failed item could not be freshly reviewed for human acceptance.",
+              "failed",
+            ),
           };
         }
         const authorization = await acceptance.authorize(findings);
@@ -620,9 +641,7 @@ export class HatchIntegrationRunner {
           targetTree,
           checks,
           verification,
-          message: verification.blockedReason
-            ? visualBlockedMessage(verification.blockedReason, verification.remediation)
-            : "Proposed integration tree did not pass fresh verification.",
+          message: verificationHaltMessage(verification),
         };
       }
       const acceptTrailers = waiver

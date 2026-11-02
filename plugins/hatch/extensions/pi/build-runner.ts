@@ -6,6 +6,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HatchBuildFinalizer, type HatchBuildFinalizationResult } from "./build-finalizer.ts";
 import type { HatchCheckPlanEntry } from "./check-convergence.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
+import { itemSpecDigest, readAttempts, recordHostCheck, recordVerification } from "./gate-attempts.ts";
 import { deriveItemGitState, type HatchItemRecoveryState } from "./git-state.ts";
 import { safeProgress, type HatchRunProgress } from "./run-events.ts";
 import {
@@ -17,8 +18,6 @@ import type { WaveHostLedger } from "./wave-host-ledger.ts";
 
 const exec = promisify(execFile);
 const MAX_GIT_OUTPUT = 8 * 1024 * 1024;
-const MAX_ACCEPTANCE_ATTEMPTS = 2;
-const MAX_SAFETY_ATTEMPTS = 3;
 
 export type HatchBuildCheckpoint = (
   name:
@@ -45,6 +44,12 @@ export interface HatchBuildItemResult {
   message: string;
   worker?: HatchWorkerResult;
   finalization?: HatchBuildFinalizationResult;
+  /**
+   * Set on a `failed` result written by the no-change guard: the worker was sent a gate's
+   * findings and changed nothing, so the tip that gate already judged is marked failed.
+   * The halt is that unchanged attempt, not a spent attempt cap.
+   */
+  noChange?: true;
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -137,6 +142,21 @@ function terminalRecovery(
       message: state.nextAction,
     };
   }
+  if (state.state === "failed-superseded") {
+    return {
+      schema: "hatch-build-item-v1",
+      binder,
+      item,
+      status: "blocked",
+      recoveryState: state.state,
+      attempts: 0,
+      worktree: state.worktree,
+      commit: state.itemTip,
+      message:
+        "A marked fix was committed past the failed ref; run the delivery to re-validate it. " +
+        "The delivery runner owns that transition.",
+    };
+  }
   if (state.state === "inconsistent") {
     return {
       schema: "hatch-build-item-v1",
@@ -154,6 +174,8 @@ function terminalRecovery(
 }
 
 function retryKind(result: HatchBuildFinalizationResult): "acceptance" | "safety" | undefined {
+  // The citation pre-check applies the safety auditor's rule without a gate run.
+  if (result.citationCheck) return "safety";
   if (result.verification?.gates.acceptance?.verdict === "concerns") return "acceptance";
   // A visual gate concern is a fidelity kickback, retried under the same bounded
   // acceptance-attempt cap as an acceptance concern; on cap exhaustion the host writes the
@@ -221,11 +243,12 @@ export class HatchBuildItemRunner {
     owner: BinderLifecycleOwner,
     waveMates: readonly string[] = [item],
     ledger?: WaveHostLedger,
+    options?: { seedFeedback?: unknown[] },
   ): Promise<HatchBuildItemResult> {
     if (!(await this.#locks.owns(lease)) || owner.binder !== binder) {
       throw new Error("Hatch build item requires its delivery-owned binder lease and lifecycle");
     }
-    return this.#runLocked(ctx, binder, item, lease, owner, waveMates, ledger);
+    return this.#runLocked(ctx, binder, item, lease, owner, waveMates, ledger, options?.seedFeedback);
   }
 
   async #runLocked(
@@ -236,6 +259,7 @@ export class HatchBuildItemRunner {
     owner: BinderLifecycleOwner,
     waveMates: readonly string[],
     ledger?: WaveHostLedger,
+    seedFeedback?: unknown[],
   ): Promise<HatchBuildItemResult> {
       // The whole of a build's host work is a host phase for its item, except the
       // worker invocation itself. The ledger records the surface the host authored
@@ -278,13 +302,24 @@ export class HatchBuildItemRunner {
       }
       await this.#checkpoint("worktree-ready");
 
-      let feedback: unknown[] = [];
+      // The gate-attempt ledger is shared with merge-time verdicts and survives the
+      // process, so the counts start from what it holds for this item spec. A malformed
+      // ledger reads as exhausted with an error; then nothing is appended and the first
+      // concern halts, naming the file.
+      const specDigest = itemSpecDigest(assignment);
+      const persisted = await readAttempts(repoRoot, binder, item, specDigest);
+      const ledgerError = persisted.acceptance.error ?? persisted.safety.error;
+      const acceptanceCap = persisted.acceptance.cap;
+      const safetyCap = persisted.safety.cap;
+      let feedback: unknown[] = seedFeedback ?? [];
       let attempts = 0;
-      let acceptanceAttempts = 0;
-      let safetyAttempts = 0;
-      while (
-        acceptanceAttempts < MAX_ACCEPTANCE_ATTEMPTS && safetyAttempts < MAX_SAFETY_ATTEMPTS
-      ) {
+      let acceptanceAttempts = persisted.acceptance.counted;
+      let safetyAttempts = persisted.safety.counted;
+      let previous: HatchBuildFinalizationResult | undefined;
+      // The first round always runs, so a resumed run or a Fix and rerun validates once;
+      // a further round needs budget in the gate that raised the concern, which the cap
+      // test after each concern enforces. Each gate is capped on its own count only.
+      while (attempts === 0 || acceptanceAttempts < acceptanceCap || safetyAttempts < safetyCap) {
         attempts += 1;
         const beforeWorker = await deriveItemGitState(worktree, binder, item);
         const recoverCommitted = beforeWorker.state === "committed-unmarked";
@@ -302,7 +337,12 @@ export class HatchBuildItemRunner {
             assignment,
             feedback,
             owner.id,
-            recoverCommitted ? "recover-committed" : recoverMerged ? "recover-merged" : "implement",
+            // A run that follows a gate concern always edits; a landed item never does.
+            recoverMerged
+              ? "recover-merged"
+              : feedback.length > 0
+                ? "implement"
+                : recoverCommitted ? "recover-committed" : "implement",
             () => this.#checkpoint("first-worker-edit"),
             waveMates,
             ledger,
@@ -342,6 +382,63 @@ export class HatchBuildItemRunner {
             worker,
           };
         }
+        if (!recoverMerged && feedback.length > 0 && afterWorker.state === "committed-unmarked") {
+          // The worker was sent findings and changed nothing, so the committed tip is the
+          // tip the gate already judged. Re-reviewing it would be a reviewer re-roll.
+          if (previous?.status === "retry" && previous.commit) {
+            const failed = await this.#finalizer.recordRecoveredFailedCandidate(
+              binder,
+              item,
+              worktree,
+              lease,
+              previous,
+            );
+            if (failed.status !== "failed") {
+              return {
+                schema: "hatch-build-item-v1",
+                binder,
+                item,
+                status: "blocked",
+                recoveryState: state.state,
+                attempts,
+                worktree,
+                commit: failed.commit,
+                message: failed.message,
+                worker,
+                finalization: failed,
+              };
+            }
+            return {
+              schema: "hatch-build-item-v1",
+              binder,
+              item,
+              status: "failed",
+              recoveryState: state.state,
+              attempts,
+              worktree,
+              commit: failed.commit,
+              message:
+                "The worker was sent the gate's findings and changed nothing, so the reviewed tip " +
+                "is marked failed with that review.",
+              worker,
+              finalization: failed,
+              noChange: true,
+            };
+          }
+          // A seeded merge kickback: no new verdict, so no ledger row.
+          return {
+            schema: "hatch-build-item-v1",
+            binder,
+            item,
+            status: "no-change",
+            recoveryState: state.state,
+            attempts,
+            worktree,
+            commit: afterWorker.itemTip,
+            message: worker.summary,
+            worker,
+          };
+        }
         const recoveringExactCommit = afterWorker.state === "committed-unmarked";
         await this.#checkpoint("before-finalization");
         const finalization = recoverMerged
@@ -372,8 +469,36 @@ export class HatchBuildItemRunner {
               lease,
               checks,
               { manager: this.#processes, owner },
+              // The citation pre-check never spends the last safety attempt.
+              { citationPrecheck: !ledgerError && safetyAttempts + 1 < safetyCap },
             );
         await this.#checkpoint("finalization-returned");
+        // The finalizer sets `targetTree` with every verification: it is the tree the
+        // gate evidence bound (the staged candidate tree or the committed tip's tree).
+        // A staged candidate has no commit yet, so its item tip is the worktree HEAD.
+        if (finalization.verification && finalization.targetTree && !ledgerError) {
+          await recordVerification(repoRoot, {
+            binder,
+            item,
+            specDigest,
+            phase: "build",
+            itemTip: finalization.commit ?? (await git(worktree, ["rev-parse", "HEAD"])),
+            reviewedTree: finalization.targetTree,
+            verification: finalization.verification,
+          });
+        }
+        if (finalization.citationCheck && finalization.targetTree && !ledgerError) {
+          await recordHostCheck(repoRoot, {
+            binder,
+            item,
+            specDigest,
+            phase: "build",
+            itemTip: await git(worktree, ["rev-parse", "HEAD"]),
+            reviewedTree: finalization.targetTree,
+            evidenceHash: finalization.citationCheck.evidenceHash,
+            findings: finalization.citationCheck.findings,
+          });
+        }
         if (
           finalization.status === "built" ||
           finalization.status === "no-change" ||
@@ -446,7 +571,12 @@ export class HatchBuildItemRunner {
         if (kind === "acceptance") acceptanceAttempts += 1;
         else safetyAttempts += 1;
         const capped =
-          acceptanceAttempts >= MAX_ACCEPTANCE_ATTEMPTS || safetyAttempts >= MAX_SAFETY_ATTEMPTS;
+          Boolean(ledgerError) ||
+          (kind === "acceptance" ? acceptanceAttempts >= acceptanceCap : safetyAttempts >= safetyCap);
+        if (capped && finalization.citationCheck) {
+          // The pre-check is off on the last safety attempt and with an unreadable ledger.
+          throw new Error("Hatch citation pre-check reached the safety cap");
+        }
         if (capped) {
           const failed = recoveringExactCommit
             ? await this.#finalizer.recordRecoveredFailedCandidate(
@@ -474,11 +604,27 @@ export class HatchBuildItemRunner {
             attempts,
             worktree,
             commit: failed.commit,
-            message: failed.message,
+            message: ledgerError
+              ? `${failed.message} No retry: the gate-attempt ledger cannot be trusted (${ledgerError}).`
+              : failed.message,
             worker,
             finalization: failed,
           };
         }
+        if (finalization.citationCheck) {
+          // A pre-check result has no commit and no verification, so it never becomes the
+          // result the no-change guard acts on.
+          feedback = [{
+            kind: "repo-rule-citation-check",
+            gate: "safety-gate",
+            attempt: safetyAttempts,
+            cap: safetyCap,
+            evidenceHash: finalization.citationCheck.evidenceHash,
+            findings: finalization.citationCheck.findings,
+          }];
+          continue;
+        }
+        previous = finalization;
         feedback = [finalization.verification];
       }
       throw new Error("Hatch build retry accounting reached an impossible state");

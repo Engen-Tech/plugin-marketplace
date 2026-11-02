@@ -13,9 +13,13 @@ import {
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
 import {
   buildHatchEvidence,
+  CITATION_DEFECT_CODES,
+  REPO_RULE_CITATION_SHAPE,
   verifyEvidenceFreshness,
+  type EvidenceCitationDefect,
   type HatchCheckManifest,
 } from "./evidence.ts";
+import type { HatchGateFinding } from "./gate-runner.ts";
 import { validateCandidateHooks, type HookValidationResult } from "./hook-runner.ts";
 import { requirePackagePath } from "./package-paths.ts";
 import {
@@ -23,7 +27,7 @@ import {
   type BinderLifecycleOwner,
 } from "./process-manager.ts";
 import {
-  visualBlockedMessage,
+  blockedVerificationMessage,
   type HatchVerificationResult,
   type HatchVerificationRunner,
 } from "./verification-runner.ts";
@@ -66,6 +70,9 @@ export interface HatchBuildFinalizationResult {
   checkFailure?: CheckConvergenceResult;
   hookValidation?: HookValidationResult;
   verification?: HatchVerificationResult;
+  // Set when the citation pre-check sent the candidate back before any check or gate:
+  // the preliminary evidence hash and one host-written finding per citation defect.
+  citationCheck?: { evidenceHash: string; findings: HatchGateFinding[] };
   // Set on an empty candidate whose already-present oracle probe changed the worktree
   // (tracked or untracked, not ignored); the host restored it to HEAD before returning.
   probeRestored?: boolean;
@@ -98,6 +105,12 @@ function oracleCheck(workItem: Record<string, unknown>): HatchCheckPlanEntry | u
     command: command.trim(),
     cwd: typeof cwd === "string" ? cwd : ".",
   };
+}
+
+function oracleOptsOut(workItem: Record<string, unknown>): boolean {
+  const oracle = workItem.oracle;
+  return Boolean(oracle) && typeof oracle === "object" && !Array.isArray(oracle) &&
+    (oracle as Record<string, unknown>).opt_out === true;
 }
 
 async function nullObjectId(cwd: string): Promise<string> {
@@ -165,17 +178,22 @@ function finalizationStatus(verification: HatchVerificationResult): HatchBuildFi
   return "blocked";
 }
 
-// A blocked verification names its cause. A typed visual prerequisite is a fail-closed
-// unmet precondition, not a gate failure, so it gets the shared, actionable per-reason
-// message; anything else keeps the site's fallback. It writes no completion ref either
-// way — the caller keys on status, and there is no fall-through that moves a ref.
-function blockedFinalizationMessage(
-  verification: HatchVerificationResult,
-  fallback: string,
-): string {
-  return verification.blockedReason
-    ? visualBlockedMessage(verification.blockedReason, verification.remediation)
-    : fallback;
+// One host-written finding per citation defect the item added. The rule is the safety
+// auditor's own: a citation that does not check out leaves its override undeclared.
+function citationDefectFindings(defects: readonly EvidenceCitationDefect[]): HatchGateFinding[] {
+  return defects.map((defect) => ({
+    severity: "major",
+    code: CITATION_DEFECT_CODES[defect.problem],
+    path: defect.path,
+    line: defect.line,
+    message:
+      `\`${defect.text}\` at ${defect.path}:${defect.line} is not a repo-rule citation the host can resolve ` +
+      `(${defect.problem}). The shape is \`${REPO_RULE_CITATION_SHAPE}\`, with a colon directly after the path. ` +
+      "Until it resolves, the HATCH-SME-OVERRIDE it supports is undeclared.",
+    nextStep:
+      `Rewrite it as \`repo-rule: ${defect.cited ?? "<path>"}:<line-or-section>\`, or remove the citation and the ` +
+      "override if no repo rule supports it.",
+  }));
 }
 
 // A command as a halt message shows it: whitespace collapsed, clipped to 200 characters.
@@ -389,9 +407,11 @@ export class HatchBuildFinalizer {
           commit: integrationTip,
           checks,
           verification,
-          message: blockedFinalizationMessage(
+          message: blockedVerificationMessage(
             verification,
             "Landed merge recovery did not pass fresh verification; done remains absent.",
+            "kept",
+            evidence.payload.citationDefects,
           ),
         };
       }
@@ -552,9 +572,11 @@ export class HatchBuildFinalizer {
         verification,
         message: finalStatus === "retry"
           ? "Committed candidate still has gate concerns."
-          : blockedFinalizationMessage(
+          : blockedVerificationMessage(
               verification,
               "Committed candidate recovery was blocked by gate evidence.",
+              "kept",
+              evidence.payload.citationDefects,
             ),
       };
     }
@@ -895,6 +917,7 @@ export class HatchBuildFinalizer {
     lease: DispatchLockLease,
     floorChecks: HatchCheckPlanEntry[] = [],
     processContext?: { manager: HatchProcessManager; owner: BinderLifecycleOwner },
+    options: { citationPrecheck?: boolean } = {},
   ): Promise<HatchBuildFinalizationResult> {
     if (!(await this.#locks.owns(lease))) {
       throw new Error("Hatch build finalization requires the active binder lock lease");
@@ -913,6 +936,25 @@ export class HatchBuildFinalizer {
       item,
       target: "candidate",
     });
+    // The citation pre-check: a repo-rule citation this item added that the host cannot
+    // resolve goes back to the worker before the floor, the oracle, the parity probe or
+    // any gate runs. An oracle opt-out runs no gate to judge the override, so it is
+    // skipped there; the caller turns it off on the last safety attempt.
+    const citationDefects = preliminaryEvidence.payload.citationDefects ?? [];
+    if (options.citationPrecheck && !oracleOptsOut(preliminaryEvidence.payload.workItem) && citationDefects.length > 0) {
+      return {
+        status: "retry",
+        binder,
+        item,
+        targetTree: preliminaryEvidence.payload.git.targetTree,
+        citationCheck: {
+          evidenceHash: preliminaryEvidence.evidenceHash,
+          findings: citationDefectFindings(citationDefects),
+        },
+        message:
+          "A repo-rule citation this item added cannot be resolved; it goes back to the worker before any check or gate runs.",
+      };
+    }
     const oracle = oracleCheck(preliminaryEvidence.payload.workItem);
     const oracleKey = oracle ? `${oracle.cwd}\0${oracle.command}` : undefined;
     const checkPlan: HatchCheckPlanEntry[] = floorChecks
@@ -1009,9 +1051,11 @@ export class HatchBuildFinalizer {
         message:
           status === "retry"
             ? "Gate concerns require another bounded worker attempt."
-            : blockedFinalizationMessage(
+            : blockedVerificationMessage(
                 verification,
                 "Gate evidence blocked finalization; the candidate remains staged.",
+                "kept",
+                evidence.payload.citationDefects,
               ),
       };
     }

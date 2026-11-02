@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { hostGitArgs } from "./worker-attestation.ts";
 
 const exec = promisify(execFile);
 const IDENTIFIER = /^[a-z0-9][a-z0-9-]*$/;
@@ -11,6 +12,7 @@ export type HatchItemRecoveryState =
   | "committed-unmarked"
   | "built"
   | "failed"
+  | "failed-superseded"
   | "merged-unmarked"
   | "accept-merge-pending"
   | "accept-ref-pending"
@@ -52,7 +54,9 @@ interface GitResult {
 
 async function gitResult(cwd: string, args: string[]): Promise<GitResult> {
   try {
-    const { stdout, stderr } = await exec("git", ["-C", cwd, ...args], {
+    // Read-only, and run with the hardened options: a hook or fsmonitor a
+    // writer planted in the repository config runs nothing here.
+    const { stdout, stderr } = await exec("git", hostGitArgs(cwd, args), {
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
     });
@@ -266,7 +270,21 @@ export async function deriveItemGitState(
     }
   }
   if (built && built !== itemTip) diagnostics.push("built ref does not match the item tip");
-  if (failed && failed !== itemTip) diagnostics.push("failed ref does not match the item tip");
+  // A marked hand fix committed past a halted tip: failed stays on the item's history, no
+  // other marker ref exists, and the marker loop above has already required every commit
+  // after integration to carry the item marker. The stale failed sha stays in refs.failed.
+  const failedSuperseded = Boolean(
+    failed &&
+      failed !== itemTip &&
+      !built &&
+      !done &&
+      !accepted &&
+      !itemMerged &&
+      await isAncestor(cwd, failed, itemTip),
+  );
+  if (failed && failed !== itemTip && !failedSuperseded) {
+    diagnostics.push("failed ref does not match the item tip");
+  }
   if (accepted && accepted !== itemTip) diagnostics.push("accepted ref does not match the item tip");
   const acceptedTrailer = done ? await trailer(cwd, done, "Hatch-Accepted") : "";
   const acceptReasonTrailer = done ? await trailer(cwd, done, "Hatch-Accept-Reason") : "";
@@ -306,6 +324,13 @@ export async function deriveItemGitState(
     return result(base, "accept-ref-pending", "finish failed-ref removal and write accepted ref-last");
   }
   if (done) return result(base, "done", "skip this completed item");
+  if (failedSuperseded) {
+    return result(
+      base,
+      "failed-superseded",
+      "a marked fix was committed past the failed ref; re-validate the new tip",
+    );
+  }
   if (failed && itemMerged) {
     return result(
       base,
