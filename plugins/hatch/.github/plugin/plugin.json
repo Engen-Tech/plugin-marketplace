@@ -1,6 +1,6 @@
 {
   "name": "hatch",
-  "version": "2.46.0",
+  "version": "2.46.1",
   "description": "Hatch skills with acceptance and safety reviewers for Claude or GPT in Copilot CLI.",
   "agents": "./.github/agents/",
   "skills": "./skills/",

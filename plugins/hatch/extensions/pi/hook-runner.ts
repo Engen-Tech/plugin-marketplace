@@ -10,6 +10,8 @@ const MAX_HOOK_OUTPUT = 2 * 1024 * 1024;
 export interface HookValidationResult {
   status: "passed" | "failed" | "drifted";
   candidateTree: string;
+  // The exit code of the `git commit` that ran the hooks, when it failed.
+  exitCode?: number;
   hookTree?: string;
   message?: string;
   stdout: string;
@@ -253,6 +255,7 @@ export async function validateCandidateHooks(options: {
       return {
         status: "failed",
         candidateTree: options.candidateTree,
+        exitCode: committed.code,
         stdout: committed.stdout,
         stderr: committed.stderr,
       };

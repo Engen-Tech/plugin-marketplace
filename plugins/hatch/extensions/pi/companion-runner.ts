@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { execFile } from "node:child_process";
-import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, sep } from "node:path";
 import { promisify } from "node:util";
@@ -83,6 +84,9 @@ export interface HatchWriterCommitResult {
   // What the host left as it was when it put the repository back, such as a
   // hooks folder outside the repository.
   restoreNotes?: string[];
+  // Set on a kaizen commit that changed no pack: an empty commit whose body
+  // carries the envelope's notes, so they reach git.
+  notesOnly?: true;
 }
 
 // The closed set of reasons the host refuses a writer change. Each one either
@@ -94,7 +98,8 @@ export type HatchWriterRefusalCode =
   | "seed-provenance" | "seeded-cache-edited" | "reseed-provenance"
   | "project-pack-not-monotonic" | "config-invalid" | "pack-validation"
   | "files-changed-mismatch" | "corrected-count-mismatch" | "gitignore"
-  | "whitespace" | "secret-scan" | "writer-error" | "host-check" | "restore-escape";
+  | "whitespace" | "secret-scan" | "writer-error" | "host-check" | "restore-escape"
+  | "read-escape";
 
 export interface HatchWriterRefusal {
   code: HatchWriterRefusalCode;
@@ -198,8 +203,9 @@ function authorityRefusalFor(message: string): HatchWriterRefusal {
   return { code: "authority", message: `${message.replace(/\.+$/, "")}; ${AUTHORITY_WITHHELD}` };
 }
 
-// A restore-escape is a link the writer planted on a restored file's folder path.
-const CONFINEMENT = new Set<HatchWriterRefusalCode>(["out-of-surface", "authority", "restore-escape"]);
+// A restore-escape is a link the writer planted on a restored file's folder path;
+// a read-escape is a link on a changed file's path or folder path.
+const CONFINEMENT = new Set<HatchWriterRefusalCode>(["out-of-surface", "authority", "restore-escape", "read-escape"]);
 
 // Codes that earn the corrective turn, and the ones whose path is restored to
 // the integration tip's bytes before it.
@@ -330,11 +336,13 @@ function parseConfig(raw: string, path: string): WriterConfig {
   return { enabled: config.enabled, ...(config.focus === undefined ? {} : { focus: config.focus }) };
 }
 
-async function readConfig(worktree: string, writer: HatchWriterRole): Promise<WriterConfig> {
+// The config is read only through its checked real folder, never through a
+// link at its path or on its folder path: a writer can plant one there.
+export async function readConfig(worktree: string, writer: HatchWriterRole): Promise<WriterConfig> {
   const relative = writer === "doc-gardner" ? ".hatch/doc-gardner.json" : ".hatch/kaizen.json";
-  const path = join(worktree, relative);
-  if (!(await exists(path))) return { enabled: false };
-  return parseConfig(await readFile(path, "utf8"), relative);
+  const text = await readConfined(worktree, relative);
+  if (text === undefined) return { enabled: false };
+  return parseConfig(text, relative);
 }
 
 function splitNul(output: string): string[] {
@@ -542,6 +550,8 @@ async function scanSecrets(
   base: string,
   processContext: ProcessContext,
   signal?: AbortSignal,
+  // The repository whose staged diff is scanned, when it is not `worktree`.
+  scanned = worktree,
 ): Promise<void> {
   const allowlist = await commitFile(worktree, base, ".hatch/secret-scan-allowlist");
   const root = await mkdtemp(join(tmpdir(), "hatch-secret-allowlist-"));
@@ -552,11 +562,11 @@ async function scanSecrets(
     const result = await runManagedCommand({
       command: "uv",
       args: ["run", "--script", requirePackagePath("skills/hatch-build/scripts/scan_secrets.py"), "--allowlist", path],
-      cwd: worktree,
+      cwd: scanned,
       signal,
       onProcessStart(pid) {
         processContext.manager.registerProcess(pid, {
-          cwd: worktree,
+          cwd: scanned,
           parentId: processContext.owner.id,
           label: "companion secret scan",
           role: "host-check",
@@ -666,13 +676,55 @@ interface WriterRefusalInput {
   signal?: AbortSignal;
 }
 
-async function readChanged(worktree: string, path: string): Promise<string> {
+// A read that would go through a link the writer planted on the path or its
+// folder path, or through something that is not a folder or a file. Nothing
+// was read.
+class ReadEscape extends Error {
+  readonly path: string;
+
+  constructor(path: string, reason: string) {
+    super(`Hatch will not read ${path}: ${reason}; nothing was read`);
+    this.path = path;
+  }
+}
+
+// Read a file only through its checked real folder joined with its name, and
+// never through a link at the path itself. A missing file, or one whose folder
+// is gone, reads as undefined.
+async function readConfined(worktree: string, path: string): Promise<string | undefined> {
+  const folder = await checkedFolder(await realpath(worktree), path, (reason) => new ReadEscape(path, reason));
+  if (folder.missing.length > 0) return undefined;
+  const target = join(folder.parent, folder.name);
+  let stat;
   try {
-    return await readFile(join(worktree, path), "utf8");
+    stat = await lstat(target);
   } catch (error) {
-    // A deleted file reads as empty, so the pack rules judge the deletion.
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
+  }
+  if (stat.isSymbolicLink()) throw new ReadEscape(path, "it is a link");
+  if (!stat.isFile()) throw new ReadEscape(path, "it is not a file");
+  // O_NOFOLLOW closes the gap between the check and the open where it exists.
+  const handle = await open(target, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try {
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+// A deleted changed file reads as empty, so the pack rules judge the deletion.
+async function readChanged(worktree: string, path: string): Promise<string> {
+  return (await readConfined(worktree, path)) ?? "";
+}
+
+// Confinement failed on a read: the only refusal, like `out-of-surface`.
+async function readChangedOrEscape(worktree: string, path: string): Promise<string | HatchWriterRefusal> {
+  try {
+    return await readChanged(worktree, path);
+  } catch (error) {
+    if (!(error instanceof ReadEscape)) throw error;
+    return { code: "read-escape", path: error.path, message: error.message };
   }
 }
 
@@ -729,8 +781,10 @@ async function collectWriterRefusals(input: WriterRefusalInput): Promise<Collect
     }
     if (paths.includes(".gitignore")) {
       const scratch = await exists(join(worktree, "superpowers")) || await exists(join(worktree, "docs", "superpowers"));
+      const after = await readChangedOrEscape(worktree, ".gitignore");
+      if (typeof after !== "string") return [after];
       try {
-        attestGitignore(input.beforeIgnore, await readChanged(worktree, ".gitignore"), scratch);
+        attestGitignore(input.beforeIgnore, after, scratch);
       } catch (error) {
         refusals.push({ code: "gitignore", path: ".gitignore", message: errorMessage(error) });
       }
@@ -756,7 +810,8 @@ async function collectWriterRefusals(input: WriterRefusalInput): Promise<Collect
   const resolved = new Map(input.packs.map((pack) => [`${pack.id}.md`, pack]));
   for (const path of changedPackPaths.filter(packPath)) {
     const name = basename(path);
-    const after = await readChanged(worktree, path);
+    const after = await readChangedOrEscape(worktree, path);
+    if (typeof after !== "string") return [after];
     const before = input.beforePacks.get(name);
     const source = resolved.get(name);
     const exactSeed = !!source?.canonicalContent && stripStamp(after) === source.canonicalContent;
@@ -789,6 +844,7 @@ async function collectWriterRefusals(input: WriterRefusalInput): Promise<Collect
   try {
     await readConfig(worktree, writer);
   } catch (error) {
+    if (error instanceof ReadEscape) return [{ code: "read-escape", path: error.path, message: error.message }];
     refusals.push({ code: "config-invalid", path: ".hatch/kaizen.json", message: errorMessage(error) });
   }
   const validation = await runPackValidator(worktree, input.processContext, input.signal);
@@ -829,11 +885,16 @@ interface RestorePlan {
 }
 
 // Walk every folder on the path below the worktree root with lstat. A link, or
-// anything that is not a folder, refuses the restore before anything changes.
-async function restoreFolder(root: string, path: string): Promise<Pick<RestorePlan, "parent" | "missing" | "name">> {
+// anything that is not a folder, refuses the restore or read before anything
+// changes or is read.
+async function checkedFolder(
+  root: string,
+  path: string,
+  escape: (reason: string) => Error,
+): Promise<Pick<RestorePlan, "parent" | "missing" | "name">> {
   const parts = path.split("/");
   if (parts.some((part) => part === "" || part === "." || part === "..")) {
-    throw new RestoreEscape(path, "its path is not a plain path inside the worktree");
+    throw escape("its path is not a plain path inside the worktree");
   }
   const name = parts.pop() as string;
   let parent = root;
@@ -846,8 +907,8 @@ async function restoreFolder(root: string, path: string): Promise<Pick<RestorePl
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       return { parent, missing: parts.slice(index), name };
     }
-    if (stat.isSymbolicLink()) throw new RestoreEscape(path, `its folder ${parts.slice(0, index + 1).join("/")} is a link`);
-    if (!stat.isDirectory()) throw new RestoreEscape(path, `${parts.slice(0, index + 1).join("/")} is not a folder`);
+    if (stat.isSymbolicLink()) throw escape(`its folder ${parts.slice(0, index + 1).join("/")} is a link`);
+    if (!stat.isDirectory()) throw escape(`${parts.slice(0, index + 1).join("/")} is not a folder`);
     parent = next;
   }
   return { parent, missing: [], name };
@@ -858,7 +919,9 @@ async function restoreFolder(root: string, path: string): Promise<Pick<RestorePl
 async function planRestores(worktree: string, base: string, paths: string[]): Promise<RestorePlan[]> {
   const root = await realpath(worktree);
   const folders = [];
-  for (const path of paths) folders.push({ path, ...(await restoreFolder(root, path)) });
+  for (const path of paths) {
+    folders.push({ path, ...(await checkedFolder(root, path, (reason) => new RestoreEscape(path, reason))) });
+  }
   const plans: RestorePlan[] = [];
   for (const folder of folders) {
     const entry = (await writerGitRaw(worktree, ["--literal-pathspecs", "ls-tree", "-z", base, "--", folder.path]))
@@ -1172,7 +1235,104 @@ export function describeCompanionOutcome(companions: HatchCompanionResult): stri
   return sentences.join(" ");
 }
 
-function formatKaizenMessage(binder: string, result: HatchKaizenResult): string {
+// The trailer a notes-only kaizen commit carries: a hash of its notes, so a
+// rerun can find it whatever git's message cleanup or a commit-msg hook did to
+// the rest of the message.
+const NOTES_TRAILER = "Hatch-Kaizen-Notes";
+
+// Each note trimmed and its whitespace runs collapsed, in fixed key order.
+function kaizenNotesHash(result: HatchKaizenResult): string {
+  const normal = (entries: string[]) => entries.map((entry) => entry.trim().replace(/\s+/g, " "));
+  const notes = {
+    candidates: normal(result.candidates),
+    erosionNotes: normal(result.erosionNotes),
+    proposedScaffolds: normal(result.proposedScaffolds),
+    residual: normal(result.residual),
+    upstreamCandidates: normal(result.upstreamCandidates),
+  };
+  return createHash("sha256").update(JSON.stringify(notes)).digest("hex");
+}
+
+// A kaizen commit carrying this notes hash on the integration branch after
+// its last item merge and after the delivery's diff base, whichever is
+// nearer, if there is one. The trailer is read by git's trailer parser and,
+// when a hook appended a paragraph below it, as a line anywhere in the body.
+async function notesCommitSinceLastMerge(
+  worktree: string,
+  tip: string,
+  diffBase: string,
+  hash: string,
+): Promise<string | undefined> {
+  const stop = await git(worktree, ["rev-parse", "--verify", "--quiet", `${diffBase}^{commit}`], true);
+  const lines = (await git(worktree, ["rev-list", "--first-parent", "--parents", "-n", "200", tip])).split("\n").filter(Boolean);
+  const bodyLine = new RegExp(`^${NOTES_TRAILER}:[ \\t]*${hash}[ \\t]*$`, "m");
+  for (const line of lines) {
+    const [commit, ...parents] = line.split(" ");
+    if (commit === stop || parents.length > 1) return undefined;
+    const shown = await git(worktree, [
+      "show",
+      "-s",
+      `--format=%s%x00%(trailers:key=${NOTES_TRAILER},valueonly,unfold)%x00%B`,
+      commit,
+    ]);
+    const [subject, values = "", body = ""] = shown.split("\0");
+    if (!subject.startsWith("kaizen:")) continue;
+    if (values.split("\n").some((value) => value.trim() === hash) || bodyLine.test(body)) return commit;
+  }
+  return undefined;
+}
+
+// Why a hook refused the notes-only commit: the stage and exit code always,
+// and the first non-empty line of its output, capped after the scan, only
+// when the whole line passes the same secret scan as a refused diff, with the integration tip's
+// allowlist. The line is staged in a scratch repository and scanned there.
+async function describeHookRefusal(
+  worktree: string,
+  base: string,
+  validation: HookValidationResult,
+  processContext: ProcessContext,
+  signal?: AbortSignal,
+): Promise<string> {
+  const exit = validation.exitCode === undefined ? "a failure" : `exit code ${validation.exitCode}`;
+  // git reports its own exit code, not the hook's, and does not say which hook.
+  const stage = ` The commit hook stage (git commit running pre-commit, prepare-commit-msg and commit-msg) ended with ${exit}.`;
+  const found = `${validation.stderr}\n${validation.stdout}`.split("\n").map((entry) => entry.trim()).find(Boolean);
+  if (found === undefined) return `${stage} The hook printed nothing.`;
+  const root = await mkdtemp(join(tmpdir(), "hatch-hook-output-"));
+  try {
+    await git(root, ["init", "-q"]);
+    // Scan the whole line before any cut: a cut can leave part of a secret
+    // that no longer matches its pattern.
+    await writeFile(join(root, "hook-output.txt"), `${found}\n`);
+    await git(root, ["add", "hook-output.txt"]);
+    await scanSecrets(worktree, base, processContext, signal, root);
+    const line = found.length > 200 ? `${found.slice(0, 200)}...` : found;
+    return `${stage} Hook output: ${line}`;
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return `${stage} The hook output was withheld by the secret scan.`;
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+// The envelope's notes that a kaizen commit body carries. A run that changed
+// no pack but left any of them gets an empty commit.
+function hasKaizenNotes(result: HatchKaizenResult): boolean {
+  return [
+    result.candidates,
+    result.erosionNotes,
+    result.upstreamCandidates,
+    result.proposedScaffolds,
+    result.residual,
+  ].some((entries) => entries.length > 0);
+}
+
+export function formatKaizenMessage(
+  binder: string,
+  result: HatchKaizenResult,
+  options: { notesTrailer?: boolean } = {},
+): string {
   const subject = result.seeded.length > 0
     ? `kaizen: seed ${result.seeded.length} packs into .hatch/sme/`
     : `kaizen: ${result.summary.split("\n", 1)[0].slice(0, 64)}`;
@@ -1189,6 +1349,8 @@ function formatKaizenMessage(binder: string, result: HatchKaizenResult): string 
       ? [`${heading}:\n${entries.map((entry) => `- ${entry}`).join("\n")}`]
       : []),
   ];
+  // The trailer is its own last paragraph, so git's trailer parser reads it.
+  if (options.notesTrailer) sections.push(`${NOTES_TRAILER}: ${kaizenNotesHash(result)}`);
   return `${subject}\n\n${sections.join("\n\n")}`;
 }
 
@@ -1520,12 +1682,36 @@ export class HatchCompanionRunner {
         }
         await this.#checkpoint("writer-checks-passed", { role: writer, tree });
         const corrected = rounds.length > 0 ? { refusals: rounds } : {};
-        if (writer === "kaizen" && paths.length === 0) {
+        // A kaizen run that changed no pack still commits when its envelope
+        // carries notes: an empty commit, so the notes reach git.
+        const notesOnly = writer === "kaizen" && paths.length === 0;
+        if (notesOnly && !hasKaizenNotes(result as HatchKaizenResult)) {
           return { role: writer, status: "no-change", tree, result, ...corrected };
         }
         const message = writer === "doc-gardner"
           ? formatDocMessage(binder, input.diffRange, result as HatchDocGardnerResult)
-          : formatKaizenMessage(binder, result as HatchKaizenResult);
+          : formatKaizenMessage(binder, result as HatchKaizenResult, { notesTrailer: notesOnly });
+        if (notesOnly) {
+          // A rerun after a crash before the archive must not repeat the notes.
+          const existing = await notesCommitSinceLastMerge(
+            integrationWorktree,
+            base,
+            input.diffRange.split("..", 1)[0],
+            kaizenNotesHash(result as HatchKaizenResult),
+          );
+          if (existing !== undefined) {
+            return {
+              role: writer,
+              status: "committed",
+              commit: existing,
+              tree,
+              result,
+              notesOnly: true,
+              reason: `The same kaizen notes are already on the integration branch in ${existing}; no new commit was made.`,
+              ...corrected,
+            };
+          }
+        }
         const hookValidation = await validateCandidateHooks({
           worktree,
           parent: base,
@@ -1540,6 +1726,19 @@ export class HatchCompanionRunner {
           }),
           onProcessExit: (pid) => processContext.manager.forgetProcess(pid),
         });
+        if (notesOnly && hookValidation.status === "failed") {
+          // A consumer hook may refuse every empty commit. The notes stay in
+          // the result, as they did before notes-only commits existed.
+          return {
+            role: writer,
+            status: "no-change",
+            tree,
+            result,
+            reason: "A commit hook refused the empty notes-only commit, so the kaizen notes are kept only in companions.kaizen.result." +
+              await describeHookRefusal(worktree, base, hookValidation, processContext, ctx.signal),
+            ...corrected,
+          };
+        }
         if (hookValidation.status !== "passed" || hookValidation.hookTree !== tree) {
           throw new Error(`Hatch ${writer} commit hooks failed or changed the attested tree`);
         }
@@ -1559,7 +1758,16 @@ export class HatchCompanionRunner {
         await this.#checkpoint("writer-ref-updated", { role: writer, commit, tree });
         await git(integrationWorktree, ["read-tree", "--reset", "-u", commit]);
         await this.#checkpoint("writer-worktree-synced", { role: writer, commit, tree });
-        return { role: writer, status: "committed", commit, tree, result, hookValidation, ...corrected };
+        return {
+          role: writer,
+          status: "committed",
+          commit,
+          tree,
+          result,
+          hookValidation,
+          ...(notesOnly ? { notesOnly: true as const } : {}),
+          ...corrected,
+        };
       } catch (error) {
         // Once the writer has run and before the ref moves, a refusal keeps its
         // evidence: read it here, before `finally` removes the worktree.
