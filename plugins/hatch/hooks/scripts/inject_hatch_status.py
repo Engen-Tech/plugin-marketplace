@@ -175,7 +175,7 @@ def _watch_state_path() -> Path:
     else:
         xdg = os.environ.get("XDG_STATE_HOME")
         base = Path(xdg) if xdg else home / ".local" / "state"
-    return base / "hatch" / "state.json"
+    return base / "hatch-watch" / "state.json"
 
 
 def _opted_in(cwd: str) -> bool:
@@ -371,6 +371,38 @@ def _watch_self_test_checks() -> list[tuple[str, bool]]:
                     os.environ["HATCH_WATCH_STATE_DIR"] = saved
 
     try:
+        # -- the cold-path gate reads the SAME store file serve_status writes,
+        # on every platform branch, with no HATCH_WATCH_STATE_DIR override --
+        parity: list[bool] = []
+        saved_env = {k: os.environ.get(k) for k in ("HATCH_WATCH_STATE_DIR",
+                     "HOME", "XDG_STATE_HOME", "LOCALAPPDATA")}
+        saved_plat = sys.platform
+        try:
+            script = _status_script()
+            d = str(script.resolve().parent)
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            import serve_status
+            os.environ.pop("HATCH_WATCH_STATE_DIR", None)
+            os.environ["HOME"] = os.path.join(tempfile.gettempdir(), "ih-home")
+            for plat in ("linux", "darwin", "win32"):
+                for k in ("XDG_STATE_HOME", "LOCALAPPDATA"):
+                    os.environ.pop(k, None)
+                sys.platform = plat
+                parity.append(_watch_state_path() == serve_status
+                              .resolve_state_dir(platform=plat) / "state.json")
+        except Exception:                                      # noqa: BLE001
+            parity.append(False)
+        finally:
+            sys.platform = saved_plat
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        checks.append(("watch store path matches serve_status on linux,"
+                       " darwin, win32", parity == [True, True, True]))
+
         # -- spawn args: DEVNULL stdio + close_fds / detached creation flags --
         calls: list[tuple[list[str], dict]] = []
         _fire_ensure("/anywhere",

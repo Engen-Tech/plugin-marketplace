@@ -7,6 +7,7 @@
   uv run --script hatch_next.py                       # terminal map (auto-detect .hatch/binders)
   uv run --script hatch_next.py --json                # the state as JSON (Phase 2's server reads this)
   uv run --script hatch_next.py --footer --binder S   # one-line run footer for a binder slug
+  uv run --script hatch_next.py --watch               # the one Hatch Watch line: keyed hub URL, nudge, or opt-in hint
   uv run --script hatch_next.py --self-test           # embedded fixtures, exit 0/1
 
 Order is a topo sort over `after` edges, recomputed every call — never stored. A dangling `after`
@@ -15,7 +16,7 @@ is a warning; a cross-binder cycle is an error (and order is null). Delivered bi
 `after` naming one resolves as satisfied — a delivered predecessor is not a dangling edge.
 
 Every real invocation also fires a fail-open, fire-and-forget `serve_status.py --ensure`
-(Hatch Watch hub revival), and the human renders — footer/terminal, never --json — carry one
+(Hatch Watch hub revival), and the terminal map — never --footer, never --json — carries one
 nudge line when this repo is opted in but the hub is unreachable."""
 from __future__ import annotations
 import argparse, fnmatch, hashlib, json, os, subprocess, sys, time
@@ -434,8 +435,8 @@ def render_footer(state: dict, slug: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Hatch Watch surface (revive-integration): every real engine touch fires a
-# fail-open, fire-and-forget `serve_status.py --ensure`, and the human renders
-# (footer/terminal — never --json) may carry one nudge line when this repo is
+# fail-open, fire-and-forget `serve_status.py --ensure`, and the terminal map
+# (never --footer, which stays one line, never --json) may carry one nudge line when this repo is
 # opted in but the hub is unreachable. Nothing here ever alters this script's
 # own stdout shape on --json, its JSON schema, or its exit code.
 # ---------------------------------------------------------------------------
@@ -447,6 +448,33 @@ WATCH_BANNER = ('Hatch Watch: http://127.0.0.1:{port}/?key={token} — '
                 'persistent; say "turn off hatch watch" to disable.')
 WATCH_NUDGE = ('Hatch Watch: hub not running{reason} — revive it: '
                'uv run --script {script} --ensure')
+# --watch's answers when there is no URL to give: one plain line each, so
+# asking for the URL is never answered by silence. ASCII on purpose: they must
+# survive any console encoding unchanged ({script}/{root}/{reason} may not).
+# {script} and {root} arrive already quoted by _paste_path.
+WATCH_NOT_OPTED = ('Hatch Watch: this repo is not opted into the persistent '
+                   'Hatch Watch; opt in with hatch_script action statusControl '
+                   'operation optIn (fallback: uv run --script {script} '
+                   '--opt-in); for an ephemeral page instead, serve '
+                   'uv run --script {script} --root {root} --port 8765')
+WATCH_UNAVAILABLE = ('Hatch Watch: this repo is opted in but the hub URL is '
+                     'unavailable ({reason}); revive it: '
+                     'uv run --script {script} --ensure')
+WATCH_NO_REPO = ('Hatch Watch: the current folder is not inside a git '
+                 'checkout, so there is no repo to watch; run this from '
+                 'inside a repo.')
+# watch_report's re-probe window: the on-demand path has just fired --ensure
+# on a possibly cold hub, which needs ~1 s to bind, so it waits ~2 s; the
+# session-start hook keeps its own shorter window.
+WATCH_REPORT_RETRIES = 8
+
+
+def _paste_path(path) -> str:
+    """A path as it pastes into a shell command: double-quoted when it holds
+    whitespace. Double quotes are the one quoting POSIX shells, cmd and
+    PowerShell all read the same way for an ordinary path."""
+    text = os.fspath(path)
+    return f'"{text}"' if any(c.isspace() for c in text) else text
 
 
 def _fire_ensure(popen=None, os_name: str | None = None,
@@ -514,7 +542,19 @@ def _watch_state_path() -> Path:
     else:
         xdg = os.environ.get("XDG_STATE_HOME")
         base = Path(xdg) if xdg else home / ".local" / "state"
-    return base / "hatch" / "state.json"
+    return base / "hatch-watch" / "state.json"
+
+
+def _nearest_git_root(cwd: str | None = None) -> str | None:
+    """The nearest directory at or above `cwd` holding a .git, as
+    serve_status.find_repo_root decides it — or None outside any checkout."""
+    d = os.path.abspath(os.fspath(cwd) if cwd is not None else os.getcwd())
+    while not os.path.exists(os.path.join(d, ".git")):
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    return d
 
 
 def _opted_in_root(cwd: str | None = None) -> str | None:
@@ -527,12 +567,9 @@ def _opted_in_root(cwd: str | None = None) -> str | None:
         state_path = _watch_state_path()
         if not state_path.is_file():
             return None
-        d = os.path.abspath(os.fspath(cwd) if cwd is not None else os.getcwd())
-        while not os.path.exists(os.path.join(d, ".git")):  # nearest .git, as
-            parent = os.path.dirname(d)                     # find_repo_root does
-            if parent == d:
-                return None
-            d = parent
+        d = _nearest_git_root(cwd)
+        if d is None:
+            return None
         doc = json.loads(state_path.read_bytes())
         repos = doc.get("repos") if isinstance(doc, dict) else None
         rec = repos.get(d) if isinstance(repos, dict) else None
@@ -544,6 +581,17 @@ def _opted_in_root(cwd: str | None = None) -> str | None:
 def watch_line(cwd: str | None = None, *, banner: bool = False, probe=None,
                retries: int = 0, retry_delay: float = 0.25,
                sleep=time.sleep) -> str | None:
+    """Fail-open wrapper over _watch_line: any error returns None."""
+    try:
+        return _watch_line(cwd, banner=banner, probe=probe, retries=retries,
+                           retry_delay=retry_delay, sleep=sleep)
+    except Exception:
+        return None
+
+
+def _watch_line(cwd: str | None = None, *, banner: bool = False, probe=None,
+                retries: int = 0, retry_delay: float = 0.25,
+                sleep=time.sleep) -> str | None:
     """The one Hatch Watch line for the human surfaces, or None.
 
     None unless the repo at `cwd` is opted in per the per-user watch store —
@@ -556,35 +604,79 @@ def watch_line(cwd: str | None = None, *, banner: bool = False, probe=None,
     just-fired ensure needs ~1 s to bind, and nudging about a hub that is
     coming up reads as broken), then the one-line nudge naming the --ensure
     one-liner plus any failure reason the ensure path recorded in the state
-    dir. Fail-open: any error returns None. Never called on the --json path."""
-    try:
-        if _opted_in_root(cwd) is None:
-            return None
-        watch = _load_watch()
-        if watch is None:
-            return None
-        sd = watch.ensure_state_dir()
-        port = watch._hub_port(sd)
-        token = watch.get_token()
-        probe_fn = probe or (lambda p: watch._probe_hub(p, token))
-        kind = probe_fn(port)[0]
-        for _ in range(retries):
-            if kind == "ours":
-                break
-            sleep(retry_delay)
-            kind = probe_fn(port)[0]
-        if kind == "ours":
-            return WATCH_BANNER.format(port=port, token=token) if banner else None
-        reason = ""
-        try:
-            doc = json.loads((sd / watch.ENSURE_FAILURE_FILENAME).read_bytes())
-            if isinstance(doc, dict) and doc.get("reason"):
-                reason = f" ({doc['reason']})"
-        except Exception:
-            reason = ""
-        return WATCH_NUDGE.format(reason=reason, script=watch._SCRIPT_PATH)
-    except Exception:
+    dir. Raises on error (watch_line is the fail-open wrapper). Never called
+    on the --json path."""
+    if _opted_in_root(cwd) is None:
         return None
+    watch = _load_watch()
+    if watch is None:
+        raise RuntimeError("serve_status could not be loaded")
+    sd = watch.ensure_state_dir()
+    port = watch._hub_port(sd)
+    token = watch.get_token()
+    probe_fn = probe or (lambda p: watch._probe_hub(p, token))
+    kind = probe_fn(port)[0]
+    for _ in range(retries):
+        if kind == "ours":
+            break
+        sleep(retry_delay)
+        port = watch._hub_port(sd)  # a just-fired ensure may record a new port
+        kind = probe_fn(port)[0]
+    if kind == "ours":
+        return WATCH_BANNER.format(port=port, token=token) if banner else None
+    reason = ""
+    try:
+        doc = json.loads((sd / watch.ENSURE_FAILURE_FILENAME).read_bytes())
+        if isinstance(doc, dict) and doc.get("reason"):
+            reason = f" ({doc['reason']})"
+    except Exception:
+        reason = ""
+    return WATCH_NUDGE.format(reason=reason, script=watch._SCRIPT_PATH)
+
+
+def watch_report(cwd: str | None = None, *, probe=None,
+                 retries: int = WATCH_REPORT_RETRIES,
+                 sleep=time.sleep) -> str:
+    """The --watch answer: the Hatch Watch line on demand, on any harness.
+
+    The session-start banner is the only other surface that carries the
+    keyed URL, and not every harness shows it. This is watch_line with the
+    banner on and a ~2 s re-probe window (the caller has just fired --ensure
+    at a possibly cold hub) — the keyed URL when the hub answers, the revive
+    nudge when it does not — except that it is never silent: outside any git
+    checkout it yields WATCH_NO_REPO; a repo that is not opted in yields
+    WATCH_NOT_OPTED, naming the opt-in call and the ephemeral serve command;
+    an opted-in repo whose line cannot be computed yields WATCH_UNAVAILABLE
+    with the reason. The cold-path promise holds: a non-opted repo never
+    imports serve_status."""
+    root = _nearest_git_root(cwd)
+    if root is None:
+        return WATCH_NO_REPO
+    script = _paste_path(_WATCH_SCRIPT)
+    if _opted_in_root(cwd) is None:
+        return WATCH_NOT_OPTED.format(script=script, root=_paste_path(root))
+    try:
+        line = _watch_line(cwd, banner=True, probe=probe, retries=retries,
+                           sleep=sleep)
+        reason = "no line was produced"
+    except Exception as exc:
+        line = None
+        reason = (" ".join(str(exc).split()) or type(exc).__name__)[:120]
+    if line is not None:
+        return line
+    return WATCH_UNAVAILABLE.format(reason=reason, script=script)
+
+
+def _print_line(line: str) -> None:
+    """Print one human line on any console. A Windows console may be cp1252
+    or cp437 and a redirected one may be ascii; the banner and nudge carry an
+    em dash, so a character the console cannot encode becomes '?' rather
+    than a UnicodeEncodeError and a non-zero exit."""
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    print(line)
 
 
 def _git(*args: str) -> str:
@@ -1641,8 +1733,186 @@ def _watch_self_test_checks() -> list[tuple[str, bool]]:
                        proc.returncode == 0 and cold.get("line") is None
                        and cold.get("imported") is False))
 
+    # -- --watch (watch_report): the on-demand URL line for any harness. It is
+    # never silent: banner with the key, the nudge, or the opt-in line --
+    with temp_store() as sd:
+        repo = sd / "wrepo"
+        (repo / ".git").mkdir(parents=True)
+        repo = Path(os.path.realpath(repo))
+        no_naps: list[float] = []
+        cold_line = watch_report(str(repo), probe=lambda p: ("ours", {}),
+                                 sleep=no_naps.append)
+        checks.append(("--watch: not opted in -> the one opt-in line",
+                       cold_line == WATCH_NOT_OPTED.format(
+                           script=_WATCH_SCRIPT, root=str(repo))
+                       and "\n" not in cold_line
+                       and "statusControl" in cold_line and "optIn" in cold_line
+                       and "--opt-in" in cold_line
+                       and f"--root {repo} --port 8765" in cold_line
+                       and no_naps == []))
+        watch = _load_watch()
+        watch.upsert_repo(str(repo), opted_in=True)
+        port = watch._hub_port(watch.ensure_state_dir())
+        token = watch.get_token()
+        up = watch_report(str(repo), probe=lambda p: ("ours", {}),
+                          sleep=no_naps.append)
+        checks.append(("--watch: opted in + hub answering -> the keyed URL banner",
+                       up == WATCH_BANNER.format(port=port, token=token)
+                       and f"?key={token}" in up))
+        down_naps: list[float] = []
+        down = watch_report(str(repo), probe=lambda p: ("dead", None),
+                            sleep=down_naps.append)
+        checks.append(("--watch: opted in + hub down -> the revive nudge after"
+                       " 8 re-probes (~2 s)",
+                       down is not None
+                       and down.startswith("Hatch Watch: hub not running")
+                       and f"{watch._SCRIPT_PATH} --ensure" in down
+                       and "?key=" not in down and len(down_naps) == 8))
+        # a cold hub needs ~1 s to bind after the just-fired ensure: a hub
+        # that first answers on the 4th probe still yields the banner
+        calls = {"n": 0}
+
+        def late(p):
+            calls["n"] += 1
+            return ("ours", {}) if calls["n"] >= 4 else ("dead", None)
+        late_line = watch_report(str(repo), probe=late, sleep=lambda s: None)
+        checks.append(("--watch: hub answering on the 4th probe -> the banner",
+                       late_line == WATCH_BANNER.format(port=port, token=token)))
+        # the just-fired ensure may bind a different port than the store held
+        # (the derived default was taken): each re-probe re-reads the port
+        moved = port + 3
+        seen_ports: list[int] = []
+
+        def moving(p):
+            seen_ports.append(p)
+            if len(seen_ports) == 1:
+                watch.record_port(moved)
+                return ("foreign", None)
+            return ("ours", {}) if p == moved else ("dead", None)
+        moved_line = watch_report(str(repo), probe=moving, sleep=lambda s: None)
+        checks.append(("--watch: ensure moving the hub to a new port -> the"
+                       " banner on the new port",
+                       moved_line == WATCH_BANNER.format(port=moved, token=token)))
+        watch.record_port(port)
+        # opted in, but the watch module cannot answer: never claim the repo
+        # is not opted in
+        saved_load = globals()["_load_watch"]
+
+        class _Broken:
+            def ensure_state_dir(self):
+                raise OSError("disk full")
+        try:
+            globals()["_load_watch"] = lambda: None
+            no_mod = watch_report(str(repo), probe=lambda p: ("ours", {}),
+                                  sleep=lambda s: None)
+            globals()["_load_watch"] = lambda: _Broken()
+            no_dir = watch_report(str(repo), probe=lambda p: ("ours", {}),
+                                  sleep=lambda s: None)
+        finally:
+            globals()["_load_watch"] = saved_load
+        unavailable = "this repo is opted in but the hub URL is unavailable"
+        checks.append(("--watch: opted in + watch module missing -> the"
+                       " unavailable line, not the opt-in hint",
+                       unavailable in no_mod and "not opted" not in no_mod
+                       and "--ensure" in no_mod and "\n" not in no_mod))
+        checks.append(("--watch: opted in + state dir error -> the unavailable"
+                       " line naming the reason",
+                       unavailable in no_dir and "disk full" in no_dir
+                       and "--ensure" in no_dir and "\n" not in no_dir))
+
+    # -- --watch quoting and the no-repo case: a path holding a space is
+    # double-quoted (pastes in POSIX shells, cmd and PowerShell); a folder
+    # outside any checkout is never offered --opt-in --
+    with temp_store() as sd:
+        repo = sd / "w repo"
+        (repo / ".git").mkdir(parents=True)
+        repo = Path(os.path.realpath(repo))
+        spaced = watch_report(str(repo), sleep=lambda s: None)
+        saved_script = globals()["_WATCH_SCRIPT"]
+        odd = sd / "my tools" / "serve_status.py"
+        try:
+            globals()["_WATCH_SCRIPT"] = odd
+            odd_line = watch_report(str(repo), sleep=lambda s: None)
+        finally:
+            globals()["_WATCH_SCRIPT"] = saved_script
+        checks.append(("--watch: a repo path with a space is double-quoted",
+                       f'--root "{repo}" --port 8765' in spaced))
+        checks.append(("--watch: a script path with a space is double-quoted",
+                       f'uv run --script "{odd}" --opt-in' in odd_line
+                       and f'uv run --script "{odd}" --root' in odd_line))
+        nowhere = sd / "plain"
+        nowhere.mkdir()
+        bare = watch_report(str(nowhere), sleep=lambda s: None)
+        checks.append(("--watch: outside any git checkout -> the no-repo line,"
+                       " no --opt-in or --root",
+                       "not inside a git checkout" in bare
+                       and "--opt-in" not in bare and "--root" not in bare
+                       and "\n" not in bare and bare.isascii()))
+
+    with temp_store() as sd:
+        repo = sd / "wcli"
+        (repo / ".git").mkdir(parents=True)
+        repo = Path(os.path.realpath(repo))
+        # utf-8 pinned so a non-ASCII temp path round-trips on any OS; the
+        # narrow-console case is the ascii check below
+        proc = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                               "--watch"], capture_output=True, text=True,
+                              cwd=repo, timeout=60, encoding="utf-8",
+                              env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        wl = proc.stdout.splitlines()
+        checks.append(("--watch CLI: not opted in -> exit 0, exactly the opt-in line",
+                       proc.returncode == 0 and len(wl) == 1
+                       and wl[0] == WATCH_NOT_OPTED.format(script=_WATCH_SCRIPT,
+                                                           root=str(repo))))
+
+    # -- the cold-path gate reads the SAME store file serve_status writes, on
+    # every platform branch, with no HATCH_WATCH_STATE_DIR override --
+    watch = _load_watch()
+    saved_env = {k: os.environ.get(k) for k in
+                 ("HATCH_WATCH_STATE_DIR", "HOME", "XDG_STATE_HOME", "LOCALAPPDATA")}
+    saved_plat = sys.platform
+    parity = []
+    try:
+        os.environ.pop("HATCH_WATCH_STATE_DIR", None)
+        os.environ["HOME"] = os.path.join(tempfile.gettempdir(), "hn-home")
+        for plat in ("linux", "darwin", "win32"):
+            for k in ("XDG_STATE_HOME", "LOCALAPPDATA"):
+                os.environ.pop(k, None)
+            sys.platform = plat
+            parity.append(_watch_state_path()
+                          == watch.resolve_state_dir(platform=plat) / "state.json")
+    finally:
+        sys.platform = saved_plat
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    checks.append(("watch store path matches serve_status on linux, darwin,"
+                   " win32", parity == [True, True, True]))
+
+    # -- --watch on a narrow console (Windows cp1252/cp437, or ascii): the
+    # banner and nudge carry an em dash; printing must never raise --
+    checks.append(("--watch: the opt-in line is plain ASCII",
+                   WATCH_NOT_OPTED.isascii()))
+    code = ("import sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import hatch_next\n"
+            "hatch_next._print_line(hatch_next.WATCH_BANNER.format("
+            "port=8765, token='t'))\n")
+    enc_env = dict(os.environ, PYTHONIOENCODING="ascii")
+    proc = subprocess.run([sys.executable, "-c", code,
+                           str(Path(__file__).resolve().parent)],
+                          capture_output=True, env=enc_env, timeout=60)
+    checks.append(("--watch: an ascii console prints the banner (em dash"
+                   " replaced), exit 0",
+                   proc.returncode == 0 and proc.stderr == b""
+                   and proc.stdout.strip()
+                   == b'Hatch Watch: http://127.0.0.1:8765/?key=t ? persistent;'
+                      b' say "turn off hatch watch" to disable.'))
+
     # -- e2e: opted-in repo, every candidate port foreign — the detached child
-    # fails open (never spawns), the footer ends on the nudge, --json is
+    # fails open (never spawns), the footer stays one line, --json is
     # untouched, both exit 0 --
     with temp_store() as sd:
         repo = sd / "repo"
@@ -1701,10 +1971,9 @@ def _watch_self_test_checks() -> list[tuple[str, bool]]:
                                  timeout=120, encoding="utf-8")
             ran_json = wait_crumb()
             flines = foot.stdout.splitlines()
-            checks.append(("e2e: footer exits 0 and ends on the one nudge line",
-                           foot.returncode == 0 and len(flines) == 2
-                           and flines[1].startswith("Hatch Watch: hub not running")
-                           and "--ensure" in flines[1]))
+            checks.append(("e2e: --footer stays one line (no nudge) and exits 0",
+                           foot.returncode == 0 and len(flines) == 1
+                           and "Hatch Watch" not in foot.stdout))
             checks.append(("e2e: --json output and exit code are never altered",
                            jso.returncode == 0 and "Hatch Watch" not in jso.stdout
                            and isinstance(json.loads(jso.stdout), dict)))
@@ -1963,10 +2232,16 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--footer", action="store_true")
     ap.add_argument("--binder", type=str)
+    ap.add_argument("--watch", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
         return _run_self_test()
+    if args.watch:
+        if _opted_in_root() is not None:
+            _fire_ensure()  # revive first; watch_report's re-probes cover the bind
+        _print_line(watch_report())
+        return 0
     _fire_ensure()  # every real engine touch revives the watch hub — fail-open
     binders, load_errors = load_binders()
     archived = frozenset(b["slug"] for b in load_archived_binders())
@@ -1979,10 +2254,12 @@ def main() -> int:
     if args.json:
         print(json.dumps(state, indent=2))  # never altered by the watch surface
     else:
-        out = (render_footer(state, args.binder or "") if args.footer
-               else render_terminal(state))
-        nudge = watch_line()
-        print(out if nudge is None else f"{out}\n{nudge}")
+        if args.footer:
+            print(render_footer(state, args.binder or ""))  # one line, always
+        else:
+            nudge = watch_line()
+            out = render_terminal(state)
+            print(out if nudge is None else f"{out}\n{nudge}")
     return 0
 
 

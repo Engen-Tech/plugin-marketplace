@@ -68,6 +68,10 @@ the default — not an extra someone has to ask for:
 
   `uv run --script <skill-dir>/scripts/serve_status.py --root <repo> --port 8765`
 
+Check first with `hatch_script` action `hatchNext` `format: watch` (fallback:
+`uv run --script <skill-dir>/scripts/hatch_next.py --watch`): in an opted-in repo it returns the
+persistent hub's working URL, so hand that over instead of starting a second server.
+
 It is a **long-running** server (a browser polls it for as long as the page is open), so start it as a
 **persistent/managed process** — a bare `&` or `nohup` is often reaped by the agent runtime before
 it binds, so use the runtime's managed background-session mechanism — then **confirm it is serving
@@ -105,7 +109,18 @@ Two rules hold on every hub route — home page, per-repo pages, state feeds, `/
 assets alike: the **token is required everywhere** (`?key=<token>`, generated per user, stored
 0600 in the per-user state dir), and the **bind is hardcoded to loopback** (`127.0.0.1`, IPv4
 only) with no interface option — the page is never reachable off the machine. In an opted-in
-repo the session-start banner carries the full working URL with port and key.
+repo, Claude Code's session-start banner carries the full working URL with port and key. Pi shows
+the user no such banner (it only folds the hook's text into the system prompt), so on Pi, or any
+time the URL is needed, get it on demand and hand it to the user:
+
+  use `hatch_script` action `hatchNext` with `format: watch`; fallback: `uv run --script <skill-dir>/scripts/hatch_next.py --watch`
+
+It prints one line: the keyed hub URL when the hub answers (it waits about 2 s for a hub it just
+revived), the revive one-liner when it does not, or, in a repo that is not opted in, how to opt in
+and the ephemeral serve command instead. In an opted-in repo whose URL cannot be read it says so,
+with the reason and the revive one-liner; outside any git checkout it says there is no repo to
+watch. Paths that contain spaces are printed in double quotes, ready to paste.
+`statusControl` `ensure` prints nothing on success, so it never answers "what is the URL".
 
 Operator guide — opt-in, the stable URL, the off switch, the reboot gap, and the security model:
 `docs/how-to/hatch-watch.md` in the hatch repo.
@@ -117,7 +132,8 @@ the engine directly instead of the page:
 
 - Use `hatch_script` action `hatchNext` with `format: text`; fallback: `uv run --script <skill-dir>/scripts/hatch_next.py` — the route + frontier + `▶ next`.
 - Use `hatch_script` action `hatchNext` with `format: json`; fallback: `uv run --script <skill-dir>/scripts/hatch_next.py --json` — the full state (the page consumes this).
-- Use `hatch_script` action `hatchNext` with `format: footer` and `binder: <slug>`; fallback: `uv run --script <skill-dir>/scripts/hatch_next.py --footer --binder <slug>` — the one-line run-end nudge.
+- Use `hatch_script` action `hatchNext` with `format: footer` and `binder: <slug>`; fallback: `uv run --script <skill-dir>/scripts/hatch_next.py --footer --binder <slug>` — the one-line run-end nudge (always exactly one line; the hub-down nudge appears only on the terminal map).
+- Use `hatch_script` action `hatchNext` with `format: watch`; fallback: `uv run --script <skill-dir>/scripts/hatch_next.py --watch` — the one Hatch Watch line: the hub URL with its key, the revive nudge, the opt-in hint, the "opted in but unavailable" line, or the "not inside a git checkout" line.
 
 This skill is read-only and stack-agnostic. It never starts a build, never merges, never writes a
 binder. It only tells you where you are and what is next. The one exception to "starts nothing" is

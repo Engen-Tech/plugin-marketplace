@@ -35,7 +35,12 @@ export const ScriptParameters = ActionUnion([
   Type.Object(
     {
       action: Type.Literal("hatchNext"),
-      format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json"), Type.Literal("footer")])),
+      format: Type.Optional(Type.Union([
+        Type.Literal("text"),
+        Type.Literal("json"),
+        Type.Literal("footer"),
+        Type.Literal("watch"),
+      ])),
       binder: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
     },
     { additionalProperties: false },
@@ -203,6 +208,7 @@ export function buildScriptInvocation(params: HatchScriptParameters, cwd: string
       const args: string[] = [];
       if (params.format === "json") args.push("--json");
       if (params.format === "footer") args.push("--footer");
+      if (params.format === "watch") args.push("--watch");
       if (params.binder) args.push("--binder", params.binder);
       return { ...base, script: resolveHatchScript("hatchNext"), args };
     }
