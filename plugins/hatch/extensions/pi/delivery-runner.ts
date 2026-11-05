@@ -734,6 +734,21 @@ function haltRecord(
 }
 
 /**
+ * Every item a wave set aside, for its `wave-finished` event: the halts recorded since the
+ * wave began, then any item the wave finalization names as failed that no halt covers.
+ * One entry per item; a later halt of the same item replaces the earlier one.
+ */
+function waveHalted(
+  halts: readonly HatchDeliveryHalt[],
+  failedItems: readonly string[] = [],
+): { item: string; status: string }[] {
+  const byItem = new Map<string, string>();
+  for (const halt of halts) byItem.set(halt.item, halt.status);
+  for (const item of failedItems) if (!byItem.has(item)) byItem.set(item, "failed");
+  return [...byItem].map(([item, status]) => ({ item, status }));
+}
+
+/**
  * How the item stands after a halt, which decides what the rerun does. `kept`: no ref
  * was written (a blocked build, a deferred kickback, a blocked recovery), so the rerun
  * resumes from Git. `failed`: a failed ref was written at merge or accept time, so the
@@ -2388,6 +2403,7 @@ export class HatchDeliveryRunner {
                 .filter((integration) => integration.status === "integrated")
                 .map((integration) => integration.item),
               failed: finalization.failedItems ?? [],
+              halted: waveHalted([], finalization.failedItems),
               next: finalization.status === "passed" ? "continue" : "stop",
             });
             if (finalization.status !== "passed") {
@@ -2537,6 +2553,7 @@ export class HatchDeliveryRunner {
             status: finalization.status,
             landed: [recovered.item],
             failed: finalization.failedItems ?? [],
+            halted: waveHalted([], finalization.failedItems),
             next: finalization.status === "passed" ? "continue" : "stop",
           });
           if (finalization.status !== "passed") {
@@ -2670,6 +2687,7 @@ export class HatchDeliveryRunner {
           // The accept-time review is one more verdict on the item's spec: it goes in the
           // ledger with phase accept, and, like a merge-time record, never throws.
           await this.#recordReview(repoRoot, binder, integrated, "accept", { emit, wave: waveNumber });
+          const acceptHaltsFrom = halts.length;
           const waveResult: HatchDeliveryWave = {
             wave: waveNumber,
             items: [failed.id],
@@ -2710,6 +2728,7 @@ export class HatchDeliveryRunner {
             status: finalization.status,
             landed: integrated.status === "integrated" ? [failed.id] : [],
             failed: finalization.failedItems ?? [],
+            halted: waveHalted(halts.slice(acceptHaltsFrom), finalization.failedItems),
             next: acceptLanded ? "continue" : "stop",
           });
           if (!acceptLanded) {
@@ -2763,6 +2782,7 @@ export class HatchDeliveryRunner {
           });
         }
         emit({ kind: "wave-started", wave: waveNumber, items: waveMates });
+        const waveHaltsFrom = halts.length;
         const builds = await mapWithConcurrencyLimit(
           batch,
           MAX_PARALLEL_BUILDS,
@@ -2830,6 +2850,7 @@ export class HatchDeliveryRunner {
             status: "nothing-to-merge",
             landed: [],
             failed: [],
+            halted: waveHalted(halts.slice(waveHaltsFrom)),
             next: afterWave(buildFailed),
           });
           continue;
@@ -3050,6 +3071,7 @@ export class HatchDeliveryRunner {
           status: waveFinalization.status,
           landed: [...landed],
           failed: waveFinalization.failedItems ?? [],
+          halted: waveHalted(halts.slice(waveHaltsFrom), waveFinalization.failedItems),
           next: waveStops ? "stop" : afterWave(integrationFailed || buildFailed),
         });
         if (waveStops) {

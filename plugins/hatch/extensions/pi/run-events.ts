@@ -45,7 +45,14 @@ export type HatchRunEvent =
       wave: number;
       status: "passed" | "rolled-back" | "nothing-to-merge";
       landed: string[];
+      // Items whose merge into this wave failed and that now hold a failed ref: the wave
+      // finalization's own list, which a rollback decision reads.
       failed: string[];
+      // Every item of this wave that did not land, in the order it was set aside, with the
+      // status it halted on: a halted build (failed, blocked, no-change, already-present),
+      // a failed merge or accept, or a deferred kickback. It includes every `failed` item,
+      // so a summary that lists `halted` never reads "none" beside a halt.
+      halted: { item: string; status: string }[];
       // What the runner decided to do next, so no reader infers it from the lists:
       // "continue" to the next wave, "prompt" the human to fix, accept or defer a failed
       // item, or "stop" the run.

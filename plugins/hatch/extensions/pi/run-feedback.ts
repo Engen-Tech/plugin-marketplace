@@ -151,7 +151,7 @@ export function describeRunEvent(event: HatchRunEvent): string {
     case "item-merged":
       return `${event.item} merged${event.accepted ? " (accepted)" : ""}`;
     case "wave-finished":
-      return `wave ${event.wave} ${event.status}: landed ${list(event.landed)}; failed ${list(event.failed)}`;
+      return `wave ${event.wave} ${event.status}: landed ${list(event.landed)}; halted ${list(event.halted.map(haltedText))}`;
     case "companions-started":
       return "companions started";
     case "clear-kept-backups":
@@ -161,6 +161,10 @@ export function describeRunEvent(event: HatchRunEvent): string {
     case "prompt-closed":
       return `${event.title}: ${event.answered ? "answered" : "not answered"}`;
   }
+}
+
+function haltedText(entry: { item: string; status: string }): string {
+  return `${entry.item} (${entry.status})`;
 }
 
 function resultStatusOf(record: HatchRunRecord): HatchRunResultDetails["status"] {
@@ -429,7 +433,11 @@ export class HatchRunFeedback {
     if (rolledBack && event.landed.length === 0) parts.push("Nothing landed.");
     else if (rolledBack) parts.push(`Rolled back to wave-${event.wave}-base: ${list(event.landed)}.`);
     else parts.push(`Landed ${list(event.landed)}.`);
-    if (event.failed.length > 0) parts.push(`Failed ${list(event.failed)}.`);
+    // "Halted so far" already names each reported halt with its reason; this sentence
+    // adds only the wave's items no item-halted event reported, so none appears twice.
+    const reported = new Set(record.progress.halted.map((entry) => entry.item));
+    const unreported = event.halted.filter((entry) => !reported.has(entry.item));
+    if (unreported.length > 0) parts.push(`Halted this wave: ${list(unreported.map(haltedText))}.`);
     if (halted.length > 0) parts.push(`Halted so far: ${halted.join("; ")}.`);
     // The runner's own decision, carried in the event; never inferred from the lists.
     parts.push(WAVE_NEXT_TEXT[event.next]);
