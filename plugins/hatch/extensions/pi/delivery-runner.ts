@@ -130,7 +130,9 @@ export interface HatchDeliveryHalt {
 export interface HatchDeliveryResult {
   schema: "hatch-delivery-v1";
   binder: string;
-  status: "complete" | "blocked";
+  // `cleared`: the operator chose Clear and stop. The binder's hatch state is gone and
+  // nothing was built; the run is finished, not halted.
+  status: "complete" | "blocked" | "cleared";
   integrationWorktree: string;
   waves: HatchDeliveryWave[];
   message: string;
@@ -2089,19 +2091,19 @@ export class HatchDeliveryRunner {
         }
         const choice = await ctx.ui.select(
           `Binder '${binder}' carries state from an earlier run${worktreeDisclosure}${unlandedDisclosureText}`,
-          ["Resume", "Clear"],
+          ["Resume", "Clear", "Clear and stop"],
         );
-        if (choice !== "Resume" && choice !== "Clear") {
+        if (choice !== "Resume" && choice !== "Clear" && choice !== "Clear and stop") {
           return {
             schema: "hatch-delivery-v1",
             binder,
             status: "blocked",
             integrationWorktree: "",
             waves: [],
-            message: `Binder '${binder}' was neither resumed nor cleared; choose Resume or Clear to continue.`,
+            message: `Binder '${binder}' was neither resumed nor cleared; choose Resume, Clear, or Clear and stop to continue.`,
           };
         }
-        if (choice === "Clear") {
+        if (choice === "Clear" || choice === "Clear and stop") {
           await this.#clearDelivery(repoRoot, binder, dirtyWorktrees.length > 0, clearStamp, (kept) => {
             keptByClear = kept;
             emit({
@@ -2111,6 +2113,22 @@ export class HatchDeliveryRunner {
               lines: kept.map(keptReport),
             });
           });
+          // Clear and stop ends here: no preflight, no integration branch, no wave. It is the
+          // route for withdrawing or replacing a binder, which needs a clean namespace and no build.
+          if (choice === "Clear and stop") {
+            return {
+              schema: "hatch-delivery-v1",
+              binder,
+              status: "cleared",
+              integrationWorktree: "",
+              waves: [],
+              message: [
+                `The hatch state of binder '${binder}' was cleared; nothing was delivered. ` +
+                  "Commit the binder's deletion to withdraw it, or deliver it again to start fresh.",
+                ...keptByClear.map(keptReport),
+              ].join("\n"),
+            };
+          }
         }
       }
       const processContext = { manager: this.#processes, owner };

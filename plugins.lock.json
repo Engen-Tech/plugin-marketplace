@@ -1,10 +1,10 @@
 {
   "hatch": {
-    "version": "2.46.5",
+    "version": "2.46.6",
     "source": "https://github.com/Engen-Tech/hatch",
-    "tag": "v2.46.5",
-    "commit": "64d4c5894c4de49c4faf93dd7d3a202e37341e98",
-    "tree": "7f0582f95b10d2cc8aa20b4a306d8f3b80870585",
+    "tag": "v2.46.6",
+    "commit": "e07a8129abf897ef4b6d9833ca234d460153fd65",
+    "tree": "832e36b048601ab89ae15f1ce0afcc826f6fd748",
     "pi": {
       "extensions": [
         "extensions/pi/index.ts"
