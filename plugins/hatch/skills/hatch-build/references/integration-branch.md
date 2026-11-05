@@ -58,6 +58,8 @@ Per-item outcomes:
 - `refs/hatch/<slug>/item-<id>/evidence` → the capped oracle evidence record blob for the item's last validated run
 - `refs/hatch/<slug>/item-<id>/in-progress`
 
+Clear backups: `refs/hatch-backup/<slug>/<YYYYMMDDTHHMMSSZ>/<branch path after hatch/<slug>/>` → the old tip of an item or integration branch that Clear deleted while it held commits on no other branch, tag, or remote-tracking ref. The namespace is outside every Clear pattern, so a later Clear never removes it. Restore with `git branch hatch/<slug>/<path> <backup ref>`.
+
 `done` ⟺ merged into integration (the invariant), in two flavors told apart by the `accepted` ref + trailers:
 - **clean-done** — the gate passed; no `accepted` ref.
 - **accepted-done** — a human waived a named unmet assertion; the `accepted` ref + the merge-commit `Hatch-Accepted`/`Hatch-Accept-Reason` trailers record what and why. Nothing pretends the assertion was met. An accepted item carries item branch + `accepted` + `done`, no `built`.

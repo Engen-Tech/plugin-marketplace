@@ -154,6 +154,8 @@ export function describeRunEvent(event: HatchRunEvent): string {
       return `wave ${event.wave} ${event.status}: landed ${list(event.landed)}; failed ${list(event.failed)}`;
     case "companions-started":
       return "companions started";
+    case "clear-kept-backups":
+      return event.lines.map((line) => `Clear ${line}`).join("\n");
     case "prompt-opened":
       return `waiting on you: ${event.title}`;
     case "prompt-closed":
@@ -269,6 +271,10 @@ export class HatchRunFeedback {
       case "environment-preflight":
         this.#flush(state);
         this.#notify(ui, `hatch ${SHORT_ACTION[record.action]} ${record.binder}: environment preflight found oracles with no setup`);
+        break;
+      case "clear-kept-backups":
+        this.#flush(state);
+        this.#notify(ui, `hatch ${SHORT_ACTION[record.action]} ${record.binder}: Clear kept unlanded work under refs/hatch-backup/`);
         break;
       case "item-halted":
         this.#flush(state);

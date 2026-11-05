@@ -44,6 +44,7 @@ Don't read [references/integration-branch.md](references/integration-branch.md) 
 
 - **Resume** — pick up from the last completed wave. Items whose `done` ref exists are skipped.
 - **Clear** — remove the wave tags, item refs, and the integration branch, then start fresh.
+  Before deleting any `hatch/<slug>/*` item or integration branch, check whether it holds commits on no other branch, tag, or remote-tracking ref: `git rev-list refs/heads/hatch/<slug>/<path> --not --exclude='hatch/<slug>/*' --branches --exclude='hatch/<slug>/*' --tags --remotes` (each `--exclude` covers only the next `--branches`/`--tags`, so it appears twice). When that lists commits, tell the user the count before they choose, and keep the tip first with `git update-ref refs/hatch-backup/<slug>/<YYYYMMDDTHHMMSSZ>/<path> <tip> ""`; if that write fails, do not delete the branch. On Pi the host does both: the dialog names each such branch, Clear writes the backup, and the run report gives the restore command.
 
 Never silently resume or silently clear — the user chooses.
 

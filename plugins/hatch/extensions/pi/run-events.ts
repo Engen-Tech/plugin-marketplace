@@ -52,6 +52,14 @@ export type HatchRunEvent =
       next: HatchWaveNext;
     }
   | { kind: "companions-started" }
+  // Clear kept these tips under refs/hatch-backup/ before deleting the branches that held them.
+  // `lines` are the operator-facing restore instructions.
+  | {
+      kind: "clear-kept-backups";
+      binder: string;
+      kept: { backupRef: string; commits: number; restoreName: string }[];
+      lines: string[];
+    }
   | { kind: "prompt-opened"; prompt: "select" | "confirm" | "input" | "editor"; title: string }
   | {
       kind: "prompt-closed";

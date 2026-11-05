@@ -1,6 +1,6 @@
 {
   "name": "@engen-tech/hatch",
-  "version": "2.46.3",
+  "version": "2.46.4",
   "description": "Stack-agnostic orchestration for parallel, Git-native delivery.",
   "private": true,
   "type": "module",

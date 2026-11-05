@@ -168,6 +168,68 @@ async function git(cwd: string, args: string[]): Promise<string> {
   }
 }
 
+/** Work Clear would delete that no surviving ref reaches: a hatch branch, or an owned worktree's detached HEAD. */
+interface UnlandedBranch {
+  /** What the dialog names: the branch path after `hatch/<binder>/`, or `detached HEAD in <dir>`. */
+  label: string;
+  /** The branch name the restore command creates. */
+  restoreName: string;
+  tip: string;
+  /** How many commits only this tip reaches. */
+  count: number;
+  /** Up to `UNLANDED_SAMPLE` of those commits, newest first. */
+  sample: string[];
+  backupRef: string;
+}
+
+/** How many unlanded shas the dialog shows per branch. */
+const UNLANDED_SAMPLE = 3;
+/** How many unlanded branches the dialog names in detail; the report always names all. */
+const UNLANDED_SHOWN = 5;
+
+/** A UTC stamp for the backup namespace: `YYYYMMDDTHHMMSSZ`. */
+function backupStamp(now: Date = new Date()): string {
+  return now.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+}
+
+function commitCount(count: number): string {
+  return `${count} commit${count === 1 ? "" : "s"}`;
+}
+
+/** The sampled shas oldest first; a leading `…` marks older commits left out. */
+function shaSpan(branch: UnlandedBranch): string {
+  const shown = [...branch.sample].reverse().map((sha) => sha.slice(0, 7)).join(", ");
+  return branch.count > branch.sample.length ? `… ${shown}` : shown;
+}
+
+function unlandedDisclosure(branch: UnlandedBranch): string {
+  return `Clear will delete ${branch.label}: ${branch.count} commit(s) on it exist on no other branch (${shaSpan(branch)}); Clear keeps a copy at ${branch.backupRef}.`;
+}
+
+/** The dialog's lines for unlanded work, bounded to the first `UNLANDED_SHOWN` entries. */
+function unlandedDisclosures(unlanded: UnlandedBranch[]): string {
+  const lines = unlanded.slice(0, UNLANDED_SHOWN).map(unlandedDisclosure);
+  const more = unlanded.length - UNLANDED_SHOWN;
+  if (more > 0) lines.push(`… and ${more} more branch(es) with unlanded commits; Clear keeps a copy of each.`);
+  return lines.join("\n");
+}
+
+function keptReport(branch: UnlandedBranch): string {
+  return `kept unlanded work at ${branch.backupRef} (${commitCount(branch.count)}); restore with: git branch ${branch.restoreName} ${branch.backupRef}`;
+}
+
+/** Detached HEADs in a `worktree list --porcelain` listing, by worktree path. */
+function detachedHeads(porcelain: string): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const block of porcelain.split(/\n\s*\n/)) {
+    const lines = block.split("\n");
+    const path = lines.find((line) => line.startsWith("worktree "))?.slice("worktree ".length);
+    const head = lines.find((line) => line.startsWith("HEAD "))?.slice("HEAD ".length);
+    if (path && head && lines.includes("detached")) result.set(path, head);
+  }
+  return result;
+}
+
 // A read-only git call with the hardened options, for the result's report: it
 // can run after a companion halted on repository authority the host could not
 // put back, so no hook or fsmonitor in that config may run.
@@ -1343,7 +1405,10 @@ export class HatchDeliveryRunner {
    * Matching on the ref alone misses a worktree left detached by an interrupted operation —
    * which is precisely the one that would later trip `#ensureIntegrationWorktree`.
    */
-  async #ownedWorktrees(repoRoot: string, binder: string): Promise<{ path: string; dirty: boolean }[]> {
+  async #ownedWorktrees(
+    repoRoot: string,
+    binder: string,
+  ): Promise<{ path: string; dirty: boolean; detachedHead?: string }[]> {
     const worktreesRoot = resolve(dirname(repoRoot), `${basename(repoRoot)}-worktrees`);
     const ownedByPath = (candidate: string): boolean => {
       const path = resolve(candidate);
@@ -1362,8 +1427,12 @@ export class HatchDeliveryRunner {
         .filter(([ref]) => ownedByRef(ref))
         .map(([, path]) => path),
     ]);
-    const found: { path: string; dirty: boolean }[] = [];
-    for (const path of paths) found.push({ path, dirty: await this.#dirty(path) });
+    const detached = detachedHeads(porcelain);
+    const found: { path: string; dirty: boolean; detachedHead?: string }[] = [];
+    for (const path of paths) {
+      const head = detached.get(path);
+      found.push({ path, dirty: await this.#dirty(path), ...(head ? { detachedHead: head } : {}) });
+    }
     return found;
   }
 
@@ -1375,6 +1444,71 @@ export class HatchDeliveryRunner {
       // Unreadable is not the same as clean: never force-remove a worktree we could not read.
       return true;
     }
+  }
+
+  /**
+   * Every `refs/heads/hatch/<binder>/*` branch, the integration branch included, and every
+   * owned worktree's detached HEAD, that holds commits no ref surviving Clear reaches.
+   * Surviving means a branch, tag, or remote-tracking ref outside this binder's namespace. Each
+   * `--exclude` applies only to the next `--branches`/`--tags`/`--remotes`, and is matched
+   * without the `refs/heads/` or `refs/tags/` prefix, so it is given twice; `refs/hatch/<binder>/`
+   * state refs are never branches or tags, so they never count as surviving. A detached HEAD
+   * also counts the binder's branch tips as surviving, because each of those is backed up
+   * itself when it needs to be. The count and a bounded sample are read separately, so a long
+   * branch cannot overflow the output buffer. Throws, with git's stderr, when git cannot answer.
+   */
+  async #unlandedBranches(repoRoot: string, binder: string, stamp: string): Promise<UnlandedBranch[]> {
+    const prefix = `refs/heads/hatch/${binder}/`;
+    const exclude = `--exclude=hatch/${binder}/*`;
+    const surviving = ["--not", exclude, "--branches", exclude, "--tags", "--remotes"];
+    const unlanded = async (tip: string, extra: string[] = []): Promise<{ count: number; sample: string[] }> => {
+      const count = Number(await git(repoRoot, ["rev-list", "--count", tip, ...surviving, ...extra]));
+      if (!Number.isInteger(count)) throw new Error(`git rev-list --count gave no count for ${tip}`);
+      const sample = count === 0
+        ? []
+        : (await git(repoRoot, ["rev-list", `--max-count=${UNLANDED_SAMPLE}`, tip, ...surviving, ...extra]))
+          .split("\n")
+          .map((sha) => sha.trim())
+          .filter(Boolean);
+      return { count, sample };
+    };
+    const lines = (await git(repoRoot, ["for-each-ref", "--format=%(refname) %(objectname)", prefix]))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const found: UnlandedBranch[] = [];
+    const branchTips = new Set<string>();
+    for (const line of lines) {
+      const [ref, tip] = line.split(" ");
+      branchTips.add(tip);
+      const { count, sample } = await unlanded(tip);
+      if (count === 0) continue;
+      const rest = ref.slice(prefix.length);
+      found.push({
+        label: rest,
+        restoreName: ref.slice("refs/heads/".length),
+        tip,
+        count,
+        sample,
+        backupRef: `refs/hatch-backup/${binder}/${stamp}/${rest}`,
+      });
+    }
+    for (const worktree of await this.#ownedWorktrees(repoRoot, binder)) {
+      const head = worktree.detachedHead;
+      if (!head || branchTips.has(head)) continue;
+      const { count, sample } = await unlanded(head, [...branchTips]);
+      if (count === 0) continue;
+      const dir = basename(worktree.path);
+      found.push({
+        label: `the detached HEAD in ${dir}`,
+        restoreName: dir,
+        tip: head,
+        count,
+        sample,
+        backupRef: `refs/hatch-backup/${binder}/${stamp}/detached-${dir}`,
+      });
+    }
+    return found;
   }
 
   async #tryClear(cwd: string, args: string[]): Promise<boolean> {
@@ -1400,8 +1534,19 @@ export class HatchDeliveryRunner {
    * sweep. It used to run `worktree remove --force` unconditionally, which deleted uncommitted
    * work without saying so, destroyed it before the survivor check could fail, and left a
    * detached worktree invisible to that check entirely.
+   *
+   * Committed work gets the same care. A hatch branch whose commits no surviving ref reaches is
+   * kept under `refs/hatch-backup/<binder>/<stamp>/`, outside every pattern Clear deletes, before
+   * anything is removed. The check runs again here rather than trusting the prompt's answer, and
+   * a backup that cannot be written stops the clear with nothing removed.
    */
-  async #clearDelivery(repoRoot: string, binder: string, discardDirty: boolean): Promise<string[]> {
+  async #clearDelivery(
+    repoRoot: string,
+    binder: string,
+    discardDirty: boolean,
+    stamp: string,
+    onKept: (kept: UnlandedBranch[]) => void,
+  ): Promise<{ removed: string[]; kept: UnlandedBranch[] }> {
     if (!discardDirty) {
       for (const worktree of await this.#ownedWorktrees(repoRoot, binder)) {
         if (worktree.dirty) {
@@ -1411,6 +1556,27 @@ export class HatchDeliveryRunner {
         }
       }
     }
+    let kept: UnlandedBranch[];
+    try {
+      kept = await this.#unlandedBranches(repoRoot, binder, stamp);
+    } catch (error) {
+      throw new Error(
+        `Hatch refuses to clear binder '${binder}': it could not check its branches for unlanded commits (${error instanceof Error ? error.message : String(error)}).`,
+      );
+    }
+    for (const branch of kept) {
+      try {
+        // The empty old value makes this create-only, so an existing backup is never overwritten.
+        await git(repoRoot, ["update-ref", branch.backupRef, branch.tip, ""]);
+      } catch (error) {
+        throw new Error(
+          `Hatch refuses to clear binder '${binder}': it could not keep a backup of ${branch.restoreName} at ${branch.backupRef} (${error instanceof Error ? error.message : String(error)}). Nothing was removed.`,
+        );
+      }
+    }
+    // Every backup exists before anything is deleted; the caller reports them from here on,
+    // so a sweep or a later step that throws cannot lose the restore commands.
+    if (kept.length > 0) onKept(kept);
     const removed: string[] = [];
     // A branch cannot be deleted while a worktree still has it checked out.
     for (const worktree of await this.#ownedWorktrees(repoRoot, binder)) {
@@ -1446,7 +1612,7 @@ export class HatchDeliveryRunner {
         `Hatch could not clear the earlier run's state: ${[...refSurvivors, ...worktreeSurvivors].join(", ")}`,
       );
     }
-    return removed;
+    return { removed, kept };
   }
 
   /**
@@ -1855,6 +2021,9 @@ export class HatchDeliveryRunner {
     }
     // Only now does the run own the binder; a run refused the lock never reports a start.
     emit({ kind: "run-started", binder });
+    // Backups Clear wrote in this run. Every exit after Clear names them: a result through
+    // `report()`, a thrown error through the catch below.
+    let keptByClear: UnlandedBranch[] = [];
     try {
       const repoRoot = await git(ctx.cwd, ["rev-parse", "--show-toplevel"]);
       const integrationRef = `refs/heads/hatch/${binder}/integration`;
@@ -1872,6 +2041,8 @@ export class HatchDeliveryRunner {
         .split("\n")
         .map((line) => line.trim())
         .filter((ref) => ref !== "" && ref !== integrationRef);
+      // One stamp per run, so the backup ref the prompt names is the one Clear writes.
+      const clearStamp = backupStamp();
       if (leftovers.length > 0) {
         if (!ctx.hasUI) {
           return {
@@ -1885,13 +2056,24 @@ export class HatchDeliveryRunner {
         }
         const ownedWorktrees = await this.#ownedWorktrees(repoRoot, binder);
         const dirtyWorktrees = ownedWorktrees.filter((worktree) => worktree.dirty);
-        const disclosure = dirtyWorktrees.length
+        const worktreeDisclosure = dirtyWorktrees.length
           ? `\n\nClear will also delete these worktrees, losing any uncommitted work in them:\n${dirtyWorktrees
               .map((worktree) => `  ${worktree.path}`)
               .join("\n")}`
           : "";
+        // Committed work that only a hatch branch holds is named too. A check that fails says
+        // so rather than staying silent; Clear itself re-checks and refuses on failure.
+        let unlandedDisclosureText: string;
+        try {
+          const unlanded = await this.#unlandedBranches(repoRoot, binder, clearStamp);
+          unlandedDisclosureText = unlanded.length
+            ? `\n\n${unlandedDisclosures(unlanded)}`
+            : "";
+        } catch {
+          unlandedDisclosureText = "\n\nHatch could not check for unlanded commits on this binder's branches.";
+        }
         const choice = await ctx.ui.select(
-          `Binder '${binder}' carries state from an earlier run${disclosure}`,
+          `Binder '${binder}' carries state from an earlier run${worktreeDisclosure}${unlandedDisclosureText}`,
           ["Resume", "Clear"],
         );
         if (choice !== "Resume" && choice !== "Clear") {
@@ -1904,7 +2086,17 @@ export class HatchDeliveryRunner {
             message: `Binder '${binder}' was neither resumed nor cleared; choose Resume or Clear to continue.`,
           };
         }
-        if (choice === "Clear") await this.#clearDelivery(repoRoot, binder, dirtyWorktrees.length > 0);
+        if (choice === "Clear") {
+          await this.#clearDelivery(repoRoot, binder, dirtyWorktrees.length > 0, clearStamp, (kept) => {
+            keptByClear = kept;
+            emit({
+              kind: "clear-kept-backups",
+              binder,
+              kept: kept.map((branch) => ({ backupRef: branch.backupRef, commits: branch.count, restoreName: branch.restoreName })),
+              lines: kept.map(keptReport),
+            });
+          });
+        }
       }
       const processContext = { manager: this.#processes, owner };
       // A successor binder (`supersedes`) inherits its predecessor's delivered work. Every
@@ -1939,6 +2131,10 @@ export class HatchDeliveryRunner {
         }
         return {
           ...result,
+          // Clear's backups go in the message the operator reads, with the command that restores each.
+          ...(keptByClear.length > 0
+            ? { message: [result.message, ...keptByClear.map(keptReport)].filter(Boolean).join("\n") }
+            : {}),
           ...(successorReport ? { supersedes: successorReport } : {}),
           ...(open.length > 0 ? { halts: open } : {}),
           ...(gateAttempts.length > 0 ? { gateAttempts } : {}),
@@ -2874,6 +3070,10 @@ export class HatchDeliveryRunner {
         waveNumber += 1;
       }
       throw new Error("Hatch delivery exceeded its deterministic orchestration bound");
+    } catch (error) {
+      if (keptByClear.length === 0) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error([message, ...keptByClear.map(keptReport)].join("\n"), { cause: error });
     } finally {
       try {
         await this.#processes.stopOwner(owner);
