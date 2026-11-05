@@ -116,7 +116,7 @@ is `check_shared_terms.py`'s job on the assembled tree, not the validator's.
 
 ## The oracle
 
-Every work item carries an oracle — the verification contract hatch uses before it considers the item complete.
+Every work item carries an oracle — the verification contract hatch uses before it considers the item complete. An oracle must be able to pass on the item's branch before the item lands: it must not need the item's own deploy, a production or shared live service, an operator login, or a post-merge event, though anything the build environment starts for itself is fine. A check that needs one belongs to a later drill stage (hatch-plan `plan:prelanding`).
 
 The schema allows two shapes:
 

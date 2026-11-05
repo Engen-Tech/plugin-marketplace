@@ -123,6 +123,7 @@ export interface HatchDeliveryHalt {
   diagnosis?: HatchCheckDiagnosis;
   // Set when a gate child returned no verdict and the host wrote `blocked`: the exact
   // Pi request that resumes the run, then what to do first (wait, or pin a model).
+  // Also set when the build worker itself returned `blocked`: the honest routes forward.
   nextStep?: string;
 }
 
@@ -655,7 +656,8 @@ type KickbackOutcome =
   | { status: "failed"; integration: HatchIntegrationResult; reason: string; checkFailure?: CheckConvergenceResult; gate?: HaltGate }
   // No ref was written: the item sits out the rest of this run, as a blocked build does.
   // `verification` is the rebuild's own, the one whose gate halted it.
-  | { status: "deferred"; integration: HatchIntegrationResult; buildStatus: string; reason: string; checkFailure?: CheckConvergenceResult; verification?: HatchVerificationResult };
+  // `nextStep` is set when the rebuild's own worker returned `blocked`.
+  | { status: "deferred"; integration: HatchIntegrationResult; buildStatus: string; reason: string; checkFailure?: CheckConvergenceResult; verification?: HatchVerificationResult; nextStep?: string };
 
 function haltRecord(
   item: string,
@@ -697,6 +699,26 @@ function hostVerdictNextStep(
     if (step) return hostNextStepWithRerun(step, sentence);
   }
   return undefined;
+}
+
+/**
+ * The next step for a build whose worker returned `blocked` itself, with no check or
+ * gate behind it. A check that can pass only after the item lands or deploys is a plan
+ * gap, so the step names the replan routes and why a hand landing is not one. The
+ * runner does not settle here whether any item has landed, so both routes are named.
+ */
+function workerBlockedNextStep(binder: string, build: HatchBuildItemResult): string | undefined {
+  if (build.status !== "blocked" || build.worker?.outcome !== "blocked") return undefined;
+  return (
+    `Fix what stopped the worker, then ask Pi to \`Deliver binder ${binder}.\` again (\`hatch_dispatch\` action \`deliverBinder\`); ` +
+    "if the item's check can pass only after the item lands or deploys, replan it with a later drill stage (hatch-plan `plan:prelanding`): " +
+    "withdraw the binder if none of its items has landed, otherwise plan a successor binder (docs/how-to/binder-repair.md). " +
+    "Landing the work by hand bypasses the gates and leaves the item with no done ref, so a later run cannot see it."
+  );
+}
+
+function withNextStep(nextStep: string | undefined): { nextStep?: string } {
+  return nextStep ? { nextStep } : {};
 }
 
 /** The structured check an `item-halted` event carries, from a halted check's diagnosis. */
@@ -1669,6 +1691,7 @@ export class HatchDeliveryRunner {
           reason: buildHaltReason(build),
           checkFailure: build.finalization?.checkFailure,
           verification: build.finalization?.verification,
+          ...withNextStep(workerBlockedNextStep(binder, build)),
         };
       }
       const proposed = build.worker?.checks.map((check): HatchCheckPlanEntry => ({ ...check, purpose: "floor" })) ?? [];
@@ -2589,7 +2612,14 @@ export class HatchDeliveryRunner {
           const halt = build.status === "failed" ? failedBuildHalt(build) : undefined;
           const reason = halt?.reason ?? buildHaltReason(build);
           deferred.set(item.id, { status: build.status, message: reason });
-          halts.push(haltRecord(item.id, "build", build.status, reason, build.finalization?.checkFailure, hostVerdictNextStep(binder, "kept", build.finalization?.verification)));
+          halts.push(haltRecord(
+            item.id,
+            "build",
+            build.status,
+            reason,
+            build.finalization?.checkFailure,
+            hostVerdictNextStep(binder, "kept", build.finalization?.verification) ?? workerBlockedNextStep(binder, build),
+          ));
           // A failed build leaves a failed ref, so the next pass asks the human about
           // it; the prompt names this run's reason rather than an earlier run's.
           if (halt) setHalt(item.id, reason, halt.gate);
@@ -2790,7 +2820,7 @@ export class HatchDeliveryRunner {
             integrationFailed = true;
           } else {
             deferred.set(item.id, { status: outcome.buildStatus, message: reason });
-            halts.push(haltRecord(item.id, "merge", outcome.buildStatus, reason, outcome.checkFailure, hostVerdictNextStep(binder, "kept", outcome.verification)));
+            halts.push(haltRecord(item.id, "merge", outcome.buildStatus, reason, outcome.checkFailure, hostVerdictNextStep(binder, "kept", outcome.verification) ?? outcome.nextStep));
           }
           emit({
             kind: "item-halted",
