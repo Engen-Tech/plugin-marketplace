@@ -174,8 +174,9 @@ function terminalRecovery(
 }
 
 function retryKind(result: HatchBuildFinalizationResult): "acceptance" | "safety" | undefined {
-  // The citation pre-check applies the safety auditor's rule without a gate run.
-  if (result.citationCheck) return "safety";
+  // The citation pre-check applies the safety auditor's rule without a gate run. A failed
+  // check the worker proposed spends the same count: it is the worker's own floor.
+  if (result.citationCheck || result.workerCheckFailure) return "safety";
   if (result.verification?.gates.acceptance?.verdict === "concerns") return "acceptance";
   // A visual gate concern is a fidelity kickback, retried under the same bounded
   // acceptance-attempt cap as an acceptance concern; on cap exhaustion the host writes the
@@ -316,6 +317,10 @@ export class HatchBuildItemRunner {
       let acceptanceAttempts = persisted.acceptance.counted;
       let safetyAttempts = persisted.safety.counted;
       let previous: HatchBuildFinalizationResult | undefined;
+      // Ids of worker-proposed checks that failed at the host and went back to the worker.
+      // Every later worker must propose a check with each id, so a worker can never pass
+      // its own floor by deleting the check that failed.
+      const requiredCheckIds = new Set<string>();
       // The first round always runs, so a resumed run or a Fix and rerun validates once;
       // a further round needs budget in the gate that raised the concern, which the cap
       // test after each concern enforces. Each gate is capped on its own count only.
@@ -361,6 +366,23 @@ export class HatchBuildItemRunner {
             attempts,
             worktree,
             message: worker.summary,
+            worker,
+          };
+        }
+        const dropped = [...requiredCheckIds].filter((id) => !worker.checks.some((check) => check.id === id));
+        if (dropped.length > 0) {
+          return {
+            schema: "hatch-build-item-v1",
+            binder,
+            item,
+            status: "blocked",
+            recoveryState: state.state,
+            attempts,
+            worktree,
+            message:
+              `Worker check ${dropped.map((id) => `'${id}'`).join(", ")} failed at the host and went back to the ` +
+              "worker, and the next worker's checks left it out: the failing check was not re-proposed. A worker " +
+              "cannot drop a failing check from its own floor, so the item halts blocked.",
             worker,
           };
         }
@@ -469,8 +491,13 @@ export class HatchBuildItemRunner {
               lease,
               checks,
               { manager: this.#processes, owner },
-              // The citation pre-check never spends the last safety attempt.
-              { citationPrecheck: !ledgerError && safetyAttempts + 1 < safetyCap },
+              // The citation pre-check never spends the last safety attempt, and neither
+              // does the worker-check kickback: on that attempt the pre-check yields to the
+              // gates, and a failed worker check halts blocked with no worker retry.
+              {
+                citationPrecheck: !ledgerError && safetyAttempts + 1 < safetyCap,
+                workerCheckKickback: !ledgerError && safetyAttempts + 1 < safetyCap,
+              },
             );
         await this.#checkpoint("finalization-returned");
         // The finalizer sets `targetTree` with every verification: it is the tree the
@@ -497,6 +524,19 @@ export class HatchBuildItemRunner {
             reviewedTree: finalization.targetTree,
             evidenceHash: finalization.citationCheck.evidenceHash,
             findings: finalization.citationCheck.findings,
+          });
+        }
+        if (finalization.workerCheckFailure && finalization.targetTree && !ledgerError) {
+          await recordHostCheck(repoRoot, {
+            binder,
+            item,
+            specDigest,
+            phase: "build",
+            itemTip: await git(worktree, ["rev-parse", "HEAD"]),
+            reviewedTree: finalization.targetTree,
+            evidenceHash: finalization.workerCheckFailure.evidenceHash,
+            findings: finalization.workerCheckFailure.findings,
+            source: "host-worker-check",
           });
         }
         if (
@@ -550,10 +590,10 @@ export class HatchBuildItemRunner {
         }
         const kind = retryKind(finalization);
         if (!kind) {
-          // A floor, oracle, or environment-setup check failed — not a gate raising a
-          // retryable concern. There is nothing for the worker to re-implement (a
-          // failing environment or a broken merged tip is not fixed by re-prompting),
-          // so halt cleanly with the check diagnostic instead of looping or crashing.
+          // The oracle, an environment-setup check, or a worker check past its kickback
+          // failed — not a gate or host check raising a retryable concern. A failing
+          // environment or a broken merged tip is not fixed by re-prompting, so halt
+          // cleanly with the check diagnostic instead of looping or crashing.
           return {
             schema: "hatch-build-item-v1",
             binder,
@@ -573,9 +613,9 @@ export class HatchBuildItemRunner {
         const capped =
           Boolean(ledgerError) ||
           (kind === "acceptance" ? acceptanceAttempts >= acceptanceCap : safetyAttempts >= safetyCap);
-        if (capped && finalization.citationCheck) {
-          // The pre-check is off on the last safety attempt and with an unreadable ledger.
-          throw new Error("Hatch citation pre-check reached the safety cap");
+        if (capped && (finalization.citationCheck || finalization.workerCheckFailure)) {
+          // Both host checks are off on the last safety attempt and with an unreadable ledger.
+          throw new Error("Hatch host check reached the safety cap");
         }
         if (capped) {
           const failed = recoveringExactCommit
@@ -621,6 +661,20 @@ export class HatchBuildItemRunner {
             cap: safetyCap,
             evidenceHash: finalization.citationCheck.evidenceHash,
             findings: finalization.citationCheck.findings,
+          }];
+          continue;
+        }
+        if (finalization.workerCheckFailure) {
+          // Like the pre-check, a kickback has no commit and no verification.
+          requiredCheckIds.add(finalization.workerCheckFailure.check.id);
+          feedback = [{
+            kind: "worker-check-failure",
+            gate: "safety-gate",
+            attempt: safetyAttempts,
+            cap: safetyCap,
+            evidenceHash: finalization.workerCheckFailure.evidenceHash,
+            check: finalization.workerCheckFailure.check,
+            findings: finalization.workerCheckFailure.findings,
           }];
           continue;
         }

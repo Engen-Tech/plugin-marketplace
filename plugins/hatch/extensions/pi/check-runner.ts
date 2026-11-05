@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import {
   hashCheckCommand,
@@ -100,6 +100,20 @@ async function stopProcessTree(pid: number | undefined, force = false): Promise<
   }
 }
 
+function cwdFailure(command: string, cwd: string, problem: string): UnboundCheckResult {
+  return {
+    commandHash: hashCheckCommand(command),
+    cwd,
+    status: "failed",
+    code: null,
+    stdout: "",
+    stderr: `Hatch did not run the command: ${problem}.`,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    durationMs: 0,
+  };
+}
+
 export async function runBoundCheck(options: RunCheckOptions): Promise<UnboundCheckResult> {
   if (!options.command.trim() || options.command.length > 16 * 1024) {
     throw new Error("Hatch check command is empty or too long");
@@ -107,8 +121,22 @@ export async function runBoundCheck(options: RunCheckOptions): Promise<UnboundCh
   const commandCwd = options.cwd ?? ".";
   validateRelativeCwd(commandCwd);
   const worktree = await realpath(options.worktree);
-  const cwd = await realpath(resolve(worktree, commandCwd));
+  // A cwd missing from the worktree, or one that is not a directory, is a failed check
+  // with no exit code, not a host error: the command could not run where it was told to.
+  // A worker that proposed it gets it back; a binder oracle with it halts cleanly. A cwd
+  // that resolves outside the worktree stays a hard error below.
+  let cwd: string;
+  try {
+    cwd = await realpath(resolve(worktree, commandCwd));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+    return cwdFailure(options.command, commandCwd, `cwd '${commandCwd}' does not exist in the worktree`);
+  }
   if (!isInside(worktree, cwd)) throw new Error(`Hatch check cwd escapes the worktree: ${commandCwd}`);
+  if (!(await stat(cwd)).isDirectory()) {
+    return cwdFailure(options.command, commandCwd, `cwd '${commandCwd}' is not a directory in the worktree`);
+  }
   const timeout = options.timeout ?? DEFAULT_TIMEOUT;
   if (!Number.isInteger(timeout) || timeout <= 0) {
     throw new Error("Hatch check timeout must be a positive integer");

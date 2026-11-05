@@ -184,6 +184,9 @@ function checkProposalsViolation(checks: unknown[]): string | null {
       return `${at}.id must be lowercase letters, digits and hyphens, starting with a letter`;
     }
     if (check.id === "oracle") return `${at}.id must not be "oracle"; the host owns that check`;
+    if (check.id.startsWith("environment-")) {
+      return `${at}.id must not start with "environment-"; the host owns the environment checks`;
+    }
     if (ids.has(check.id)) return `${at}.id "${check.id}" is a duplicate`;
     if (typeof check.command !== "string" || !check.command.trim()) {
       return `${at}.command must be a non-empty string`;
@@ -316,9 +319,11 @@ The host owns staging, secret scanning, acceptance commands, gates, commits, tag
 When a \`HATCH-SME-OVERRIDE\` rationale cites a repo rule, write the citation as \`${REPO_RULE_CITATION_SHAPE}\` with a colon directly after the path, for example \`repo-rule: AGENTS.md:Error handling\`; the host reads no other form and sends any other back as an undeclared override.
 
 Return exactly one JSON object and no prose using this envelope:
-{"schema":"${WORKER_SCHEMA}","role":"build-worker","binder":"<bound binder>","item":"<bound item>","roleDefinitionHash":"${profile.role.definitionHash}","profileHash":"${profile.profileHash}","outcome":"ready|no-change|blocked","summary":"plain-language result","checks":[{"id":"stable-floor-id","command":"exact command to rerun","cwd":"repo-relative cwd"}]}
+{"schema":"${WORKER_SCHEMA}","role":"build-worker","binder":"<bound binder>","item":"<bound item>","roleDefinitionHash":"${profile.role.definitionHash}","profileHash":"${profile.profileHash}","outcome":"ready|no-change|blocked","summary":"plain-language result","checks":[{"id":"stable-floor-id","command":"exact command to rerun","cwd":"."}]}
 
-List every final lint, test, type-check, build, or other project-floor command you used and the host must rerun. Do not include the binder oracle; the host adds it. This list is an untrusted proposal, never proof that a command passed.`;
+List every final lint, test, type-check, build, or other project-floor command you used and the host must rerun. Do not include the binder oracle; the host adds it. This list is an untrusted proposal, never proof that a command passed.
+
+The host runs each \`command\` through the shell with \`cwd\`, relative to the worktree root, as its working directory. A command that sets its own directory (\`--directory\`, \`--prefix\`, \`-C\`, \`cd\`) must use \`cwd: "."\`; never pair it with the subdirectory it already targets. Propose each check exactly as you ran it: the same command from the same directory. When a check you proposed fails or times out at the host, it comes back to you in feedback with its command, cwd, exit code and output. Then fix the code, or correct only how the check is invoked (its \`cwd\` or directory flag) so it runs what it ran before, and re-propose a check with the same \`id\`, or the item halts blocked. Never weaken or replace what a check verifies to make it pass.`;
 }
 
 export type WorkerInstructionLoader = (

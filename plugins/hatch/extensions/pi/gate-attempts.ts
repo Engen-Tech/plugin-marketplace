@@ -39,9 +39,13 @@ export interface HatchGateAttemptRecord {
   evidenceHash: string;
   findings: { severity: "critical" | "major" | "minor"; code: string; path?: string; line?: number }[];
   recordedAt: string;
-  // Set on a row the host wrote without a gate run: the build-time citation pre-check.
-  source?: "host-citation-check";
+  // Set on a row the host wrote without a gate run: the build-time citation pre-check,
+  // or a failed check the worker proposed and the host reran.
+  source?: HatchHostCheckSource;
 }
+
+export type HatchHostCheckSource = "host-citation-check" | "host-worker-check";
+const HOST_CHECK_SOURCES = new Set<unknown>(["host-citation-check", "host-worker-check"]);
 
 export const GATE_ATTEMPT_CAPS = { acceptance: 2, safety: 3 } as const;
 
@@ -158,7 +162,7 @@ function toRecord(row: LedgerRow): HatchGateAttemptRecord | undefined {
     evidenceHash: String(row.evidence_hash),
     findings: Array.isArray(row.findings) ? (row.findings as HatchGateAttemptRecord["findings"]) : [],
     recordedAt: String(row.recorded_at),
-    ...(row.source === "host-citation-check" ? { source: "host-citation-check" as const } : {}),
+    ...(HOST_CHECK_SOURCES.has(row.source) ? { source: row.source as HatchHostCheckSource } : {}),
   };
 }
 
@@ -217,7 +221,7 @@ async function appendRow(
     hostVerdict?: true;
     evidenceHash: string;
     findings: readonly HatchGateFinding[];
-    source?: "host-citation-check";
+    source?: HatchHostCheckSource;
   },
 ): Promise<HatchGateAttemptRecord> {
   const gate = gateFileFor(entry.role);
@@ -319,20 +323,26 @@ export async function recordVerification(
   return written;
 }
 
-// The build-time citation pre-check sends an item back before any gate runs. It applies
-// the safety auditor's own rule (a citation that does not check out leaves its override
-// undeclared) to bytes the host parsed, so it spends one safety attempt like a gate
-// concern: one counted row with every key a gate row has, marked by `source`.
+// Two host checks send an item back before any gate runs, and each spends one safety
+// attempt like a gate concern: one counted row with every key a gate row has, marked by
+// `source`. The citation pre-check (the default) applies the safety auditor's own rule (a
+// citation that does not check out leaves its override undeclared) to bytes the host
+// parsed. `host-worker-check` is a check the worker proposed that failed when the host
+// reran it; the worker wrote it, so the worker gets it back instead of the item halting.
 export async function recordHostCheck(
   repoRoot: string,
-  input: RowTarget & { evidenceHash: string; findings: readonly HatchGateFinding[] },
+  input: RowTarget & {
+    evidenceHash: string;
+    findings: readonly HatchGateFinding[];
+    source?: HatchHostCheckSource;
+  },
 ): Promise<HatchGateAttemptRecord> {
   return appendRow(await binderDir(repoRoot, input.binder), input, {
     role: "safety-gate",
     verdict: "concerns",
     evidenceHash: input.evidenceHash,
     findings: input.findings,
-    source: "host-citation-check",
+    source: input.source ?? "host-citation-check",
   });
 }
 

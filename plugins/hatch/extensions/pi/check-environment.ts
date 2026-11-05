@@ -504,7 +504,7 @@ export async function resolveInstallNeeds(
   return needs;
 }
 
-function excerptOf(result: { stdout?: string; stderr?: string } | undefined): string {
+export function excerptOf(result: { stdout?: string; stderr?: string } | undefined): string {
   const pick = (text: string | undefined) =>
     (text ?? "").split(/\r?\n/).map((line) => line.trimEnd()).filter((line) => line.trim());
   const stderr = pick(result?.stderr);

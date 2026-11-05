@@ -10,6 +10,7 @@ import {
   type HaltedCheckConvergenceResult,
   type HatchCheckPlanEntry,
 } from "./check-convergence.ts";
+import { excerptOf } from "./check-environment.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
 import {
   buildHatchEvidence,
@@ -73,10 +74,28 @@ export interface HatchBuildFinalizationResult {
   // Set when the citation pre-check sent the candidate back before any check or gate:
   // the preliminary evidence hash and one host-written finding per citation defect.
   citationCheck?: { evidenceHash: string; findings: HatchGateFinding[] };
+  // Set when a check the worker itself proposed failed or timed out when the host reran
+  // it, and the caller allowed the kickback: the worker wrote that check, so the worker
+  // gets it back. The binder oracle and the environment checks never set it.
+  workerCheckFailure?: HatchWorkerCheckFailure;
   // Set on an empty candidate whose already-present oracle probe changed the worktree
   // (tracked or untracked, not ignored); the host restored it to HEAD before returning.
   probeRestored?: boolean;
   message: string;
+}
+
+export interface HatchWorkerCheckFailure {
+  // The preliminary evidence hash of the candidate the check ran on.
+  evidenceHash: string;
+  check: {
+    id: string;
+    command: string;
+    cwd: string;
+    status: "failed" | "timed-out";
+    exitCode: number | null;
+    excerpt: string;
+  };
+  findings: HatchGateFinding[];
 }
 
 async function git(cwd: string, args: string[], allowFailure = false): Promise<string> {
@@ -227,9 +246,11 @@ function checkOutcome(convergence: HaltedCheckConvergenceResult, plan: HatchChec
   return command ? `\`${shownCommand(command)}\` ${code}.` : `It ${code}.`;
 }
 
-// A final check that failed in the item worktree. Nothing returns it to the worker:
-// build-runner halts any finalization no gate classified as retryable, so the message
-// says the item halts blocked and names the check, its command and exit code.
+// A final check that failed in the item worktree and is not going back to the worker:
+// the binder oracle, or a worker-proposed check once the kickback is off (the last safety
+// attempt, or an unreadable ledger). build-runner halts any finalization no gate or host
+// check classified as retryable, so the message says the item halts blocked and names
+// the check, its command and exit code.
 function finalCheckFailedMessage(
   convergence: HaltedCheckConvergenceResult,
   plan: HatchCheckPlanEntry[],
@@ -238,6 +259,54 @@ function finalCheckFailedMessage(
   return (
     `Final check '${id}' failed in the item worktree: ${checkOutcome(convergence, plan)} ` +
     "The item halts blocked, and no worker retry follows."
+  );
+}
+
+// A check the worker proposed that failed or timed out in the item worktree, described
+// for the worker. Only a plan entry with purpose "floor" qualifies: the host adds the
+// oracle with purpose "oracle", and the environment checks are never plan entries (the
+// worker envelope rejects an `environment-` id, so none can shadow one). Precondition-
+// unmet, aborted and non-converging halts are not a failing command the worker can correct.
+export function workerCheckFailureOf(
+  convergence: HaltedCheckConvergenceResult,
+  plan: HatchCheckPlanEntry[],
+  evidenceHash: string,
+): HatchWorkerCheckFailure | undefined {
+  if (convergence.status !== "failed" && convergence.status !== "timed-out") return undefined;
+  const id = convergence.check?.id;
+  const entry = plan.find((check) => check.id === id);
+  if (!id || !entry || entry.purpose !== "floor") return undefined;
+  const exitCode = convergence.check?.result.code ?? convergence.diagnosis?.exitCode ?? null;
+  const excerpt = convergence.diagnosis?.excerpt ?? excerptOf(convergence.check?.result);
+  const ran = exitCode === null ? "stopped without an exit code" : `exited ${exitCode}`;
+  return {
+    evidenceHash,
+    check: { id, command: entry.command, cwd: entry.cwd, status: convergence.status, exitCode, excerpt },
+    findings: [{
+      severity: "major",
+      code: "worker-check-failed",
+      message:
+        `Check '${id}', which the worker proposed, ${convergence.status === "timed-out" ? "timed out" : "failed"} ` +
+        `when the host reran it: \`${shownCommand(entry.command)}\` in cwd "${entry.cwd}" ${ran}.` +
+        (excerpt ? ` Output: ${excerpt}` : ""),
+      nextStep:
+        `The host runs the command through the shell with cwd as its working directory, relative to the worktree ` +
+        `root. A command that sets its own directory (--directory, --prefix, -C, cd) uses cwd ".". Fix the code, or ` +
+        `correct only how the check is invoked (its cwd or directory flag) so it runs what it ran before; never weaken ` +
+        `or replace what the check verifies. Run it exactly as you will propose it, and re-propose a check with id "${id}".`,
+    }],
+  };
+}
+
+// The kickback's own message: the item does not halt, the worker gets the check back.
+export function workerCheckKickbackMessage(failure: HatchWorkerCheckFailure): string {
+  const { id, command, exitCode, status } = failure.check;
+  const code = exitCode === null ? "without an exit code" : `exited ${exitCode}`;
+  const outcome = status === "timed-out" ? "timed out" : "failed";
+  return (
+    `Final check '${id}', which the worker proposed, ${outcome} in the item worktree: ` +
+    `\`${shownCommand(command)}\` ${code}. It goes back to the worker as a counted safety attempt; ` +
+    "the next worker must re-propose a check with the same id."
   );
 }
 
@@ -917,7 +986,7 @@ export class HatchBuildFinalizer {
     lease: DispatchLockLease,
     floorChecks: HatchCheckPlanEntry[] = [],
     processContext?: { manager: HatchProcessManager; owner: BinderLifecycleOwner },
-    options: { citationPrecheck?: boolean } = {},
+    options: { citationPrecheck?: boolean; workerCheckKickback?: boolean } = {},
   ): Promise<HatchBuildFinalizationResult> {
     if (!(await this.#locks.owns(lease))) {
       throw new Error("Hatch build finalization requires the active binder lock lease");
@@ -984,6 +1053,22 @@ export class HatchBuildFinalizer {
           : undefined,
       });
       if (convergence.status !== "stable") {
+        // The caller turns the kickback off on the last safety attempt and with an
+        // unreadable ledger; then a failed worker check halts below like any other.
+        const workerCheckFailure = options.workerCheckKickback
+          ? workerCheckFailureOf(convergence, checkPlan, preliminaryEvidence.evidenceHash)
+          : undefined;
+        if (workerCheckFailure) {
+          return {
+            status: "retry",
+            binder,
+            item,
+            targetTree: convergence.targetTree,
+            checkFailure: convergence,
+            workerCheckFailure,
+            message: workerCheckKickbackMessage(workerCheckFailure),
+          };
+        }
         return {
           status: convergence.status === "failed" ? "retry" : "blocked",
           binder,

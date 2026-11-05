@@ -613,7 +613,11 @@ function attemptLine(index: number, rows: readonly HatchGateAttemptRecord[]): st
     const findings = row.verdict === "concerns" && row.findings.length > 0
       ? `: ${row.findings.map(findingLabel).join(", ")}`
       : "";
-    const label = row.source === "host-citation-check" ? `${GATE_NAMES[row.role]} (host citation check)` : GATE_NAMES[row.role];
+    const label = row.source === "host-citation-check"
+      ? `${GATE_NAMES[row.role]} (host citation check)`
+      : row.source === "host-worker-check"
+        ? `${GATE_NAMES[row.role]} (host worker check)`
+        : GATE_NAMES[row.role];
     return `${label} ${row.verdict}${findings}`;
   }).join(" · ");
   return clipText(`  ${index}. ${first.phase.padEnd(5)}  ${where.padEnd(22)}  ${verdicts}`, ATTEMPT_LINE_LIMIT);
