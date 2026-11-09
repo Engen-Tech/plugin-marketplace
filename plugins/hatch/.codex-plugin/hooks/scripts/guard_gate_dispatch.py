@@ -375,6 +375,10 @@ def _run_self_test() -> int:
         repo = str(Path(td) / "repo")
         Path(repo).mkdir()
         run("git", "init", "-q", cwd=repo)
+        # This repo is copied with shutil.copytree below; a commit may start git's
+        # background maintenance, whose .git/objects/maintenance.lock can vanish mid-copy.
+        run("git", "config", "maintenance.auto", "false", cwd=repo)
+        run("git", "config", "gc.auto", "0", cwd=repo)
         run("git", "config", "user.email", "t@example.com", cwd=repo)
         run("git", "config", "user.name", "t", cwd=repo)
         (Path(repo) / "a.txt").write_text("one\n", encoding="utf-8")

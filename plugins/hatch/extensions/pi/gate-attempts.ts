@@ -92,14 +92,14 @@ export function gateFileFor(role: HatchGateRole): GateFile {
   return role === "safety-gate" ? "safety" : "acceptance";
 }
 
-function safeName(kind: string, value: string): string {
+export function safeName(kind: string, value: string): string {
   if (!SAFE_NAME.test(value) || value.includes("..")) {
     throw new Error(`Hatch gate-attempt ledger: ${kind} ${JSON.stringify(value)} is not a plain name (letters, digits, '.', '_', '-')`);
   }
   return value;
 }
 
-async function binderDir(repoRoot: string, binder: string): Promise<string> {
+export async function binderDir(repoRoot: string, binder: string): Promise<string> {
   const { stdout } = await exec("git", hostGitArgs(repoRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
   return join(stdout.trim(), "hatch", "attempts", safeName("binder slug", binder));
 }
@@ -346,7 +346,8 @@ export async function recordHostCheck(
   });
 }
 
-// The human's "start over" restarts the counts for every item of the binder.
+// The human's "start over" restarts the counts for every item of the binder, and removes
+// each item's floor cache file, which lives in the same folder (floor-cache.ts).
 export async function clearBinderAttempts(repoRoot: string, binder: string): Promise<void> {
   await rm(await binderDir(repoRoot, binder), { recursive: true, force: true });
 }

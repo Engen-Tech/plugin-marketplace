@@ -62,7 +62,8 @@ import tempfile
 CAPS = {"acceptance": 2, "safety": 3}
 CAP_ACTION = {
     "acceptance": ("halt the item with a call to action (a `failed` ref, not done) — no human "
-                   "escalation from this gate"),
+                   "escalation from this gate; on Pi the halt prompt also offers Send back to the "
+                   "worker once, which waives nothing and leaves the cap spent"),
     "safety": "escalate to the human — an unjustified boundary crossing needs a person's decision",
 }
 VERDICTS = ("pass", "concerns", "blocked")

@@ -62,7 +62,9 @@ export default async function hatchPi(extension: ExtensionAPI): Promise<void> {
   const verification = new HatchVerificationRunner(gatePreflight, children, dispatchLocks);
   const workers = new HatchBuildWorkerRunner(children);
   const finalizer = new HatchBuildFinalizer(dispatchLocks, verification);
-  const buildItems = new HatchBuildItemRunner(dispatchLocks, workers, finalizer, processes);
+  // Every build and delivery probes the gate models at its start, on the run's context.
+  const probeGates = (ctx: ExtensionContext) => verification.probeGateModels(ctx);
+  const buildItems = new HatchBuildItemRunner(dispatchLocks, workers, finalizer, processes, undefined, probeGates);
   const integrations = new HatchIntegrationRunner(dispatchLocks, verification);
   const waves = new HatchWaveRunner(dispatchLocks);
   const writers = new HatchWriterRunner(children);
@@ -76,6 +78,7 @@ export default async function hatchPi(extension: ExtensionAPI): Promise<void> {
     workers,
     waves,
     companions,
+    probeGates,
   );
   const runs = new HatchRunRegistry();
   const runHost = new HatchRunHost({ extension, registry: runs });

@@ -522,13 +522,13 @@ def run_oracle(
             exit_status = 2
             timed_out = False
         else:
-            reader = _start_reader(capture, proc.stdout)
             # One budget covers the shell and the pipe drain: a descendant
             # still writing (or holding the pipe) at the deadline is a hang,
             # exactly as if the shell itself had not exited.
             deadline = time.monotonic() + timeout
             pipe_held = False
             try:
+                reader = _start_reader(capture, proc.stdout)
                 proc.wait(timeout=timeout)
                 exit_status = proc.returncode
                 reader.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -539,11 +539,13 @@ def run_oracle(
             except subprocess.TimeoutExpired:
                 timed_out = True
                 exit_status = 1
-            # setsid made the shell's pid the group id. Kill the group on every
-            # path so no descendant outlives the run and changes the tree after
-            # the post-run hash (the Windows job object does the same).
-            with contextlib.suppress(ProcessLookupError, OSError):
-                os.killpg(proc.pid, signal.SIGKILL)
+            finally:
+                # setsid made the shell's pid the group id. Kill the group on
+                # every path, a signal to this runner included, so no descendant
+                # outlives the run and changes the tree after the post-run hash
+                # (the Windows job object does the same).
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=10)
             reader.join(timeout=10)
@@ -762,6 +764,74 @@ def _run_self_test() -> int:
             capture_output=True, text=True, timeout=30, encoding="utf-8")
         check("CLI maps command nonzero to runner exit 1",
               cli.returncode == 1 and json.loads(cli.stdout)["exit_status"] == 7)
+
+        # (f3) a stopped runner stops its command. Real CLI, real signals, real group.
+        if os.name != "nt":
+            import shlex
+
+            def group_alive(pgid: int) -> bool:
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    return False
+                return True
+
+            def stop_runner(sig: signal.Signals, disposition=None) -> tuple[int, int, Path]:
+                """Start the CLI on a command that would write a marker, signal the runner
+                with `sig` set to `disposition` at its start, and wait for it. The marker's
+                writer is a backgrounded descendant that publishes the group file itself, so
+                killing only the shell leaves it running. (runner exit, group, marker)."""
+                work = tmp_root / f"stopped-{sig.name}-{disposition}"
+                work.mkdir()
+                group_file, marker = work / "group", work / "marker"
+                command = (f"echo $$ > {shlex.quote(str(group_file))}.tmp; "
+                           f"(mv {shlex.quote(str(group_file))}.tmp {shlex.quote(str(group_file))}; "
+                           f"sleep 2; touch {shlex.quote(str(marker))}) & wait")
+
+                def set_disposition() -> None:
+                    if disposition is not None:
+                        signal.signal(sig, disposition)
+
+                with subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), "--cwd", str(work), command],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    preexec_fn=set_disposition) as runner:
+                    deadline = time.monotonic() + 30
+                    while not group_file.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    group = int(group_file.read_text(encoding="utf-8"))
+                    runner.send_signal(sig)
+                    return runner.wait(timeout=30), group, marker
+
+            def gone_within(pgid: int, seconds: float) -> bool:
+                deadline = time.monotonic() + seconds
+                while group_alive(pgid) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                return not group_alive(pgid)
+
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                code, group, marker = stop_runner(sig, signal.SIG_DFL)
+                gone = gone_within(group, 10)
+                # The group held the only writer, so once it is gone the marker cannot appear.
+                check(f"{sig.name} to the runner stops its command's process group",
+                      code == 128 + sig and gone and not marker.exists(),
+                      f"exit={code} gone={gone} marker={marker.exists()}")
+
+            # `nohup` and a shell's `&` start the runner with these ignored. That stands.
+            for sig in (signal.SIGINT, signal.SIGHUP):
+                code, _group, marker = stop_runner(sig, signal.SIG_IGN)
+                check(f"{sig.name} ignored at the runner's start stays ignored",
+                      code == 0 and marker.exists(), f"exit={code} marker={marker.exists()}")
+
+            # Negative control: nothing can catch SIGKILL, so the command outlives the
+            # runner. It proves the probes above see a survivor and that the marker
+            # command does finish when no one stops it.
+            code, group, marker = stop_runner(signal.SIGKILL)
+            survived = group_alive(group)
+            gone_within(group, 30)
+            check("control: a command outliving a SIGKILLed runner is visible to the probes",
+                  code == -signal.SIGKILL and survived and marker.exists(),
+                  f"exit={code} survived={survived} marker={marker.exists()}")
         if os.name == "nt":
             batch = tmp_root / "script space & quote" / "npm.cmd"
             batch.write_bytes(b"@echo off\r\necho BATCH-%1\r\nexit /b 0\r\n")
@@ -1138,6 +1208,10 @@ def _run_self_test() -> int:
 # --- CLI -----------------------------------------------------------------
 
 
+def _exit_on_signal(signum: int, _frame) -> None:
+    raise SystemExit(128 + signum)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=(
@@ -1182,6 +1256,14 @@ def main(argv: list[str] | None = None) -> int:
     if not cwd.exists():
         print(f"run_oracle: --cwd does not exist: {cwd}", file=sys.stderr)
         return 2
+
+    # The command runs in its own session, so a signal to this runner never reaches
+    # it. These become an exit that passes through run_oracle's kill. A signal ignored
+    # at the start (`nohup`, a shell's `&`) stays ignored.
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None and signal.getsignal(sig) != signal.SIG_IGN:
+            signal.signal(sig, _exit_on_signal)
 
     record = run_oracle(args.command, cwd, args.expect, args.expect_re, args.timeout)
 

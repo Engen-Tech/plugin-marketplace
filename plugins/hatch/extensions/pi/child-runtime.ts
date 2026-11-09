@@ -180,6 +180,7 @@ export async function createIsolatedResourceLoader(
   cwd: string,
   systemPrompt: string,
   agentDir = getAgentDir(),
+  options: { noAppendSystemPrompt?: boolean } = {},
 ): Promise<{ loader: DefaultResourceLoader; settings: SettingsManager }> {
   const settings = SettingsManager.inMemory();
   const loader = new DefaultResourceLoader({
@@ -192,6 +193,10 @@ export async function createIsolatedResourceLoader(
     noThemes: true,
     noContextFiles: true,
     systemPrompt,
+    // An empty list stops Pi discovering <cwd>/.pi/APPEND_SYSTEM.md and
+    // <agentDir>/APPEND_SYSTEM.md. A gate child's cwd is the worktree under
+    // review, so without this the diff could write into its own gate prompt.
+    ...(options.noAppendSystemPrompt ? { appendSystemPrompt: [] } : {}),
   });
   await loader.reload();
   return { loader, settings };
@@ -314,7 +319,9 @@ async function createChild(
   target?: ChildModelTarget,
 ): Promise<{ session: AgentSession; report: ChildRuntimeReport }> {
   const { runtime, model, report } = await createMirroredModelRuntime(ctx, policy, target);
-  const { loader, settings } = await createIsolatedResourceLoader(cwd, systemPrompt);
+  const { loader, settings } = await createIsolatedResourceLoader(cwd, systemPrompt, undefined, {
+    noAppendSystemPrompt: policy === "gate",
+  });
   const requestedThinkingLevel = target?.thinkingLevel ?? ctx.thinkingLevel ?? "minimal";
   const { session } = await createAgentSession({
     cwd,
@@ -458,7 +465,10 @@ function forRole(
 }
 
 export class GateProviderPreflight {
-  readonly #successful = new Map<string, ChildRuntimeReport>();
+  // A success is kept with the context that proved it. A run's context lives for that run,
+  // so a later run probes again: a quota that ran out between runs is never hidden. Each
+  // key holds the context of its latest success until clear() at shutdown.
+  readonly #successful = new Map<string, { report: ChildRuntimeReport; ctx: ExtensionContext }>();
   readonly #pending = new Map<string, Promise<ChildRuntimeReport>>();
   readonly #probe: GatePreflightProbe;
   #generation = 0;
@@ -501,7 +511,9 @@ export class GateProviderPreflight {
   ): Promise<GateProviderPreflightReport> {
     const key = this.#key(ctx, target);
     const successful = this.#successful.get(key);
-    if (successful) return { ...forRole(ctx, successful, target), cached: true };
+    if (successful?.ctx === ctx) return { ...forRole(ctx, successful.report, target), cached: true };
+    // A run may join another run's in-flight probe. That probe is fresh, and its success is
+    // stored only under the context that started it, so the joining run's gates probe again.
     const pending = this.#pending.get(key);
     if (pending) return { ...forRole(ctx, await pending, target), cached: true };
 
@@ -510,7 +522,7 @@ export class GateProviderPreflight {
     this.#pending.set(key, probe);
     try {
       const report = await probe;
-      if (generation === this.#generation) this.#successful.set(key, report);
+      if (generation === this.#generation) this.#successful.set(key, { report, ctx });
       return { ...forRole(ctx, report, target), cached: false };
     } finally {
       this.#pending.delete(key);

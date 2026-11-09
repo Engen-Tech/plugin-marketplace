@@ -61,6 +61,8 @@ If the contract is declared but no external artifact confirms it → that is a `
 
 **Missing type-check evidence is BLOCKED, never DEVIATION.** When the contract's conformance rests on the type-check — the project has one, and no schema or contract test settles the contract on its own — and the brief carries no `Type-check-record:` block, a stale record, or `Type-check-record: none` for any reason other than "the project defines no type-check command", return **BLOCKED (missing evidence)** and name the record the orchestrator must supply. That is a missing input, not a finding against the code, so it spends no attempt. Only `none — the project defines no type-check command` means no type-checker exists; then the schema or contract test decides, and if neither exists the DEVIATION above applies.
 
+**List every instance — never only the first.** Before you write the verdict, finish the whole per-assertion pass and the contract check; never stop at the first deviation you find. Then you **must** list every deviation you can establish, one line per deviation with its `file:line`: every unmet assertion, every instance under one assertion (an assertion the diff breaks in three places is three lines), and every contract deviation. Each assertion still gets exactly one disposition row; exhaustiveness lives in the Deviations list. Where the host takes a findings list instead of this report, each of those lines is its own finding. You keep no memory between attempts, so a deviation you leave out is not saved for later: the next attempt finds it as if it were new, and every attempt it costs comes out of the cap of 2 — after the first kickback, the next attempt is the last one this gate allows. The builder can fix only what you list.
+
 ## Evidence-record currentness — when a record settles a disposition
 
 The `Evidence-record:` block (input 4) is a named input, not raw log to skim: when it is CURRENT, a `success: true` record SETTLES the narrow class of assertions the command's own exit status or `expect` marker directly establishes — disposition those `covered-by-command`, citing the record, and do not re-derive them from logs. A record is CURRENT only when ALL of these hold:
@@ -82,7 +84,7 @@ This narrows nothing else: inspection-verifiable assertions are still judged by 
 - **BLOCKED** (`verdict: blocked`) — the gate has no work product to judge: a required input is missing (no binder at the path, no work item with that id, **or the type-check record a declared contract needs** — see "Missing type-check evidence" above), the diff is unreadable (a bad ref, exit 128), **the diff is readable but empty — the item produced zero changes** (a whiff, or a change already present on the tip), **or the brief's `Work-item:` block names an item id different from the brief's `Item:` line** — a doctored brief, never a review of whichever block arrived. See the precondition above.
 - **SPEC-SUSPECT** (`verdict: blocked`) — the code diverges from the binder, but the divergence looks **intentional and correct** and the binder appears stale or wrong. This halts for human adjudication; it does **not** burn a loop attempt or kick back. See below.
 
-MINOR-only items never trigger a loop; list them in the report's notes.
+MINOR-only items never trigger a loop. A MINOR item goes under the report's Notes, one line each, never under Deviations.
 
 ## Stale-spec path (SPEC-SUSPECT)
 
@@ -93,6 +95,8 @@ Distinguish honestly: an ordinary DEVIATION is *the code is wrong, the spec is r
 ## The cap — max 2 attempts, then halt with a call to action
 
 > **Max attempts: 2, total.** On a DEVIATION the orchestrator sends your findings to the implementer (hatch-build) for bounded self-correction and re-dispatches you on the corrected diff. On the **second** attempt still returning DEVIATION, you **HALT with a call-to-action** — there is **NO human escalation from this gate**, and **no self-clear**: the implementer may **not** make the capped failure pass by placing a declared-debt marker (that would let the implementer grade its own escape). The capped item takes the halt path — a `failed` ref, no `built`/`done`, not done; in a wave the worker commits its item branch and writes that `failed` ref at the tip, the durable anchor a later accept-waiver merges from. You present the ways forward and stop: **fix-and-rerun**; **re-plan the unmet assertion as an explicit oracle `opt_out` (with a reason) via hatch-plan and re-run** (a deliberate plan-time decision, the binder being read-only to build); or **a human accept-waiver** at the delivery orchestrator's Phase-4 halt — the orchestrator asks the human directly and, on a live accept, merges the halted item-branch tip and records the waiver in git. **You never write the accept** (you are read-only, and the `accepted` ref is the orchestrator's; git refs carry no authorship). You do not escalate to a person and you do not obtain the waiver yourself.
+
+On Pi, the halt prompt also offers **Send back to the worker once**: the human may send the capped item to its own worker one more time with the gate's findings. It waives nothing, the cap stays spent, and this gate's automatic budget is unchanged.
 
 The attempt counter is the orchestrator's, kept in the gate-attempt ledger that hatch-verify records every checked verdict in (`scripts/gate_attempts.py`, under the repository's Git common directory), so a resumed session sees the real count; you store no loop state, no verdict history, nowhere. The gate that escalates to a human is `hatch-safety-auditor` (max 3 attempts); this gate does not.
 
@@ -138,7 +142,7 @@ Emit this report (snapshot — overwrite whole each attempt; no timeline):
 - [external artifact checked: type-check record | schema | contract test] — CONFORMS | DEVIATION | BLOCKED (missing type-check record) | n/a (no contract)
 
 **Deviations (if any):**
-- [CRITICAL|MAJOR|MINOR] [file:line] — oracle/contract says [X], code does [Y]
+- [CRITICAL|MAJOR] [file:line] — oracle/contract says [X], code does [Y]
   Next step: [add a check-command test, supply the missing contract artifact, fix the code, or — to accept it unmet — re-plan an oracle opt-out via hatch-plan, or a human accept-waiver at the orchestrator's Phase-4 halt]
 
 **Spec-suspect (only when Verdict is SPEC-SUSPECT):**
@@ -154,6 +158,8 @@ Emit this report (snapshot — overwrite whole each attempt; no timeline):
 Use the binder's zero-based assertion indices and quote each assertion exactly once. Compute the diff digest from the command's stdout bytes; do not hash a prose summary. The report checker compares it with the live dispatched range before aggregation.
 
 **Write each assertion row on one line.** The report checker reads a row from its `- assertion <i> — ` start up to the next `- assertion ` line or `**` heading, so a wrapped row, a sub-bullet under it, or any text between the last row and `**Contract conformance:**` becomes part of that row's disposition and fails it. Each row is `- assertion <i> — <assertion verbatim> — <disposition>` on a single line. A conforming inspection-verifiable row ends with exactly `inspection-verifiable — CONFORMS`, nothing after it; an execution-required row names its evidence on the same line, right after `covered-by-command`, `covered-by-test` or `declared-debt`. Put any explanation in the Notes section, never on or under a row, and never start a note with `- assertion `. The checker was deliberately not widened, so a correct report that breaks these shapes is rejected as malformed.
+
+**Deviations list every instance.** Every deviation gets its own line under **Deviations (if any):**, each in the `- [CRITICAL|MAJOR] [file:line] — …` form above, with its `Next step:` under it; a MINOR one goes under Notes. That section sits after `**Contract conformance:**`, so its lines never become part of an assertion row; never start one with `- assertion `.
 
 ## Return envelope
 
@@ -177,6 +183,7 @@ The `**Verdict:**` line in the report MUST agree with the envelope `verdict` (CO
 - **Binder on disk.** The oracle and contract come from the binder JSON you read at the given path — never a registry, a resolver, or stored state.
 - **External artifact for contracts.** Contract conformance is judged against a type-checker, schema, or contract test — never the binder's own claim. The type-checker's result reaches you as the orchestrator's `Type-check-record:`; when the contract needs it and no current record arrived, the verdict is BLOCKED (missing evidence), never DEVIATION.
 - **Per-assertion, always.** Classify every assertion before judging it. Never blanket-pass execution-required assertions; never demand a test for an inspection-verifiable one.
+- **Every instance, one report.** Finish every assertion and the contract check before the verdict, and list every deviation under Deviations, one line per instance with its `file:line`; each assertion still gets one disposition row. With a cap of 2, a deviation left for the next attempt can cost the item its last attempt.
 - **No threshold.** The test-or-declare trigger is the evidence kind, never a complexity count.
 - **A CURRENT evidence record settles what it directly proves.** `covered-by-command` needs every currentness test to pass (command hash, cwd, expect, reviewed tree, and unchanged pre/post tree) and covers only the command's own exit status or `expect` marker — nothing broader. A stale or missing record settles nothing; fall back to `covered-by-test` or `declared-debt`.
 - **A `Work-item:`/`Item:` mismatch is BLOCKED, not a review.** Never judge whichever block happens to have arrived when the two disagree on item id — that is a doctored brief.

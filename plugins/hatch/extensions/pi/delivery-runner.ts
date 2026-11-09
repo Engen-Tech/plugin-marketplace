@@ -21,8 +21,10 @@ import {
   type ProcessContext,
 } from "./companion-runner.ts";
 import { hostGitArgs } from "./worker-attestation.ts";
+import { haltDisclosure, haltReason, readHaltView } from "./halt-record.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
 import { readEnvironmentConfig } from "./environment.ts";
+import { lookupFloorCache } from "./floor-cache.ts";
 import {
   clearBinderAttempts,
   gateFileFor,
@@ -34,7 +36,7 @@ import {
   type HatchGatePhase,
   type HatchGateRole,
 } from "./gate-attempts.ts";
-import { effectiveGateVerdict, hostNextStepWithRerun } from "./gate-runner.ts";
+import { effectiveGateVerdict, hostNextStepWithRerun, type HatchGateFinding } from "./gate-runner.ts";
 import { deriveItemGitState, isItemMergeSubject } from "./git-state.ts";
 import type { HatchIntegrationResult, HatchIntegrationRunner } from "./integration-runner.ts";
 import { hostBlockedGate, type HatchVerificationResult } from "./verification-runner.ts";
@@ -42,6 +44,8 @@ import { validateCandidateHooks, validateMergeHooks } from "./hook-runner.ts";
 import { HatchProcessManager, type BinderLifecycleOwner } from "./process-manager.ts";
 import {
   safeProgress,
+  type HatchFloorListReused,
+  type HatchRunEvent,
   type HatchRunEventCheck,
   type HatchRunProgress,
   type HatchWaveNext,
@@ -491,26 +495,43 @@ function buildHaltReason(build: HatchBuildItemResult): string {
  */
 function noChangeHaltReason(
   item: string,
-  phase: "build" | "merge",
+  phase: HatchGatePhase,
   role: HatchGateRole | undefined,
   tip: string,
   words: string,
+  what: "kickback" | "send-back" = "kickback",
 ): string {
   const gate = role ? ` ${GATE_NAMES[role]}` : "";
   return (
-    `Item '${item}' ${phase}-time${gate} kickback changed nothing, so the review of ` +
+    `Item '${item}' ${phase}-time${gate} ${what} changed nothing, so the review of ` +
     `${shortSha(tip)} stands and no automatic retry follows. The worker said: "${clipText(words.replace(/\s+/g, " ").trim(), 500)}"`
   );
 }
 
+/** The event a settled build reports: halted with its reason, or built. */
+function buildEvent(wave: number | undefined, build: HatchBuildItemResult): HatchRunEvent {
+  const at = wave !== undefined ? { wave } : {};
+  return BUILD_HALT_STATUSES.includes(build.status)
+    ? {
+        kind: "item-halted",
+        ...at,
+        item: build.item,
+        status: build.status,
+        reason: buildHaltReason(build),
+        ...withCheck(eventCheck(checkDiagnosis(build.finalization?.checkFailure))),
+      }
+    : { kind: "item-built", ...at, item: build.item, status: build.status, attempts: build.attempts };
+}
+
 /** A failed build's halt reason and the gate whose cap it spent; a no-change halt spent none. */
 function failedBuildHalt(build: HatchBuildItemResult): { reason: string; gate?: HaltGate } {
-  const role = verificationConcern(build.finalization?.verification);
+  const verification = build.finalization?.verification;
+  const role = verificationConcern(verification);
   if (build.noChange) {
     const words = build.worker?.summary ?? build.message;
     return { reason: noChangeHaltReason(build.item, "build", role, build.commit ?? "", words) };
   }
-  return { reason: buildHaltReason(build), ...(role ? { gate: { role, phase: "build" } } : {}) };
+  return { reason: buildHaltReason(build), ...(role ? { gate: { role, phase: "build", verification } } : {}) };
 }
 
 /** The diagnosis of a halted check, when the convergence carries one. */
@@ -546,10 +567,123 @@ type HatchItemAttempts = Awaited<ReturnType<typeof readAttempts>>;
 /** An item's ledger as read for a prompt or a result: the attempts, or why they could not be read. */
 type ItemAttemptsRead = HatchItemAttempts | { error: string };
 
-/** The gate whose spent cap halted an item, named where the halt happened. */
+/** The gate whose spent cap halted an item, named where the halt happened, and the review that spent it. */
 interface HaltGate {
   role: HatchGateRole;
   phase: HatchGatePhase;
+  verification?: HatchVerificationResult;
+  // The integration tip and merge tree a merge-time review judged.
+  merge?: { integrationTip: string; mergeTree: string };
+}
+
+/** The prompt's label for sending a cap-halted item back to its own worker once more. */
+const SEND_BACK_CHOICE = "Send back to the worker once";
+
+type BriefFinding = Pick<HatchGateFinding, "severity" | "code" | "path" | "line"> & Partial<Pick<HatchGateFinding, "message" | "nextStep">>;
+
+/** The review whose findings go back to a worker. */
+interface FindingsReview {
+  findings: readonly BriefFinding[];
+  evidenceHash?: string;
+  citationDefects?: HatchVerificationResult["citationDefects"];
+  merge?: { integrationTip: string; mergeTree: string };
+}
+
+/**
+ * What a worker gets with a review's findings, the same for a merge kickback and a
+ * send-back: the reviewed tip; for a merge-time review the integration tip, merge base and
+ * merge tree; the evidence hash; the findings' structured fields only; and the host-proven
+ * citation defects, so the worker sees the exact lines when a finding is vague. No gate
+ * summary, no earlier attempt, no worker narrative.
+ */
+async function findingsBrief(
+  repoRoot: string,
+  head: Record<string, unknown>,
+  itemTip: string,
+  review: FindingsReview,
+): Promise<Record<string, unknown>> {
+  const merge = review.merge;
+  return {
+    ...head,
+    itemTip,
+    ...(merge
+      ? {
+          integrationTip: merge.integrationTip,
+          mergeBase: await git(repoRoot, ["merge-base", merge.integrationTip, itemTip]),
+          mergeTree: merge.mergeTree,
+        }
+      : {}),
+    ...(review.evidenceHash ? { evidenceHash: review.evidenceHash } : {}),
+    findings: review.findings.map((finding) => ({
+      severity: finding.severity,
+      code: finding.code,
+      ...(finding.path !== undefined ? { path: finding.path } : {}),
+      ...(finding.line !== undefined ? { line: finding.line } : {}),
+      ...(finding.message !== undefined ? { message: finding.message } : {}),
+      ...(finding.nextStep !== undefined ? { nextStep: finding.nextStep } : {}),
+    })),
+    ...(review.citationDefects && review.citationDefects.length > 0 ? { citationDefects: review.citationDefects } : {}),
+  };
+}
+
+/** What "Send back to the worker once" sends: the gate whose spent cap halted the item, and that review. */
+interface SendBackOffer extends FindingsReview {
+  role: HatchGateRole;
+  phase: HatchGatePhase;
+  attempt: number; // the gate's counted concerns so far
+  cap: number;
+  // Set when the review comes from the attempt ledger, which keeps no finding text.
+  fromLedger?: true;
+}
+
+/**
+ * The send-back choice for a failed item, or undefined when no spent gate cap halted it.
+ * The ledger's own count decides that the cap is spent; an unreadable ledger file leaves
+ * the count unknown and caps every gate on its first concern, so the choice's text would
+ * not hold. A halt this run saw names its gate and review (`seen`); a no-change halt, a
+ * check failure and a host verdict name none. A halt from an earlier run has no cause in
+ * Git, so the newest review of the failed tip's own bytes decides: a merge or accept row
+ * names the tip, a build row (whose item tip is the parent of what it staged) reviewed
+ * its tree.
+ */
+export function sendBackOffer(
+  attempts: ItemAttemptsRead,
+  seen: boolean,
+  halt: HaltGate | undefined,
+  failedTip: { commit: string; tree: string },
+): SendBackOffer | undefined {
+  if (!("records" in attempts) || attempts.acceptance.error || attempts.safety.error) return undefined;
+  if (seen) {
+    const gate = halt?.verification?.gates[GATE_KEYS[halt.role]];
+    if (!halt || !gate || !attempts[gateFileFor(halt.role)].exhausted) return undefined;
+    const state = attempts[gateFileFor(halt.role)];
+    return {
+      role: halt.role,
+      phase: halt.phase,
+      attempt: state.counted,
+      cap: state.cap,
+      findings: gate.findings,
+      evidenceHash: halt.verification?.evidenceHash,
+      citationDefects: halt.verification?.citationDefects,
+      merge: halt.merge,
+    };
+  }
+  const reviews = attempts.records.filter((record) =>
+    record.phase === "build" ? record.reviewedTree === failedTip.tree : record.itemTip === failedTip.commit,
+  );
+  const row = attemptGroups(reviews).at(-1)?.find((record) => record.counted);
+  if (!row || !attempts[gateFileFor(row.role)].exhausted) return undefined;
+  const state = attempts[gateFileFor(row.role)];
+  return {
+    role: row.role,
+    phase: row.phase,
+    attempt: state.counted,
+    cap: state.cap,
+    findings: row.findings,
+    evidenceHash: row.evidenceHash,
+    ...(row.integrationTip ? { merge: { integrationTip: row.integrationTip, mergeTree: row.reviewedTree } } : {}),
+    fromLedger: true,
+  };
 }
 
 /**
@@ -656,10 +790,12 @@ function distinctCodesLine(records: readonly HatchGateAttemptRecord[], role: Hat
 
 /**
  * The fix/accept/defer prompt: why the item halted, every recorded attempt, and what each
- * of the three choices does. The labels stay fixed, because the run compares them by string.
+ * choice does. The labels stay fixed, because the run compares them by string.
  * `halt` is the gate whose cap halted the item, passed from where the halt happened; a halt
  * with no gate (a failed check, a worker that changed nothing, an earlier run) gets the
- * plain heading. The reason and the attempt list share the halt-reason budget.
+ * plain heading. `sendBack`, when set, adds the send-back choice after Fix and rerun;
+ * `sendBackWithheld` says instead why it is not offered. The reason and the attempt list
+ * share the halt-reason budget.
  */
 export function failedPrompt(
   binder: string,
@@ -667,13 +803,18 @@ export function failedPrompt(
   reason: string,
   attempts: ItemAttemptsRead | undefined,
   halt?: HaltGate,
+  sendBack?: SendBackOffer,
+  sendBackWithheld?: string,
 ): string {
   const branch = `hatch/${binder}/item-${item}`;
   const ledger = attempts && "records" in attempts ? attempts : undefined;
   const gate = halt ? GATE_NAMES[halt.role] : undefined;
   const state = halt && ledger ? ledger[gateFileFor(halt.role)] : undefined;
+  // A send-back or a Fix and rerun can add a counted concern past the cap.
   const counts = halt && state && !state.error
-    ? ` after ${state.counted} of ${state.cap} ${gateFileFor(halt.role)} attempts`
+    ? state.counted > state.cap
+      ? ` after ${state.counted} ${gateFileFor(halt.role)} attempts, past its cap of ${state.cap}`
+      : ` after ${state.counted} of ${state.cap} ${gateFileFor(halt.role)} attempts`
     : "";
   const head = halt
     ? `Hatch item '${item}' halted at the ${halt.phase}-time ${gate} gate${counts}.\n${reason}`
@@ -704,10 +845,44 @@ export function failedPrompt(
       `  Fix and rerun: re-validates the branch tip (checks, then both gates) after you commit a fix on ${branch}. It edits nothing itself${
         gate ? `, and no automatic retry remains for the ${gate} gate` : ""
       }.`,
+      ...(sendBack ? [sendBackLine(sendBack)] : []),
+      ...(sendBackWithheld ? [`  ${SEND_BACK_CHOICE} is not offered: ${sendBackWithheld}`] : []),
       accept,
       `  Defer and stop delivery: stops the run and keeps the failed ref. To fix it by hand, commit the fix on ${branch} with [hatch:item-${item}] in the subject, then run the delivery again; hatch treats the moved tip as your fix and re-validates it without asking.`,
     ].join("\n"),
   ].filter(Boolean).join("\n\n");
+}
+
+/** What the send-back choice does and does not do, for the gate whose cap halted the item. */
+function sendBackLine(offer: SendBackOffer): string {
+  const gate = GATE_NAMES[offer.role];
+  const findings = offer.fromLedger
+    ? `the ${gate} findings from the attempt list above as feedback (their code, path and line; the finding text is not stored)`
+    : `the ${gate} findings above as feedback`;
+  return (
+    `  ${SEND_BACK_CHOICE}: runs the item's worker once more with ${findings}, although its ${offer.cap} ${gateFileFor(offer.role)} attempts are used up. ` +
+    "Its change then goes through the checks and both gates like any attempt, and lands only if they pass; nothing is waived. " +
+    `If the worker changes nothing, or the ${gate} gate still has concerns, the item halts here again, as it does when any gate runs out of attempts. ` +
+    "If the build is blocked instead, for example by a failed check, it waits for the next run like any blocked build. " +
+    "A gate with attempts left can still send the item back on its own."
+  );
+}
+
+/** The paths an item worktree changed and has not committed: tracked edits and untracked files. */
+async function uncommittedPaths(worktree: string): Promise<string[]> {
+  const tracked = await git(worktree, ["diff", "HEAD", "--name-only", "-z"]);
+  const untracked = await git(worktree, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  return [...new Set(`${tracked}\0${untracked}`.split("\0").filter(Boolean))];
+}
+
+/** Why the send-back waits for a clean worktree, naming the worktree, its changes and the way on. */
+function uncommittedReason(worktree: string, paths: readonly string[], binder: string, item: string): string {
+  const shown = paths.slice(0, 5).join(", ") + (paths.length > 5 ? ` and ${paths.length - 5} more` : "");
+  return (
+    `the item worktree ${worktree} has uncommitted changes (${shown}). Discard them, or commit them on ` +
+    `hatch/${binder}/item-${item} with [hatch:item-${item}] in the subject as your fix; then choose Defer and run the ` +
+    "delivery again, and hatch offers this choice again or re-validates your commit."
+  );
 }
 
 /** A halt reason followed by the attempt list, the whole bounded by the halt-reason limit. */
@@ -1025,6 +1200,7 @@ export class HatchDeliveryRunner {
   readonly #workers: HatchBuildWorkerRunner;
   readonly #waves: HatchWaveRunner;
   readonly #companions: CompanionRunner;
+  readonly #probeGates: (ctx: ExtensionContext) => Promise<string | undefined>;
 
   constructor(
     locks: DispatchLockManager,
@@ -1034,7 +1210,9 @@ export class HatchDeliveryRunner {
     workers: HatchBuildWorkerRunner,
     waves: HatchWaveRunner,
     companions: CompanionRunner,
+    probeGates: (ctx: ExtensionContext) => Promise<string | undefined> = async () => undefined,
   ) {
+    this.#probeGates = probeGates;
     this.#locks = locks;
     this.#processes = processes;
     this.#builds = builds;
@@ -1786,7 +1964,12 @@ export class HatchDeliveryRunner {
           status: "failed",
           integration: current,
           reason: `${integrationHaltReason(current)}${ledger}`,
-          gate: { role, phase: "merge" },
+          gate: {
+            role,
+            phase: "merge",
+            verification: current.verification,
+            ...(current.targetTree ? { merge: { integrationTip: current.base, mergeTree: current.targetTree } } : {}),
+          },
         };
       }
       if (round > MAX_KICKBACK_ROUNDS) {
@@ -1796,32 +1979,17 @@ export class HatchDeliveryRunner {
       if (!verification || !current.targetTree) {
         throw new Error("Hatch kickback accounting reached an impossible state");
       }
-      const brief = {
-        kind: "merge-gate-kickback",
-        gate: role,
-        attempt: state.counted,
-        cap: state.cap,
-        itemTip: current.itemTip,
-        integrationTip: current.base,
-        mergeBase: await git(repoRoot, ["merge-base", current.base, current.itemTip]),
-        mergeTree: current.targetTree,
-        evidenceHash: verification.evidenceHash,
-        // The current attempt's structured findings only: no gate summary, no earlier
-        // attempt, no worker narrative.
-        findings: (verification.gates[GATE_KEYS[role]]?.findings ?? []).map((finding) => ({
-          severity: finding.severity,
-          code: finding.code,
-          ...(finding.path !== undefined ? { path: finding.path } : {}),
-          ...(finding.line !== undefined ? { line: finding.line } : {}),
-          message: finding.message,
-          ...(finding.nextStep !== undefined ? { nextStep: finding.nextStep } : {}),
-        })),
-        // The host-proven citation defects of the reviewed merge tree, as the build-time
-        // feedback carries them, so the worker sees the exact lines when a finding is vague.
-        ...(verification.citationDefects && verification.citationDefects.length > 0
-          ? { citationDefects: verification.citationDefects }
-          : {}),
-      };
+      const brief = await findingsBrief(
+        repoRoot,
+        { kind: "merge-gate-kickback", gate: role, attempt: state.counted, cap: state.cap },
+        current.itemTip,
+        {
+          findings: verification.gates[GATE_KEYS[role]]?.findings ?? [],
+          evidenceHash: verification.evidenceHash,
+          citationDefects: verification.citationDefects,
+          merge: { integrationTip: current.base, mergeTree: current.targetTree },
+        },
+      );
       // finalizeCandidate creates built against the null id, and a built item is
       // recovered without a worker, so the reviewed checkpoint goes first.
       await updateRefsTransaction(repoRoot, [`delete ${root}/built ${current.itemTip}`]);
@@ -1844,18 +2012,10 @@ export class HatchDeliveryRunner {
         { seedFeedback: [brief] },
       );
       if (build.status === "no-change") {
-        // Nothing changed, so the verdict on these bytes stands: halt rather than
-        // re-review them. Built is already gone, so failed is created at the same tip.
-        const tip = build.commit ?? current.itemTip;
-        await updateRefsTransaction(repoRoot, [
-          `verify refs/heads/hatch/${binder}/item-${item.id} ${current.itemTip}`,
-          `create ${root}/failed ${tip}`,
-        ]);
-        const reason = noChangeHaltReason(item.id, "merge", role, current.itemTip, build.worker?.summary ?? build.message);
         return {
           status: "failed",
           integration: current,
-          reason,
+          reason: await this.#failUnchanged(repoRoot, binder, item.id, current.itemTip, build, "merge", role),
         };
       }
       if (build.status === "failed") {
@@ -1907,6 +2067,28 @@ export class HatchDeliveryRunner {
       role = concern.role;
       ledgerError = concern.ledgerError;
     }
+  }
+
+  /**
+   * A seeded worker run that changed nothing: the verdict on these bytes stands, so the
+   * item halts rather than having them re-reviewed. Its built or failed ref is already
+   * gone, so failed is created at the same tip. Returns the halt reason.
+   */
+  async #failUnchanged(
+    repoRoot: string,
+    binder: string,
+    item: string,
+    reviewedTip: string,
+    build: HatchBuildItemResult,
+    phase: HatchGatePhase,
+    role: HatchGateRole,
+    what: "kickback" | "send-back" = "kickback",
+  ): Promise<string> {
+    await updateRefsTransaction(repoRoot, [
+      `verify refs/heads/hatch/${binder}/item-${item} ${reviewedTip}`,
+      `create refs/hatch/${binder}/item-${item}/failed ${build.commit ?? reviewedTip}`,
+    ]);
+    return noChangeHaltReason(item, phase, role, reviewedTip, build.worker?.summary ?? build.message, what);
   }
 
   /** Swap an item's built ref for a failed ref at the same tip, atomically. */
@@ -1997,6 +2179,32 @@ export class HatchDeliveryRunner {
     return undefined;
   }
 
+  /**
+   * The stored floor list for an item, when it was recorded for this spec and this item
+   * tree. Any failure is a miss, because the cache never halts a run.
+   */
+  async #reusedFloorChecks(
+    repoRoot: string,
+    binder: string,
+    item: string,
+    announce: (event: HatchFloorListReused) => void,
+    wave?: number,
+  ): Promise<HatchCheckPlanEntry[] | undefined> {
+    try {
+      const found = await lookupFloorCache(repoRoot, {
+        binder,
+        item,
+        specDigest: await this.#specDigest(repoRoot, binder, item),
+        tree: await git(repoRoot, ["rev-parse", `refs/heads/hatch/${binder}/item-${item}^{tree}`]),
+      });
+      if (!found.hit) return undefined;
+      announce({ kind: "floor-list-reused", wave, item, match: found.match, commands: found.checks.length });
+      return found.checks.map((check) => ({ ...check, purpose: "floor" }));
+    } catch {
+      return undefined;
+    }
+  }
+
   async #discoverFloorChecks(
     ctx: ExtensionContext,
     repoRoot: string,
@@ -2004,7 +2212,10 @@ export class HatchDeliveryRunner {
     item: DeliveryItem,
     ownerId: string,
     mode: "recover-committed" | "recover-merged",
+    announce: (event: HatchFloorListReused) => void,
   ): Promise<HatchCheckPlanEntry[]> {
+    const reused = await this.#reusedFloorChecks(repoRoot, binder, item.id, announce);
+    if (reused) return reused;
     const worktree = await this.#ensureItemWorktree(repoRoot, binder, item.id);
     const discovery = await this.#workers.run(
       ctx,
@@ -2032,6 +2243,15 @@ export class HatchDeliveryRunner {
     progress?: HatchRunProgress,
   ): Promise<HatchDeliveryResult> {
     const emit = safeProgress(progress);
+    // A recovered item is looked up in its build round and again before its merge, so a
+    // same-tree hit prints once per item per run.
+    const reuseAnnounced = new Set<string>();
+    const announceFloorReuse = (event: HatchFloorListReused): void => {
+      // A hand-fix hit always prints: the operator must see a list was reused, not re-derived.
+      if (event.match === "same-tree" && reuseAnnounced.has(event.item)) return;
+      reuseAnnounced.add(event.item);
+      emit(event);
+    };
     const lease = await this.#locks.acquire(ctx.cwd, binder);
     let owner;
     try {
@@ -2093,8 +2313,9 @@ export class HatchDeliveryRunner {
         } catch {
           unlandedDisclosureText = "\n\nHatch could not check for unlanded commits on this binder's branches.";
         }
+        const haltText = await haltDisclosure(repoRoot, binder, leftovers, (item) => this.#specDigest(repoRoot, binder, item));
         const choice = await ctx.ui.select(
-          `Binder '${binder}' carries state from an earlier run${worktreeDisclosure}${unlandedDisclosureText}`,
+          `Binder '${binder}' carries state from an earlier run${worktreeDisclosure}${unlandedDisclosureText}${haltText}`,
           ["Resume", "Clear", "Clear and stop"],
         );
         if (choice !== "Resume" && choice !== "Clear" && choice !== "Clear and stop") {
@@ -2220,6 +2441,26 @@ export class HatchDeliveryRunner {
           }
         }
       }
+      // Before any worker, check or ref of this run: a gate model that cannot answer stops
+      // the run here instead of after the build. A plan whose uncarried items are all done
+      // needs no gate and skips it; a first run (no integration branch) reads no item state.
+      let needsGate = !planned;
+      for (const item of planned?.work_items ?? []) {
+        if (planned?.supersedes?.carried.includes(item.id)) continue;
+        needsGate = !integrationExists || (await deriveItemGitState(repoRoot, binder, item.id)).state !== "done";
+        if (needsGate) break;
+      }
+      const refused = needsGate ? await this.#probeGates(ctx) : undefined;
+      if (refused) {
+        return report({
+          schema: "hatch-delivery-v1",
+          binder,
+          status: "blocked",
+          integrationWorktree: "",
+          waves: [],
+          message: `Delivery stopped before any build: ${refused}`,
+        });
+      }
       if (planned?.supersedes && !integrationExists) {
         const plannedPath = `.hatch/binders/${binder}.json`;
         const blocked = (message: string): Promise<HatchDeliveryResult> => report({
@@ -2324,6 +2565,29 @@ export class HatchDeliveryRunner {
       // Items whose build halted in this run, with the status and reason. In memory only:
       // Git refs stay the record, and a later run rebuilds the frontier from them.
       const deferred = new Map<string, DeferredItem>();
+      // Items whose send-back brief could not be built in this run, with the reason the
+      // prompt gives instead of the choice.
+      const sendBackRefused = new Map<string, string>();
+      // The checks a sent-back build's worker proposed. Its item merges in a later wave,
+      // recovered without a worker, so the merge pass takes them from here, as it takes a
+      // merge kickback's, instead of starting a worker to discover them again.
+      const sentBackChecks = new Map<string, HatchCheckPlanEntry[]>();
+      // A halted build sits out the rest of this run; a failed one's next pass asks the
+      // human, naming this run's reason and the gate whose cap halted it.
+      const recordBuildHalt = (item: string, build: HatchBuildItemResult): void => {
+        const halt = build.status === "failed" ? failedBuildHalt(build) : undefined;
+        const reason = halt?.reason ?? buildHaltReason(build);
+        deferred.set(item, { status: build.status, message: reason });
+        halts.push(haltRecord(
+          item,
+          "build",
+          build.status,
+          reason,
+          build.finalization?.checkFailure,
+          hostVerdictNextStep(binder, "kept", build.finalization?.verification) ?? workerBlockedNextStep(binder, build),
+        ));
+        if (halt) setHalt(item, reason, halt.gate);
+      };
       // Items merged during this run, for the aggregate stop's "landed" line.
       const landedThisRun: string[] = [];
       const waves: HatchDeliveryWave[] = [];
@@ -2388,6 +2652,7 @@ export class HatchDeliveryRunner {
                 item,
                 owner.id,
                 "recover-merged",
+                announceFloorReuse,
               ));
             }
             if (integrations.length === 0) {
@@ -2521,6 +2786,7 @@ export class HatchDeliveryRunner {
             acceptPending,
             owner.id,
             "recover-merged",
+            announceFloorReuse,
           );
           const recovered = await this.#integrations.recoverAccepted(
             ctx,
@@ -2631,16 +2897,37 @@ export class HatchDeliveryRunner {
               }${"error" in attempts ? ` Its gate attempts could not be read: ${attempts.error}` : ""}`,
             });
           }
+          const failedTip = states.get(failed.id)?.itemTip;
+          if (!failedTip) throw new Error("Hatch failed item has no item tip");
+          let sendBack = sendBackOffer(attempts, haltReasons.has(failed.id), haltGate, {
+            commit: failedTip,
+            tree: await git(repoRoot, ["rev-parse", `${failedTip}^{tree}`]),
+          });
+          // The worker would build on uncommitted edits it did not make, so the choice waits
+          // for a clean worktree, and a brief that could not be built is not offered again.
+          const worktree = states.get(failed.id)?.worktree;
+          const withheld = !sendBack
+            ? undefined
+            : sendBackRefused.get(failed.id) ??
+              (worktree && Object.values(states.get(failed.id)?.dirty ?? {}).some(Boolean)
+                ? uncommittedReason(worktree, await uncommittedPaths(worktree), binder, failed.id)
+                : undefined);
+          if (withheld) sendBack = undefined;
           const choice = await ctx.ui.select(
             failedPrompt(
               binder,
               failed.id,
               haltReasons.get(failed.id) ??
-                "it was halted by an earlier run, whose result named the finding; the halt reason is not stored in Git",
+                haltReason(
+                  await readHaltView(repoRoot, binder, failed.id, () => this.#specDigest(repoRoot, binder, failed.id)),
+                  "it was halted by an earlier run, whose result named the finding; the halt reason is not stored in Git",
+                ),
               attempts,
               haltGate,
+              sendBack,
+              withheld,
             ),
-            ["Fix and rerun", "Accept exact current findings", "Defer and stop delivery"],
+            ["Fix and rerun", ...(sendBack ? [SEND_BACK_CHOICE] : []), "Accept exact current findings", "Defer and stop delivery"],
           );
           if (choice === "Fix and rerun") {
             const itemTip = states.get(failed.id)?.itemTip;
@@ -2654,6 +2941,58 @@ export class HatchDeliveryRunner {
               `refs/hatch/${binder}/item-${failed.id}/failed`,
               itemTip,
             ]);
+            continue;
+          }
+          if (choice === SEND_BACK_CHOICE && sendBack) {
+            // The human authorizes one worker attempt past the spent cap, and nothing else.
+            // A failed item is recovered without a worker, so the failed ref goes first, at
+            // the tip the prompt showed. The build's first round always runs, so the worker
+            // edits once; the cap stays spent, so a new concern from that gate writes failed
+            // again and this prompt returns. Its verdicts are ordinary ledger rows.
+            // Everything the worker needs is gathered before the failed ref goes; when it
+            // cannot be, the ref stays and the prompt opens again without this choice.
+            let brief: Record<string, unknown>;
+            try {
+              brief = await findingsBrief(
+                repoRoot,
+                { kind: "human-authorized-retry", gate: sendBack.role, phase: sendBack.phase, attempt: sendBack.attempt, cap: sendBack.cap },
+                failedTip,
+                sendBack,
+              );
+            } catch (error) {
+              sendBackRefused.set(failed.id, `hatch could not gather what the worker needs (${(error as Error).message}), so nothing ran and the failed ref is kept.`);
+              continue;
+            }
+            // The findings describe the tip the prompt showed. An edit or commit made on the
+            // item while the prompt was open is the operator's own work, so no worker runs:
+            // the next pass asks again about an edit and takes a commit as a hand fix.
+            if (Object.values((await deriveItemGitState(repoRoot, binder, failed.id)).dirty).some(Boolean)) continue;
+            const branchRef = `refs/heads/hatch/${binder}/item-${failed.id}`;
+            try {
+              await updateRefsTransaction(repoRoot, [
+                `verify ${branchRef} ${failedTip}`,
+                `delete refs/hatch/${binder}/item-${failed.id}/failed ${failedTip}`,
+              ]);
+            } catch (error) {
+              if ((await git(repoRoot, ["rev-parse", "--verify", "--quiet", branchRef]).catch(() => "")) === failedTip) throw error;
+              continue;
+            }
+            deferred.delete(failed.id);
+            emit({ kind: "item-kicked-back", item: failed.id, gate: sendBack.role, attempt: sendBack.attempt, cap: sendBack.cap, authorized: true });
+            const build = await this.#builds.runWithLease(ctx, binder, failed.id, lease, owner, [failed.id], undefined, {
+              seedFeedback: [brief],
+            });
+            if (build.status === "no-change") {
+              const reason = await this.#failUnchanged(repoRoot, binder, failed.id, failedTip, build, sendBack.phase, sendBack.role, "send-back");
+              setHalt(failed.id, reason);
+              halts.push(haltRecord(failed.id, "build", "failed", reason, undefined));
+              emit({ kind: "item-halted", item: failed.id, status: "failed", reason });
+            } else {
+              emit(buildEvent(undefined, build));
+              if (BUILD_HALT_STATUSES.includes(build.status)) recordBuildHalt(failed.id, build);
+              else sentBackChecks.set(failed.id, build.worker?.checks.map((check) => ({ ...check, purpose: "floor" as const })) ?? []);
+            }
+            // A built item merges in the next wave, where the merge-time gates review it.
             continue;
           }
           if (choice !== "Accept exact current findings") {
@@ -2673,6 +3012,7 @@ export class HatchDeliveryRunner {
             failed,
             owner.id,
             "recover-committed",
+            announceFloorReuse,
           );
           if ((await deriveItemGitState(repoRoot, binder, failed.id)).state !== "failed") {
             throw new Error("Hatch failed item changed during human-accept floor discovery");
@@ -2810,27 +3150,12 @@ export class HatchDeliveryRunner {
           MAX_PARALLEL_BUILDS,
           (item) =>
             this.#builds
-              .runWithLease(ctx, binder, item.id, lease, owner, waveMates, ledger)
+              .runWithLease(ctx, binder, item.id, lease, owner, waveMates, ledger, {
+                onFloorListReused: (event) => announceFloorReuse({ ...event, wave: waveNumber }),
+              })
               // Reported as each build settles, not at the wave barrier, so a long wave shows motion.
               .then((build) => {
-                emit(
-                  BUILD_HALT_STATUSES.includes(build.status)
-                    ? {
-                        kind: "item-halted",
-                        wave: waveNumber,
-                        item: item.id,
-                        status: build.status,
-                        reason: buildHaltReason(build),
-                        ...withCheck(eventCheck(checkDiagnosis(build.finalization?.checkFailure))),
-                      }
-                    : {
-                        kind: "item-built",
-                        wave: waveNumber,
-                        item: item.id,
-                        status: build.status,
-                        attempts: build.attempts,
-                      },
-                );
+                emit(buildEvent(waveNumber, build));
                 return build;
               }),
         );
@@ -2846,21 +3171,7 @@ export class HatchDeliveryRunner {
         // ref. The wave-mates that built still merge, serially, in batch order.
         const pairs = batch.map((item, index) => ({ item, build: builds[index] }));
         for (const { item, build } of pairs) {
-          if (!BUILD_HALT_STATUSES.includes(build.status)) continue;
-          const halt = build.status === "failed" ? failedBuildHalt(build) : undefined;
-          const reason = halt?.reason ?? buildHaltReason(build);
-          deferred.set(item.id, { status: build.status, message: reason });
-          halts.push(haltRecord(
-            item.id,
-            "build",
-            build.status,
-            reason,
-            build.finalization?.checkFailure,
-            hostVerdictNextStep(binder, "kept", build.finalization?.verification) ?? workerBlockedNextStep(binder, build),
-          ));
-          // A failed build leaves a failed ref, so the next pass asks the human about
-          // it; the prompt names this run's reason rather than an earlier run's.
-          if (halt) setHalt(item.id, reason, halt.gate);
+          if (BUILD_HALT_STATUSES.includes(build.status)) recordBuildHalt(item.id, build);
         }
         // A failed build holds a failed ref, so the next pass asks the human about it.
         const buildFailed = pairs.some(({ build }) => build.status === "failed");
@@ -2894,14 +3205,21 @@ export class HatchDeliveryRunner {
         // Items whose merge-time review drew a gate's counted concern, kicked back after
         // the pass so no wave-mate's merge waits on another item's worker.
         const kickbacks: { item: DeliveryItem; role: HatchGateRole; ledgerError?: string; first: HatchIntegrationResult }[] = [];
+        // A landed item recovered on its stored list ran no worker, and its list must still
+        // reach the post-wave floor, or a wave-mate that breaks its command goes unseen.
+        const landWithFloor = async (item: DeliveryItem): Promise<void> => {
+          landed.add(item.id);
+          if (itemChecks.get(item.id)?.length) return;
+          itemChecks.set(item.id, (await this.#reusedFloorChecks(repoRoot, binder, item.id, announceFloorReuse, waveNumber)) ?? []);
+        };
         for (const { item, build } of mergeable) {
           itemChecks.set(item.id, build.worker?.checks.map((check) => ({
             ...check,
             purpose: "floor" as const,
-          })) ?? []);
+          })) ?? sentBackChecks.get(item.id) ?? []);
           let state = await deriveItemGitState(repoRoot, binder, item.id);
           if (state.state === "done") {
-            landed.add(item.id);
+            await landWithFloor(item);
             emit({
               kind: "item-merged",
               wave: waveNumber,
@@ -2914,10 +3232,12 @@ export class HatchDeliveryRunner {
           if (state.state === "merged-unmarked") {
             // Serial recovery after the wave barrier: nothing is building concurrently,
             // so only this item's own worktree may churn.
-            recovery = await this.#builds.runWithLease(ctx, binder, item.id, lease, owner, [item.id]);
+            recovery = await this.#builds.runWithLease(ctx, binder, item.id, lease, owner, [item.id], undefined, {
+              onFloorListReused: (event) => announceFloorReuse({ ...event, wave: waveNumber }),
+            });
             state = await deriveItemGitState(repoRoot, binder, item.id);
             if (state.state === "done") {
-              landed.add(item.id);
+              await landWithFloor(item);
               emit({
                 kind: "item-merged",
                 wave: waveNumber,
@@ -2948,6 +3268,10 @@ export class HatchDeliveryRunner {
             continue;
           }
           let checks: HatchCheckPlanEntry[] = itemChecks.get(item.id) ?? [];
+          if (checks.length === 0) {
+            checks = (await this.#reusedFloorChecks(repoRoot, binder, item.id, announceFloorReuse, waveNumber)) ?? [];
+            itemChecks.set(item.id, checks);
+          }
           if (checks.length === 0) {
             const worktree = await this.#ensureItemWorktree(repoRoot, binder, item.id);
             const discovery = await this.#workers.run(

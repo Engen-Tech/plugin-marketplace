@@ -10,6 +10,14 @@ export interface HatchRunEventCheck {
 
 export type HatchWaveNext = "continue" | "prompt" | "stop";
 
+export interface HatchFloorListReused {
+  kind: "floor-list-reused";
+  wave?: number;
+  item: string;
+  match: "same-tree" | "hand-fix";
+  commands: number;
+}
+
 // Progress a Hatch runner reports while it works. Runners never decide how an event is shown;
 // the run host does. A sink must never break a run, so runners call it through safeProgress.
 export type HatchRunEvent =
@@ -19,11 +27,14 @@ export type HatchRunEvent =
   | { kind: "item-built"; wave?: number; item: string; status: string; attempts: number }
   // A merge-time gate concern sent the item back to its own worker with the findings,
   // while that gate's shared attempt budget remains. `attempt` counts the gate's concerns
-  // so far, out of `cap`.
-  | { kind: "item-kicked-back"; wave?: number; item: string; gate: string; attempt: number; cap: number }
+  // so far, out of `cap`. `authorized` marks the one attempt past a spent cap that the
+  // human chose at the halt prompt.
+  | { kind: "item-kicked-back"; wave?: number; item: string; gate: string; attempt: number; cap: number; authorized?: true }
   // A marked fix was committed past the item's failed ref: the stale ref is dropped and
   // the new tip re-validates without a prompt.
   | { kind: "item-hand-fixed"; item: string; failed: string; tip: string }
+  // A stored floor list stood in for a worker. `match` says why it still applies.
+  | HatchFloorListReused
   // A merge-time or accept-time review's verdicts could not be written to the gate-attempt
   // ledger, because the ledger cannot be read or appended. Nothing was recorded; the
   // item's landing is decided as before. `file` is the ledger file, when known.

@@ -16,17 +16,20 @@ anywhere in the worktree is seen regardless of where the scan starts.
 Usage:
   uv run skills/hatch-build/scripts/scan_secrets.py            # scan staged diff, exit 0/1
   uv run skills/hatch-build/scripts/scan_secrets.py --base <commit> --target <commit>
+  uv run skills/hatch-build/scripts/scan_secrets.py --file <path>   # scan one file, not a diff
   uv run skills/hatch-build/scripts/scan_secrets.py --allowlist .hatch/secret-scan-allowlist
   uv run skills/hatch-build/scripts/scan_secrets.py --self-test  # embedded fixtures, exit 0/1
 
 Exit codes: 0 = clean (or every hit allow-listed), 1 = a secret hit blocks the commit.
+With --file, every line of that file is scanned, an unreadable file exits 1, and an
+allow-list glob matches the label "<file>", not the path.
 
 This is a high-signal floor, not a full security scanner. It catches the
 common accidental credential commit; it does not replace project secret
 tooling (git-secrets, trufflehog, detect-secrets).
 """
 from __future__ import annotations
-import argparse, fnmatch, math, re, subprocess, sys
+import argparse, fnmatch, json, math, re, subprocess, sys, tempfile
 from pathlib import Path
 
 # High-signal patterns. Sourced from the public rule sets of gitleaks, Yelp
@@ -64,6 +67,10 @@ SECRET_NAME = re.compile(
     r"\s*[:=]\s*['\"]([A-Za-z0-9/+=_-]{20,})['\"]"
 )
 ENTROPY_FLOOR = 4.0  # Shannon bits/char; gitleaks/detect-secrets use ~3.5–4.5
+
+# The path a --file finding reports and an allow-list glob is matched against. The named
+# file is a host scratch file with no meaning in the repository, so its own path is not used.
+FILE_LABEL = "<file>"
 
 
 def shannon_entropy(s: str) -> float:
@@ -156,6 +163,17 @@ def parse_added_lines(diff: str) -> list[tuple[str, int, str]]:
     return rows
 
 
+def file_lines(path: Path) -> list[tuple[str, int, str]]:
+    """Return (FILE_LABEL, line_no, text) for every line of one named file.
+
+    Same reading rules as the diff path: a lossy decode, and only "\\n" splits lines.
+    A file written as JSON holds a double quote as \\", which SECRET_NAME and the AWS
+    pattern would not read as a quote, so that escape is undone before the scan.
+    """
+    lines = path.read_bytes().decode("utf-8", errors="replace").split("\n")
+    return [(FILE_LABEL, number, text.replace('\\"', '"')) for number, text in enumerate(lines, 1)]
+
+
 def load_allowlist(path: Path) -> list[tuple[str, str]]:
     """Parse `path glob : pattern description` lines; blanks and # comments skipped."""
     entries: list[tuple[str, str]] = []
@@ -227,7 +245,33 @@ def _run_self_test() -> int:
     ok = parsed and parsed[0] == ("src/c.py", 1, 'secret = "ghp_' + "c" * 36 + '"') and parsed[1][1] == 2
     print(f"[{'PASS' if ok else 'FAIL'}] diff parse: {parsed}")
     failures += 0 if ok else 1
-    total = len(cases) + 1
+    # --file reads a named file, not a diff. Each case is a real file through the real reader.
+    assignment = 'API_KEY="Zx9KpQ2mWf7Lr4Tv8Nd6Yb3Hc5Ja1Ge0"'
+    file_cases = [
+        ("file clean", b'{"command": "node lint.mjs"}\n', []),
+        ("file token on line 2", b'{\n  "command": "curl -H ghp_' + b"d" * 36 + b'"\n}\n', [("github-token", 2)]),
+        ("file form feed does not split a line", b"a\x0cb\nghp_" + b"e" * 36 + b"\n", [("github-token", 2)]),
+        ("file invalid utf-8 still scanned", b"\xff\nghp_" + b"f" * 36 + b"\n", [("github-token", 2)]),
+        ("file json-escaped quotes", json.dumps({"command": assignment}).encode("utf-8"), [("high-entropy-assignment", 1)]),
+    ]
+    with tempfile.TemporaryDirectory(prefix="scan-secrets-") as folder:
+        target = Path(folder) / "named.json"
+        for name, content, expected in file_cases:
+            target.write_bytes(content)
+            hits = scan_lines(file_lines(target), allow)
+            got = sorted({(f["pattern"], f["line"]) for f in hits})
+            ok = got == expected and all(f["file"] == FILE_LABEL for f in hits)
+            print(f"[{'PASS' if ok else 'FAIL'}] {name}: {got}")
+            failures += 0 if ok else 1
+        target.unlink()
+        try:
+            file_lines(target)
+            ok = False
+        except OSError:
+            ok = True
+        print(f"[{'PASS' if ok else 'FAIL'}] file missing raises OSError")
+        failures += 0 if ok else 1
+    total = len(cases) + 1 + len(file_cases) + 1
     print(f"\n{total - failures}/{total} checks passed")
     return 1 if failures else 0
 
@@ -237,16 +281,19 @@ def main() -> int:
     ap.add_argument("--allowlist", type=Path, default=Path(".hatch/secret-scan-allowlist"))
     ap.add_argument("--base")
     ap.add_argument("--target")
+    ap.add_argument("--file", type=Path)
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
         return _run_self_test()
     if (args.base is None) != (args.target is None):
         ap.error("--base and --target must be supplied together")
+    if args.file is not None and args.base is not None:
+        ap.error("--file cannot be combined with --base and --target")
     allow = load_allowlist(args.allowlist)
     try:
-        added = added_lines(args.base, args.target)
-    except (RuntimeError, ValueError) as exc:
+        added = file_lines(args.file) if args.file is not None else added_lines(args.base, args.target)
+    except (OSError, RuntimeError, ValueError) as exc:
         print(f"SECRET SCAN: ERROR: {exc}")
         return 1
     findings = scan_lines(added, allow)

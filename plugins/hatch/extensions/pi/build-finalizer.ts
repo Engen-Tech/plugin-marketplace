@@ -650,11 +650,15 @@ export class HatchBuildFinalizer {
       };
     }
     const committedMessage = await git(worktree, ["show", "-s", "--format=%B", commit]);
+    // A committed tip may be empty (its tree is its parent's); reproducing it then needs
+    // --allow-empty, or git answers "nothing to commit" before any hook decides.
+    const parentTree = await git(worktree, ["rev-parse", `${parent}^{tree}`]);
     const hookValidation = await validateCandidateHooks({
       worktree,
       candidateTree: committedTree,
       parent,
       message: committedMessage,
+      allowEmpty: committedTree === parentTree,
       signal: ctx.signal,
       onProcessStart: processContext
         ? (pid) => processContext.manager.registerProcess(pid, {

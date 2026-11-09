@@ -4018,9 +4018,11 @@ def with_held_review(rows: list[dict], review_by_slug: dict) -> list[dict]:
 # because the page's job there is to state what is going unchecked and why;
 # `branch` is the branch hatch builds the item on.
 #
-# The design's RIGHT NOW, RESULT, TOOK, WHY IT STOPPED, LAST ERROR and ATTEMPTS
-# rows are left out on purpose: the engine reports none of those facts, and a
-# row the page filled in would be the page inventing them.
+# The design's RIGHT NOW, RESULT, TOOK, LAST ERROR and ATTEMPTS rows are left out
+# on purpose: the engine reports none of those facts, and a row the page filled
+# in would be the page inventing them. WHY IT STOPPED is drawn only from an
+# item's halt record, and the engine's view picks which of the three halt labels
+# applies: a record no longer true of the item is AN EARLIER HALT.
 DETAIL_LABELS = {
     "summary": "WHAT IT DOES",
     "check": "HOW WE CHECK IT",
@@ -4035,6 +4037,9 @@ DETAIL_LABELS = {
     "branch": "BRANCH",
     "ref": "REF",
     "touches": "FILES IT TOUCHES",
+    "halt": "WHY IT STOPPED",
+    "halt_history": "AN EARLIER HALT",
+    "halt_unread": "HALT RECORD",
 }
 # How each oracle type is named on the card: the short name the collapsed card's
 # 'Checked by' line carries (template L563) and the sentence its HOW WE CHECK IT
@@ -4154,6 +4159,10 @@ def item_detail(it: dict, slug: str, status_by_id: dict | None = None) -> list[d
         else:
             rows.append(_detail_row(key, kind, text=_detail_text(value), mono=mono))
 
+    # the record's own lines, worded once by the engine, and only for an item with one
+    halt = it.get("halt")
+    if halt:
+        rows.append(_detail_row(halt["label_key"], "list", pairs=_detail_pairs(halt["lines"])))
     add("summary", it.get("summary"), "text")
     rows.append(_detail_row("check", "text", text=oracle_check(otype)[1],
                             icon=_ORACLE_ICON.get(otype, ORACLE_ICON_FALLBACK)))
@@ -5403,6 +5412,8 @@ function itemDetail(it, slug, byId) {
     else rows.push(detailRow(key, kind, { text: detailText(value), mono: mono }));
   };
 
+  // the record's own lines, worded once by the engine, and only for an item with one
+  if (it.halt) rows.push(detailRow(it.halt.label_key, 'list', { pairs: detailPairs(it.halt.lines) }));
   add('summary', it.summary, 'text');
   rows.push(detailRow('check', 'text',
     { text: oracleCheck(otype)[1], icon: ORACLE_ICON[otype] || DETAIL.icon_fallback }));
@@ -16937,7 +16948,9 @@ _DETAIL_WORDS = {"summary": "WHAT IT DOES", "check": "HOW WE CHECK IT",
                  "asserts": "WHAT IT MUST SHOW", "contract": "CONTRACT",
                  "waiver": "WHY IT WAS ACCEPTED", "waiting": "WAITS ON",
                  "carried": "DELIVERED BY", "estimate": "SIZE", "branch": "BRANCH",
-                 "ref": "REF", "touches": "FILES IT TOUCHES"}
+                 "ref": "REF", "touches": "FILES IT TOUCHES",
+                 "halt": "WHY IT STOPPED", "halt_history": "AN EARLIER HALT",
+                 "halt_unread": "HALT RECORD"}
 
 
 def _rows_by_key(rows: list[dict]) -> dict:
@@ -17380,6 +17393,92 @@ def _c_item_detail_mirror(ctx):
             and 'rows.append(_detail_row("carried", "text", text=owner, mono=True))' in py
             and '_STATE_META.get(status_by_id.get(dep), _STATE_META["blocked"])' in py
             and "MIRROR: change together with itemDetail()" in py)
+
+
+_HALT_ITEMS: dict[str, dict] = {}
+
+
+def _halt_item(row_id: str) -> dict:
+    """The table's item as the page's own feed carries it: one row of
+    references/item-states.json built in a real repo, with a real binder file,
+    through current_state(). Kept once per row, because each negative control
+    runs the check again and only the rendering is what it breaks."""
+    if row_id not in _HALT_ITEMS:
+        doc = json.loads(hatch_next.ITEM_STATES_FIXTURE.read_text(encoding="utf-8"))
+        row = next(r for r in doc["rows"] if r["id"] == row_id)
+        old = Path.cwd()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            hatch_next._item_state_repo(doc, row, repo)
+            binders = repo / ".hatch" / "binders"
+            binders.mkdir(parents=True)
+            (binders / "demo.json").write_text(json.dumps(doc["binder"]), encoding="utf-8")
+            os.chdir(repo)
+            try:
+                state = current_state()
+            finally:
+                os.chdir(old)
+        _HALT_ITEMS[row_id] = next(it for b in state["binders"] if b["slug"] == "demo"
+                                   for it in b["items"]["detail"] if it["id"] == "a")
+    return _HALT_ITEMS[row_id]
+
+
+def _halt_rows(ctx, row_id: str) -> list[dict]:
+    return ctx["item_detail"](_halt_item(row_id), "demo", {})
+
+
+@_covers("item-detail-says-why-it-stopped", kind="behaviour",
+         breaks=[lambda c: {"item_detail": lambda it, slug, by: [
+             r for r in c["item_detail"](it, slug, by) if not r["key"].startswith("halt")]},
+                 lambda c: {"item_detail": lambda it, slug, by: [
+                     dict(r, label=c["detail_labels"]["halt_history"]) if r["key"] == "halt"
+                     else dict(r, label=c["detail_labels"]["halt"]) if r["key"] == "halt_history"
+                     else r for r in c["item_detail"](it, slug, by)]},
+                 lambda c: {"item_detail": lambda it, slug, by: [
+                     dict(r, key="halt", label=c["detail_labels"]["halt"])
+                     if r["key"] == "halt_history" else r
+                     for r in c["item_detail"](it, slug, by)]},
+                 lambda c: {"app_src": c["app_src"].replace(
+                     "if (it.halt) rows.push(detailRow(it.halt.label_key, 'list', { pairs: detailPairs(it.halt.lines) }));",
+                     "")}])
+def _c_detail_says_why_it_stopped(ctx):
+    """A halted item says why, from the record in git, first in its grid, and a
+    record no longer true of the item never wears the words of a present reason.
+
+    Driven from real refs in a real repo through current_state(), so the row is
+    what the feed carries, read back through item_detail(). The page's twin is
+    compared as source text: this check does not run the JavaScript."""
+    current = _halt_rows(ctx, "failed+halt-current")
+    history = _halt_rows(ctx, "failed+halt-tip")
+    unread = _halt_rows(ctx, "failed+halt-notjson")
+    bare = _halt_rows(ctx, "failed")
+    head = "Gate attempts used up: acceptance gate, build phase, attempt 2. Recorded 2026-11-06T21:39:00Z."
+    if any(r["key"].startswith("halt") for r in bare):
+        return False
+    if not (current[0]["key"] == "halt" and current[0]["label"] == "WHY IT STOPPED"
+            and current[0]["kind"] == "list"
+            and [p["value"] for p in current[0]["pairs"]] == [
+                head, "major ver-1-absence-without-presence backend/tests/test_pack_archive.py:88",
+                "Next: fix the item and rerun."]):
+        return False
+    lines = [p["value"] for p in history[0]["pairs"]]
+    if not (history[0]["key"] == "halt_history" and history[0]["label"] == "AN EARLIER HALT"
+            and lines[0].startswith("History, not the present reason: the item branch moved from ")
+            and lines[1:] == [head]):
+        return False
+    if not (unread[0]["key"] == "halt_unread" and unread[0]["label"] == "HALT RECORD"
+            and "could not read it: not valid JSON." in unread[0]["pairs"][0]["value"]):
+        return False
+    app = ctx["app_src"]
+    marker = "// MIRROR: change together with item_detail() in serve_status.py"
+    js = app[app.index(marker):]
+    js = js[:js.index("\n}\n")]
+    py = inspect.getsource(item_detail)
+    first = "add('summary', it.summary, 'text');"
+    twin = "if (it.halt) rows.push(detailRow(it.halt.label_key, 'list', { pairs: detailPairs(it.halt.lines) }));"
+    return (twin in js and js.index(twin) < js.index(first)
+            and 'pairs=_detail_pairs(halt["lines"])' in py
+            and py.index('halt = it.get("halt")') < py.index('add("summary"'))
 
 
 def _js_first_after_brace(body: str, opener: str, template: str) -> bool:
@@ -18193,6 +18292,12 @@ def _c_detail_item_branch(ctx):
 
 @_covers("card-claims-no-fact-the-engine-lacks", kind="behaviour",
          breaks=[lambda c: {"detail_labels": dict(c["detail_labels"], took="TOOK")},
+                 lambda c: {"card_words": dict(c["card_words"], show="Why it stopped")},
+                 lambda c: {"detail_labels": dict(c["detail_labels"], halt="TOOK")},
+                 lambda c: {"detail_inlined": dict(c["detail_inlined"], labels=dict(
+                     c["detail_inlined"]["labels"], took="TOOK"))},
+                 lambda c: {"detail_inlined": dict(c["detail_inlined"], labels=dict(
+                     c["detail_inlined"]["labels"], halt="TOOK"))},
                  lambda c: {"page": c["page"].replace(
                      "{{ cardWords.checked_by }}", "Started 3m ago · {{ cardWords.checked_by }}", 1)},
                  lambda c: {"card_words": dict(c["card_words"], show="Details · attempt 1")},
@@ -18213,7 +18318,11 @@ def _c_detail_item_branch(ctx):
 def _c_card_claims_no_unknown_fact(ctx):
     """The design's card says when an item started, how long it took, how many
     files it changed, its attempts, its last error and why it stopped. The
-    engine reports none of those, so this page's card says none of them.
+    engine reports none of those, so this page's card says none of them. The
+    one exception is the whole of one row: the halt label, exactly as the page
+    ships it, which is drawn only for an item with a halt record
+    (_c_detail_says_why_it_stopped). Any other string saying those words, and
+    any other value under that key, still fails here.
 
     What is read is EVERY string the page owns that can reach a card. A card
     takes its words (mkBinder, itemDetail, itemStages, oracleCheck, and the
@@ -18230,19 +18339,26 @@ def _c_card_claims_no_unknown_fact(ctx):
     The one carve-out is the binder's and the engine's own values, which an
     interpolation drops into those formats or onto the card: an item's title,
     summary, assertions, contract prose, check command, touched paths, id,
-    size, status, the slug it was carried from, the ids it waits on, and the
-    waiver reason a human wrote. Those are the plan's and the run's words, not
-    the page's, and may say anything."""
+    size, status, the slug it was carried from, the ids it waits on, the lines
+    of an item's halt record, and the waiver reason a human wrote. Those are the
+    plan's and the run's words, not the page's, and may say anything."""
     page = ctx["page"]
     card = _one_tag(page, "data-kw-item")
     if not card:
         return False
     markup = re.sub(r"\{\{.*?\}\}", " ", re.sub(r"<[^>]*>", " ", _subtree(page, card)))
-    said = [markup] + list(ctx["detail_labels"].values()) + list(ctx["card_words"].values())
+    def without_halt_label(table: dict) -> dict:
+        return {k: v for k, v in table.items()
+                if not (k == "halt" and v == _DETAIL_WORDS["halt"])}
+
+    said = [markup] + list(without_halt_label(ctx["detail_labels"]).values())
+    said += list(ctx["card_words"].values())
     said += list(ctx["stage_tables"]["labels"]) + list(ctx["stage_tables"]["formats"])
     said += [w for pair in ctx["oracle_checks"].values() for w in pair]
     said += [ctx["waiver_unknown"], ctx["detail_empty_label"]]
-    for table in (ctx["state_meta"], ctx["detail_inlined"], ctx["frame_inlined"]):
+    inlined = {**ctx["detail_inlined"],
+               "labels": without_halt_label(ctx["detail_inlined"]["labels"])}
+    for table in (ctx["state_meta"], inlined, ctx["frame_inlined"]):
         said += _string_leaves(table)
     low = " ".join(said).lower()
     return not [w for w in _UNKNOWN_FACTS if w in low]

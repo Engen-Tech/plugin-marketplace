@@ -81,6 +81,13 @@ const dispatchParameters = ActionUnion([
         description: "Additional binder slugs that are staged with this one and commit together in a single commit.",
       }),
     ),
+    executionRequired: Type.Optional(
+      Type.Object({}, {
+        additionalProperties: Type.Number(),
+        description:
+          "Your own count, per work item, of the assertions you expect the acceptance reviewer to class as execution-required. Keyed by item id, or by <slug>/<id> in a set. Shown on the review card as your count; no gate reads it and it is not stored.",
+      }),
+    ),
   }),
   Type.Object({
     action: Type.Literal("runStatus"),
@@ -173,6 +180,7 @@ interface PlanRunner {
     ctx: ExtensionContext,
     binder: string,
     set?: string[],
+    executionRequired?: Record<string, number>,
   ): Promise<{ status: string; paths: string[]; card: string; commit?: string; message: string }>;
 }
 
@@ -290,7 +298,8 @@ export function createHatchDispatchTool(
         }
         if (params.action === "commitBinder") {
           if (!plans) throw new Error("Hatch plan runner is unavailable");
-          const result = await plans.commit(ctx, params.binder, params.set ?? []);
+          const result = await plans.commit(ctx, params.binder, params.set ?? [],
+            params.executionRequired as Record<string, number> | undefined);
           return textResult(JSON.stringify(result, null, 2), {
             action: params.action,
             binder: params.binder,

@@ -12,6 +12,26 @@ async function git(cwd: string, args: string[]): Promise<string> {
   return stdout;
 }
 
+const LISTING_RACE = /failed to read '\.git\/worktrees\/[^']*\/locked'/;
+const LISTING_RETRY_MS = [50, 150];
+
+/**
+ * `git worktree list` dies when a wave-mate's worktree entry loses its `locked`
+ * file between git's existence check and its read. Retry only that listing and
+ * only that error, at most three attempts, then rethrow the last error unchanged.
+ */
+async function worktreeList(cwd: string): Promise<string> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await git(cwd, ["worktree", "list", "--porcelain"]);
+    } catch (error) {
+      const stderr = (error as { stderr?: string }).stderr ?? "";
+      if (attempt >= LISTING_RETRY_MS.length || !LISTING_RACE.test(stderr)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, LISTING_RETRY_MS[attempt]));
+    }
+  }
+}
+
 /** Split a `git worktree list --porcelain` listing into its per-worktree blocks. */
 function porcelainBlocks(porcelain: string): string[] {
   const blocks: string[] = [];
@@ -53,7 +73,7 @@ export async function captureMateSurface(
       branchRef,
       namespace,
     ]),
-    git(repository, ["worktree", "list", "--porcelain"]),
+    worktreeList(repository),
   ]);
   const blocks = porcelainBlocks(registry).filter((block) =>
     block.split("\n").some((line) => line === `branch ${branchRef}`),

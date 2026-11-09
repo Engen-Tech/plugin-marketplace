@@ -121,8 +121,24 @@ async function isFirstParentReachable(cwd: string, commit: string, tip: string):
   return commits.has(commit);
 }
 
+const LISTING_RACE = /failed to read '\.git\/worktrees\/[^']*\/locked'/;
+const LISTING_RETRY_MS = [50, 150];
+
+// `git worktree list` dies when a wave-mate's worktree entry loses its `locked`
+// file between git's existence check and its read. Retry only that listing and
+// only that error, at most three attempts, then fail with the last result.
+async function worktreeList(cwd: string): Promise<string> {
+  const args = ["worktree", "list", "--porcelain"];
+  for (let attempt = 0; ; attempt += 1) {
+    const result = await gitResult(cwd, args);
+    if (result.code === 0) return result.stdout;
+    if (attempt >= LISTING_RETRY_MS.length || !LISTING_RACE.test(result.stderr)) throw gitFailure(args, result);
+    await new Promise((resolve) => setTimeout(resolve, LISTING_RETRY_MS[attempt]));
+  }
+}
+
 async function worktreeForBranch(cwd: string, branchRef: string): Promise<string | undefined> {
-  const output = await git(cwd, ["worktree", "list", "--porcelain"]);
+  const output = await worktreeList(cwd);
   let path: string | undefined;
   for (const line of output.split("\n")) {
     if (line.startsWith("worktree ")) path = line.slice("worktree ".length);

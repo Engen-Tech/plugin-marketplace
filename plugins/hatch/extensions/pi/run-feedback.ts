@@ -2,6 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
+import { gateFileFor, type HatchGateRole } from "./gate-attempts.ts";
 import { roleModelsToken } from "./role-models.ts";
 import type { HatchRunEvent, HatchWaveNext } from "./run-events.ts";
 import type { HatchRunAction, HatchRunRecord, HatchRunRoleModels } from "./run-registry.ts";
@@ -132,9 +133,16 @@ export function describeRunEvent(event: HatchRunEvent): string {
     case "item-built":
       return `${event.item} ${event.status} (${event.attempts} attempt${event.attempts === 1 ? "" : "s"})`;
     case "item-kicked-back":
-      return `${event.item} kicked back by the ${event.gate} (attempt ${event.attempt} of ${event.cap})`;
+      // A visual concern spends the acceptance cap, so the count names the ledger file's cap.
+      return event.authorized
+        ? `${event.item} sent back to its worker once more, as you chose, after ${event.attempt} ${gateFileFor(event.gate as HatchGateRole)} attempts (cap ${event.cap})`
+        : `${event.item} kicked back by the ${event.gate} (attempt ${event.attempt} of ${event.cap})`;
     case "item-hand-fixed":
       return `${event.item} hand fix ${event.tip.slice(0, 7)} found past failed ${event.failed.slice(0, 7)}; re-validating`;
+    case "floor-list-reused":
+      return event.match === "same-tree"
+        ? `${event.item} floor list reused; no worker asked (tree unchanged)`
+        : `${event.item} floor list reused, not re-derived: ${event.commands} command${event.commands === 1 ? "" : "s"} (hand fix changed only the item's own files)`;
     case "gate-ledger-unrecorded":
       return `${event.item} gate verdicts not recorded${event.file ? ` in ${event.file}` : ""}: ${event.error}`;
     case "item-halted": {

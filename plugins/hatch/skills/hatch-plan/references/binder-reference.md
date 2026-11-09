@@ -130,7 +130,7 @@ The schema allows two shapes:
 }
 ```
 
-`type` is one of `unit`, `integration`, `e2e`, `smoke`, or `visual`. `assertions` and `command` are optional but recommended. The floor for a non-opted-out item is compile / type-check / lint — a change that cannot clear that bar is surfaced for human review rather than auto-merged.
+`type` is one of `unit`, `integration`, `e2e`, `smoke`, or `visual`. `command` is optional but recommended. Write an assertion only when you can name the command or test that turns it red (hatch-plan, `plan:synthesize`). The floor for a non-opted-out item is compile / type-check / lint — a change that cannot clear that bar is surfaced for human review rather than auto-merged.
 
 **An opt-out oracle** records a deliberate decision to skip hatch's verification:
 

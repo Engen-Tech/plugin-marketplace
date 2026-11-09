@@ -829,6 +829,32 @@ def _run_self_test() -> int:
         check("an owner.json with an out-of-range pid does not silence the guard",
               stop(repo), 2)
 
+
+        # The shared item-state table: every row's ref configuration in a real
+        # repo, read by this guard's real decide(). Each finding's text is the
+        # block reason's, so the table pins what the session is told.
+        def guard_item_state(repo: Path, binder: dict, _item: str) -> list[str]:
+            d = repo / ".hatch" / "binders"
+            d.mkdir(parents=True)
+            (d / f"{binder['slug']}.json").write_text(json.dumps(binder), encoding="utf-8")
+            code, reason = decide(stop(repo, session="item-states"))
+            found = sorted(name for name, text in (
+                ("built-unmerged", "carry built but no done"),
+                ("accepted-unmerged", "carry an accepted ref"),
+                ("suspect-done", "fails delivery's provenance check"),
+                ("complete-unarchived", "the binder was never archived"),
+            ) if text in reason)
+            # An empty list means the guard allows, never "no finding this reads".
+            return found or ([] if code == 0 else [f"exit {code} with no known finding"])
+
+        engine = _status_engine()
+        if engine is None:
+            flag("item-states table unreadable: the hatch-status engine is not "
+                 "beside this guard", False)
+        else:
+            for name, ok in engine.item_state_checks("guard", guard_item_state):
+                flag(name, ok)
+
     total = len(results)
     failures = results.count(False)
     print(f"\n{total - failures}/{total} checks passed")

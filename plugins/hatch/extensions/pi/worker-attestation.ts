@@ -71,6 +71,23 @@ async function git(cwd: string, args: string[]): Promise<string> {
   }
 }
 
+const LISTING_RACE = /failed to read '\.git\/worktrees\/[^']*\/locked'/;
+const LISTING_RETRY_MS = [50, 150];
+
+// `git worktree list` dies when a wave-mate's worktree entry loses its `locked`
+// file between git's existence check and its read. Retry only that listing and
+// only that error, at most three attempts, then rethrow the last error unchanged.
+async function worktreeList(cwd: string): Promise<string> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await git(cwd, ["worktree", "list", "--porcelain"]);
+    } catch (error) {
+      if (attempt >= LISTING_RETRY_MS.length || !LISTING_RACE.test((error as Error).message)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, LISTING_RETRY_MS[attempt]));
+    }
+  }
+}
+
 async function gitOptional(cwd: string, args: string[]): Promise<string> {
   try {
     return await git(cwd, args);
@@ -531,7 +548,7 @@ export async function snapshotWorkerAuthority(
         "refs/hatch",
         "refs/tags",
       ]),
-      git(physical, ["worktree", "list", "--porcelain"]),
+      worktreeList(physical),
       git(physical, [
         "status",
         "--porcelain=v2",

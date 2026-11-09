@@ -47,7 +47,7 @@ Top-level keys:
                         base; a successor item must revert or replace it), and every
                         dropped id needs a predecessor done ref. Any failure sets `halt`.
                         Proven carried items count as done for the frontier.
-  refs                — every refs/hatch/<slug>/item-*/{built,failed,done,accepted,evidence}
+  refs                — every refs/hatch/<slug>/item-*/{built,failed,done,accepted,evidence,halt}
                         that exists, mapped to its target sha. The canonical evidence
                         namespace is refs/hatch/<slug>/item-<id>/evidence.
   wave_tags            — every hatch/<slug>/wave-* tag, mapped to its target sha.

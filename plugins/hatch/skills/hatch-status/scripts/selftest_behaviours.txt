@@ -437,3 +437,6 @@ root-data-never-shadows-a-computed-or-method
 build-status-line-follows-the-roll
 lanes-legend-and-wave-hat-on-home-and-the-build
 home-tally-counts-each-roll
+# A halted item says why, from the halt record in git, and a record no longer
+# true of the item is labelled history (R2d readers). Nothing writes one yet.
+item-detail-says-why-it-stopped

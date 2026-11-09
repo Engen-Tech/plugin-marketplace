@@ -1,0 +1,2067 @@
+{
+  "_about": [
+    "One table from a ref configuration to the item state each reader of hatch's git state derives.",
+    "Readers: pi is deriveItemGitState (extensions/pi/git-state.ts), read by tests/pi/git-state.test.ts. status is the item status from gather_git_facts, gather_recovery_facts and derive_state (skills/hatch-status/scripts/hatch_next.py --self-test). guard is the findings of decide() in both guard_delivery_stop.py twins (hooks/scripts/, .codex-plugin/hooks/scripts/), each --self-test.",
+    "A cell is what that reader derives today, not what it should derive. It is a reader's own word: a Pi recovery state, a status item state (or not-in-binder when status lists no entry), or the sorted list of guard findings for the binder, where an empty list means the guard allows the stop. A cell of {\"skip\": why} says the reader does not model the row and why; the test prints it.",
+    "A row's setup names entries of steps, run in order after seed in an empty directory, with git -C <repo> and nothing else. No sha is stored, so a row reads the same in any repo. A row's work_items replaces the binder's.",
+    "disagreements lists each row where the readers mean different things by one configuration. They are findings for a later change: no reader was changed to agree, and none is named right. scripts/validate_plugin.py holds each side to the table's cells, requires every row outside its short list of agreeing readings to be covered here, and pins the row count and every skip.",
+    "A row with a halt key plants a record at refs/hatch/<slug>/item-<item>/halt after its setup, through one helper per language (plant_halt_record in hatch_next.py, tests/pi/fixtures/plant-halt-record.ts), and each helper fails when the ref is absent afterwards. halt.fields overrides halt_record; @item_tip, @integration_tip and @failed_tip resolve after the steps (null when absent) and @spec is the item's digest, which both helpers compare to halt_spec_digest. halt.raw writes those bytes, halt.repeat times; halt.findings repeats the first finding that many times; halt.commit points the ref at the item tip. base names the row this one equals except for the record: hatch_next.py --self-test fails unless the two rows' cells and their whole derived state agree. view is what each parser must read, and where it carries lines, the exact words both languages must show. view_skip names a language whose parser the row cannot reach, and why."
+  ],
+  "readers": [
+    "pi",
+    "status",
+    "guard"
+  ],
+  "binder": {
+    "slug": "demo",
+    "work_items": [
+      {
+        "id": "a"
+      },
+      {
+        "id": "other"
+      }
+    ]
+  },
+  "item": "a",
+  "seed": [
+    [
+      "init",
+      "-q",
+      "-b",
+      "main"
+    ],
+    [
+      "config",
+      "user.name",
+      "hatch"
+    ],
+    [
+      "config",
+      "user.email",
+      "hatch@test.invalid"
+    ],
+    [
+      "config",
+      "commit.gpgsign",
+      "false"
+    ],
+    [
+      "config",
+      "core.hooksPath",
+      ".git/no-hooks"
+    ],
+    [
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      "base"
+    ]
+  ],
+  "steps": {
+    "integration": [
+      [
+        "branch",
+        "hatch/demo/integration"
+      ]
+    ],
+    "item-branch": [
+      [
+        "checkout",
+        "-q",
+        "-b",
+        "hatch/demo/item-a",
+        "hatch/demo/integration"
+      ]
+    ],
+    "item-commit": [
+      [
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "[hatch:item-a] work"
+      ]
+    ],
+    "item-commit-again": [
+      [
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "[hatch:item-a] more work"
+      ]
+    ],
+    "unmarked-commit": [
+      [
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "unmarked work"
+      ]
+    ],
+    "built-ref": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/built",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "failed-ref": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/failed",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "accepted-ref": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/accepted",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "evidence-ref": [
+      [
+        "config",
+        "-f",
+        "evidence.txt",
+        "hatch.evidence",
+        "capped"
+      ],
+      [
+        "add",
+        "evidence.txt"
+      ],
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/evidence",
+        ":evidence.txt"
+      ],
+      [
+        "reset",
+        "-q"
+      ]
+    ],
+    "in-progress-ref": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/in-progress",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "done-ref": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/done",
+        "hatch/demo/integration"
+      ]
+    ],
+    "done-ref-on-tree": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/done",
+        "hatch/demo/integration^{tree}"
+      ]
+    ],
+    "done-ref-on-side": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/done",
+        "side"
+      ]
+    ],
+    "delete-failed-ref": [
+      [
+        "update-ref",
+        "-d",
+        "refs/hatch/demo/item-a/failed"
+      ]
+    ],
+    "fast-forward-integration": [
+      [
+        "update-ref",
+        "refs/heads/hatch/demo/integration",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "rewrite-item-branch": [
+      [
+        "reset",
+        "-q",
+        "--hard",
+        "hatch/demo/integration"
+      ]
+    ],
+    "wave-base-tag": [
+      [
+        "tag",
+        "hatch/demo/wave-1-base",
+        "hatch/demo/integration"
+      ]
+    ],
+    "wave-tag": [
+      [
+        "tag",
+        "hatch/demo/wave-1",
+        "hatch/demo/integration"
+      ]
+    ],
+    "merge": [
+      [
+        "checkout",
+        "-q",
+        "hatch/demo/integration"
+      ],
+      [
+        "merge",
+        "-q",
+        "--no-ff",
+        "-m",
+        "Merge item a into integration [hatch:item-a]",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "merge-legacy-subject": [
+      [
+        "checkout",
+        "-q",
+        "hatch/demo/integration"
+      ],
+      [
+        "merge",
+        "-q",
+        "--no-ff",
+        "-m",
+        "[hatch:merge-item-a] merge",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "merge-unmarked-subject": [
+      [
+        "checkout",
+        "-q",
+        "hatch/demo/integration"
+      ],
+      [
+        "merge",
+        "-q",
+        "--no-ff",
+        "-m",
+        "merge item",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "merge-accept": [
+      [
+        "checkout",
+        "-q",
+        "hatch/demo/integration"
+      ],
+      [
+        "merge",
+        "-q",
+        "--no-ff",
+        "-m",
+        "Accept item a into integration [hatch:item-a]\n\nHatch-Accepted: assertion 1\nHatch-Accept-Reason: human waiver",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "merge-off-integration": [
+      [
+        "checkout",
+        "-q",
+        "-b",
+        "side",
+        "hatch/demo/integration"
+      ],
+      [
+        "merge",
+        "-q",
+        "--no-ff",
+        "-m",
+        "Merge item a into integration [hatch:item-a]",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "delete-item-branch": [
+      [
+        "branch",
+        "-q",
+        "-D",
+        "hatch/demo/item-a"
+      ]
+    ],
+    "land-and-delete-branches": [
+      [
+        "checkout",
+        "-q",
+        "main"
+      ],
+      [
+        "merge",
+        "-q",
+        "--no-ff",
+        "-m",
+        "land demo",
+        "hatch/demo/integration"
+      ],
+      [
+        "branch",
+        "-q",
+        "-D",
+        "hatch/demo/item-a",
+        "hatch/demo/integration"
+      ]
+    ],
+    "built-ref-on-integration": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/built",
+        "hatch/demo/integration"
+      ]
+    ],
+    "untracked-file": [
+      [
+        "config",
+        "-f",
+        "dirty.txt",
+        "hatch.dirty",
+        "true"
+      ]
+    ],
+    "in-progress-ref-on-integration": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-a/in-progress",
+        "hatch/demo/integration"
+      ]
+    ],
+    "other-branch": [
+      [
+        "checkout",
+        "-q",
+        "-b",
+        "hatch/demo/item-other",
+        "hatch/demo/integration"
+      ]
+    ],
+    "other-commit": [
+      [
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "[hatch:item-other] work"
+      ]
+    ],
+    "other-built-ref": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-other/built",
+        "hatch/demo/item-other"
+      ]
+    ],
+    "other-merge": [
+      [
+        "checkout",
+        "-q",
+        "hatch/demo/integration"
+      ],
+      [
+        "merge",
+        "-q",
+        "--no-ff",
+        "-m",
+        "Merge item other into integration [hatch:item-other]",
+        "hatch/demo/item-other"
+      ]
+    ],
+    "other-done-ref": [
+      [
+        "update-ref",
+        "refs/hatch/demo/item-other/done",
+        "hatch/demo/integration"
+      ]
+    ]
+  },
+  "rows": [
+    {
+      "id": "not-started",
+      "setup": [
+        "integration"
+      ],
+      "expect": {
+        "pi": "not-started",
+        "status": "ready",
+        "guard": []
+      }
+    },
+    {
+      "id": "not-started-blocked",
+      "setup": [
+        "integration"
+      ],
+      "expect": {
+        "pi": "not-started",
+        "status": "blocked",
+        "guard": []
+      },
+      "work_items": [
+        {
+          "id": "a",
+          "depends_on": [
+            "other"
+          ]
+        },
+        {
+          "id": "other"
+        }
+      ]
+    },
+    {
+      "id": "not-started-dependency-done",
+      "setup": [
+        "integration",
+        "other-branch",
+        "other-commit",
+        "other-built-ref",
+        "other-merge",
+        "other-done-ref"
+      ],
+      "expect": {
+        "pi": "not-started",
+        "status": "ready",
+        "guard": []
+      },
+      "work_items": [
+        {
+          "id": "a",
+          "depends_on": [
+            "other"
+          ]
+        },
+        {
+          "id": "other"
+        }
+      ]
+    },
+    {
+      "id": "in-progress-alone",
+      "setup": [
+        "integration",
+        "in-progress-ref-on-integration"
+      ],
+      "expect": {
+        "pi": "not-started",
+        "status": "ready",
+        "guard": []
+      }
+    },
+    {
+      "id": "evidence-alone",
+      "setup": [
+        "integration",
+        "evidence-ref"
+      ],
+      "expect": {
+        "pi": "not-started",
+        "status": "ready",
+        "guard": []
+      }
+    },
+    {
+      "id": "no-integration-branch",
+      "setup": [],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "ready",
+        "guard": []
+      }
+    },
+    {
+      "id": "branch-only",
+      "setup": [
+        "integration",
+        "item-branch"
+      ],
+      "expect": {
+        "pi": "branch-only",
+        "status": "building",
+        "guard": []
+      }
+    },
+    {
+      "id": "worktree-dirty",
+      "setup": [
+        "integration",
+        "item-branch",
+        "untracked-file"
+      ],
+      "expect": {
+        "pi": "worktree-dirty",
+        "status": "building",
+        "guard": []
+      }
+    },
+    {
+      "id": "committed-unmarked",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit"
+      ],
+      "expect": {
+        "pi": "committed-unmarked",
+        "status": "building",
+        "guard": []
+      }
+    },
+    {
+      "id": "commit-without-marker",
+      "setup": [
+        "integration",
+        "item-branch",
+        "unmarked-commit"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "building",
+        "guard": []
+      }
+    },
+    {
+      "id": "built",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref"
+      ],
+      "expect": {
+        "pi": "built",
+        "status": "built",
+        "guard": [
+          "built-unmerged"
+        ]
+      }
+    },
+    {
+      "id": "built-with-evidence",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "evidence-ref"
+      ],
+      "expect": {
+        "pi": "built",
+        "status": "built",
+        "guard": [
+          "built-unmerged"
+        ]
+      }
+    },
+    {
+      "id": "built-with-in-progress",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "in-progress-ref"
+      ],
+      "expect": {
+        "pi": "built",
+        "status": "built",
+        "guard": [
+          "built-unmerged"
+        ]
+      }
+    },
+    {
+      "id": "built-behind-tip",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "item-commit-again"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "built",
+        "guard": [
+          "built-unmerged"
+        ]
+      }
+    },
+    {
+      "id": "built-fast-forwarded",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "fast-forward-integration"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "built",
+        "guard": [
+          "built-unmerged"
+        ]
+      }
+    },
+    {
+      "id": "built-merged-no-done",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge"
+      ],
+      "expect": {
+        "pi": "merged-unmarked",
+        "status": "built",
+        "guard": [
+          "built-unmerged"
+        ]
+      }
+    },
+    {
+      "id": "orphan-built-no-branch",
+      "setup": [
+        "integration",
+        "built-ref-on-integration"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "built",
+        "guard": [
+          "built-unmerged"
+        ]
+      }
+    },
+    {
+      "id": "done",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge",
+        "done-ref"
+      ],
+      "expect": {
+        "pi": "done",
+        "status": "done",
+        "guard": []
+      }
+    },
+    {
+      "id": "done-with-wave-tags",
+      "setup": [
+        "integration",
+        "wave-base-tag",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge",
+        "done-ref",
+        "wave-tag"
+      ],
+      "expect": {
+        "pi": "done",
+        "status": "done",
+        "guard": []
+      }
+    },
+    {
+      "id": "done-legacy-merge-subject",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge-legacy-subject",
+        "done-ref"
+      ],
+      "expect": {
+        "pi": "done",
+        "status": "done",
+        "guard": []
+      }
+    },
+    {
+      "id": "done-unmarked-merge-subject",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge-unmarked-subject",
+        "done-ref"
+      ],
+      "expect": {
+        "pi": "done",
+        "status": "built",
+        "guard": [
+          "built-unmerged",
+          "suspect-done"
+        ]
+      }
+    },
+    {
+      "id": "done-without-built",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "merge",
+        "done-ref"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "done",
+        "guard": []
+      }
+    },
+    {
+      "id": "done-fast-forward",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "fast-forward-integration",
+        "done-ref"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "done",
+        "guard": []
+      }
+    },
+    {
+      "id": "done-off-first-parent",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge-off-integration",
+        "done-ref-on-side"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "built",
+        "guard": [
+          "built-unmerged",
+          "suspect-done"
+        ]
+      }
+    },
+    {
+      "id": "done-item-branch-deleted",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge",
+        "done-ref",
+        "delete-item-branch"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "done",
+        "guard": []
+      }
+    },
+    {
+      "id": "done-landed-branches-deleted",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge",
+        "done-ref",
+        "land-and-delete-branches"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "done",
+        "guard": []
+      }
+    },
+    {
+      "id": "done-and-failed-no-trailers",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref",
+        "merge",
+        "done-ref"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "done",
+        "guard": []
+      }
+    },
+    {
+      "id": "done-ref-not-a-commit",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "done-ref-on-tree"
+      ],
+      "expect": {
+        "pi": {
+          "skip": "deriveItemGitState rejects a marker ref that does not peel to a commit: it throws and returns no state"
+        },
+        "status": "building",
+        "guard": [
+          "suspect-done"
+        ]
+      }
+    },
+    {
+      "id": "complete-unarchived",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge",
+        "done-ref"
+      ],
+      "expect": {
+        "pi": "done",
+        "status": "done",
+        "guard": [
+          "complete-unarchived"
+        ]
+      },
+      "work_items": [
+        {
+          "id": "a"
+        }
+      ]
+    },
+    {
+      "id": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      }
+    },
+    {
+      "id": "failed-superseded",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref",
+        "item-commit-again"
+      ],
+      "expect": {
+        "pi": "failed-superseded",
+        "status": "failed",
+        "guard": []
+      }
+    },
+    {
+      "id": "failed-off-history",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref",
+        "rewrite-item-branch",
+        "item-commit-again"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "failed",
+        "guard": []
+      }
+    },
+    {
+      "id": "built-and-failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "failed",
+        "guard": []
+      }
+    },
+    {
+      "id": "failed-merged",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref",
+        "merge"
+      ],
+      "expect": {
+        "pi": "accept-merge-pending",
+        "status": "failed",
+        "guard": []
+      }
+    },
+    {
+      "id": "accept-ref-pending",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref",
+        "merge-accept",
+        "done-ref"
+      ],
+      "expect": {
+        "pi": "accept-ref-pending",
+        "status": "done",
+        "guard": []
+      }
+    },
+    {
+      "id": "accepted-done",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "merge-accept",
+        "done-ref",
+        "accepted-ref"
+      ],
+      "expect": {
+        "pi": "done",
+        "status": "accepted",
+        "guard": []
+      }
+    },
+    {
+      "id": "accepted-done-no-trailers",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "merge",
+        "done-ref",
+        "accepted-ref"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "building",
+        "guard": [
+          "accepted-unmerged",
+          "suspect-done"
+        ]
+      }
+    },
+    {
+      "id": "accepted-without-done",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "accepted-ref"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "building",
+        "guard": [
+          "accepted-unmerged"
+        ]
+      }
+    },
+    {
+      "id": "accepted-and-failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "accepted-ref",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "inconsistent",
+        "status": "failed",
+        "guard": []
+      }
+    },
+    {
+      "id": "stray-item-not-in-binder",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref"
+      ],
+      "expect": {
+        "pi": "built",
+        "status": "not-in-binder",
+        "guard": [
+          "built-unmerged"
+        ]
+      },
+      "work_items": [
+        {
+          "id": "other"
+        }
+      ]
+    },
+    {
+      "id": "failed+halt-current",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {},
+      "view": {
+        "status": "current",
+        "lines": [
+          "Gate attempts used up: acceptance gate, build phase, attempt 2. Recorded 2026-11-06T21:39:00Z.",
+          "major ver-1-absence-without-presence backend/tests/test_pack_archive.py:88",
+          "Next: fix the item and rerun."
+        ]
+      }
+    },
+    {
+      "id": "failed+halt-tip",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "fields": {
+          "item_tip": "1111111111111111111111111111111111111111"
+        }
+      },
+      "view": {
+        "status": "history",
+        "why": "tip-moved"
+      }
+    },
+    {
+      "id": "failed+halt-spec",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "fields": {
+          "item_spec_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "view": {
+        "status": "history",
+        "why": "spec-changed",
+        "lines": [
+          "History, not the present reason: this item's plan changed after this was recorded.",
+          "Gate attempts used up: acceptance gate, build phase, attempt 2. Recorded 2026-11-06T21:39:00Z."
+        ]
+      }
+    },
+    {
+      "id": "failed+halt-both",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "fields": {
+          "item_tip": "1111111111111111111111111111111111111111",
+          "item_spec_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "view": {
+        "status": "history",
+        "why": "spec-changed"
+      }
+    },
+    {
+      "id": "failed+halt-spec-unknown",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {},
+      "view": {
+        "status": "history",
+        "why": "spec-unknown"
+      },
+      "view_skip": {
+        "status": "the engine views only items it loaded from a binder, so its spec is never unknown; a direct call of its view covers the branch"
+      }
+    },
+    {
+      "id": "superseded+halt",
+      "base": "failed-superseded",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref",
+        "item-commit-again"
+      ],
+      "expect": {
+        "pi": "failed-superseded",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "fields": {
+          "item_tip": "@failed_tip"
+        }
+      },
+      "view": {
+        "status": "history",
+        "why": "tip-moved"
+      }
+    },
+    {
+      "id": "failed+halt-notjson",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "raw": "{not json"
+      },
+      "view": {
+        "status": "unreadable",
+        "why": "not-json",
+        "lines": [
+          "A halt record exists at refs/hatch/demo/item-a/halt but hatch could not read it: not valid JSON. The item's state does not depend on it."
+        ]
+      }
+    },
+    {
+      "id": "failed+halt-toolarge",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "raw": "x",
+        "repeat": 16385
+      },
+      "view": {
+        "status": "unreadable",
+        "why": "too-large"
+      }
+    },
+    {
+      "id": "failed+halt-deep",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "raw": "[",
+        "repeat": 33
+      },
+      "view": {
+        "status": "unreadable",
+        "why": "too-deep",
+        "lines": [
+          "A halt record exists at refs/hatch/demo/item-a/halt but hatch could not read it: it is nested too deeply. The item's state does not depend on it."
+        ]
+      }
+    },
+    {
+      "id": "failed+halt-findings",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "findings": 51
+      },
+      "view": {
+        "status": "unreadable",
+        "why": "bad-field:findings"
+      }
+    },
+    {
+      "id": "failed+halt-control",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "fields": {
+          "findings": [
+            {
+              "severity": "major",
+              "code": "c",
+              "path": "a\u001b[2J"
+            }
+          ]
+        }
+      },
+      "view": {
+        "status": "unreadable",
+        "why": "bad-field:findings"
+      }
+    },
+    {
+      "id": "failed+halt-commit",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "commit": true
+      },
+      "view": {
+        "status": "unreadable",
+        "why": "not-a-blob"
+      }
+    },
+    {
+      "id": "failed+halt-otheritem",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "fields": {
+          "item": "other"
+        }
+      },
+      "view": {
+        "status": "unreadable",
+        "why": "wrong-item"
+      }
+    },
+    {
+      "id": "failed+halt-v2",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "fields": {
+          "schema_version": 2
+        }
+      },
+      "view": {
+        "status": "unsupported",
+        "lines": [
+          "A halt record exists from another hatch version (schema 2). This version does not read it. The item's state does not depend on it."
+        ]
+      }
+    },
+    {
+      "id": "failed+halt-v0",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "fields": {
+          "schema_version": 0
+        }
+      },
+      "view": {
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "failed+halt-kind",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {
+        "fields": {
+          "halt_kind": "quota-spent"
+        }
+      },
+      "view": {
+        "status": "current",
+        "lines": [
+          "Kind \"quota-spent\" (not known to this hatch version): acceptance gate, build phase, attempt 2. Recorded 2026-11-06T21:39:00Z.",
+          "major ver-1-absence-without-presence backend/tests/test_pack_archive.py:88",
+          "Next: fix the item and rerun."
+        ]
+      }
+    },
+    {
+      "id": "failed+halt+evidence",
+      "base": "failed",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "failed-ref",
+        "evidence-ref"
+      ],
+      "expect": {
+        "pi": "failed",
+        "status": "failed",
+        "guard": []
+      },
+      "halt": {},
+      "view": {
+        "status": "current"
+      }
+    },
+    {
+      "id": "branch-only+halt",
+      "base": "branch-only",
+      "setup": [
+        "integration",
+        "item-branch"
+      ],
+      "expect": {
+        "pi": "branch-only",
+        "status": "building",
+        "guard": []
+      },
+      "halt": {},
+      "view": {
+        "status": "current"
+      }
+    },
+    {
+      "id": "committed+halt",
+      "base": "committed-unmarked",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit"
+      ],
+      "expect": {
+        "pi": "committed-unmarked",
+        "status": "building",
+        "guard": []
+      },
+      "halt": {},
+      "view": {
+        "status": "current"
+      }
+    },
+    {
+      "id": "no-branch+halt",
+      "base": "not-started",
+      "setup": [
+        "integration"
+      ],
+      "expect": {
+        "pi": "not-started",
+        "status": "ready",
+        "guard": []
+      },
+      "halt": {},
+      "view": {
+        "status": "current"
+      }
+    },
+    {
+      "id": "built+halt",
+      "base": "built",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref"
+      ],
+      "expect": {
+        "pi": "built",
+        "status": "built",
+        "guard": [
+          "built-unmerged"
+        ]
+      },
+      "halt": {},
+      "view": {
+        "status": "history",
+        "why": "outcome-written"
+      }
+    },
+    {
+      "id": "done+halt",
+      "base": "done",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "built-ref",
+        "merge",
+        "done-ref"
+      ],
+      "expect": {
+        "pi": "done",
+        "status": "done",
+        "guard": []
+      },
+      "halt": {},
+      "view": {
+        "status": "history",
+        "why": "outcome-written"
+      }
+    },
+    {
+      "id": "accepted+halt",
+      "base": "accepted-done",
+      "setup": [
+        "integration",
+        "item-branch",
+        "item-commit",
+        "merge-accept",
+        "done-ref",
+        "accepted-ref"
+      ],
+      "expect": {
+        "pi": "done",
+        "status": "accepted",
+        "guard": []
+      },
+      "halt": {},
+      "view": {
+        "status": "history",
+        "why": "outcome-written"
+      }
+    }
+  ],
+  "disagreements": [
+    {
+      "id": "missing-integration-branch",
+      "rows": [
+        "no-integration-branch"
+      ],
+      "sides": [
+        {
+          "meaning": "the delivery's git state is broken",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "the item is simply not started",
+          "cells": {
+            "status": "ready",
+            "guard": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "branches-deleted-after-done",
+      "rows": [
+        "done-item-branch-deleted",
+        "done-landed-branches-deleted"
+      ],
+      "sides": [
+        {
+          "meaning": "markers without an item branch are orphaned state",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "the item is delivered",
+          "cells": {
+            "status": "done",
+            "guard": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "done-merge-without-marker",
+      "rows": [
+        "done-unmarked-merge-subject"
+      ],
+      "sides": [
+        {
+          "meaning": "the merge's subject is not checked, so the item is done",
+          "cells": {
+            "pi": "done"
+          }
+        },
+        {
+          "meaning": "the done ref fails provenance and is not trusted",
+          "cells": {
+            "status": "built",
+            "guard": [
+              "built-unmerged",
+              "suspect-done"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "done-without-built",
+      "rows": [
+        "done-without-built"
+      ],
+      "sides": [
+        {
+          "meaning": "a clean done must have a built ref",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "done alone is the single-item form integration-branch.md documents",
+          "cells": {
+            "status": "done",
+            "guard": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "fast-forward-done",
+      "rows": [
+        "done-fast-forward"
+      ],
+      "sides": [
+        {
+          "meaning": "done must name a two-parent merge",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "built and done on one sha is the fast-forward form integration-branch.md documents",
+          "cells": {
+            "status": "done",
+            "guard": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "done-beside-failed",
+      "rows": [
+        "done-and-failed-no-trailers"
+      ],
+      "sides": [
+        {
+          "meaning": "done and failed together are a contradiction",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "done wins; the failed ref is not read",
+          "cells": {
+            "status": "done",
+            "guard": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "failed-beside-a-contradiction",
+      "rows": [
+        "built-and-failed",
+        "failed-off-history",
+        "accepted-and-failed"
+      ],
+      "sides": [
+        {
+          "meaning": "the refs contradict each other and need manual repair",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "the failed ref decides: a halted item, a designed resting state",
+          "cells": {
+            "status": "failed",
+            "guard": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "failed-superseded",
+      "rows": [
+        "failed-superseded",
+        "superseded+halt"
+      ],
+      "sides": [
+        {
+          "meaning": "a marked fix past failed is ready to re-validate",
+          "cells": {
+            "pi": "failed-superseded"
+          }
+        },
+        {
+          "meaning": "the failed ref stands; commits past it are not read",
+          "cells": {
+            "status": "failed",
+            "guard": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "interrupted-accept-merge",
+      "rows": [
+        "failed-merged"
+      ],
+      "sides": [
+        {
+          "meaning": "the item is merged and the accept must be recovered or reverted",
+          "cells": {
+            "pi": "accept-merge-pending"
+          }
+        },
+        {
+          "meaning": "the item is halted; the merge is not read",
+          "cells": {
+            "status": "failed",
+            "guard": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "interrupted-accept-refs",
+      "rows": [
+        "accept-ref-pending"
+      ],
+      "sides": [
+        {
+          "meaning": "the accept is unfinished: failed-ref removal and the accepted ref remain",
+          "cells": {
+            "pi": "accept-ref-pending"
+          }
+        },
+        {
+          "meaning": "the item is a clean done, and the waiver in the merge trailers is not shown",
+          "cells": {
+            "status": "done",
+            "guard": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "accepted-done",
+      "rows": [
+        "accepted-done",
+        "accepted+halt"
+      ],
+      "sides": [
+        {
+          "meaning": "complete, with no sign of the waiver in the state",
+          "cells": {
+            "pi": "done"
+          }
+        },
+        {
+          "meaning": "complete with a human waiver, never shown as a clean pass",
+          "cells": {
+            "status": "accepted"
+          }
+        }
+      ]
+    },
+    {
+      "id": "accepted-without-done",
+      "rows": [
+        "accepted-without-done"
+      ],
+      "sides": [
+        {
+          "meaning": "the refs contradict each other",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "the accepted ref is ignored with a warning; the branch decides",
+          "cells": {
+            "status": "building"
+          }
+        },
+        {
+          "meaning": "an unfinished accept that blocks the stop",
+          "cells": {
+            "guard": [
+              "accepted-unmerged"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "built-ref-off-the-item-tip",
+      "rows": [
+        "built-behind-tip",
+        "built-fast-forwarded",
+        "orphan-built-no-branch"
+      ],
+      "sides": [
+        {
+          "meaning": "the built ref does not fit the branches, so it needs manual repair",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "the built ref's presence decides",
+          "cells": {
+            "status": "built",
+            "guard": [
+              "built-unmerged"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "merged-without-done",
+      "rows": [
+        "built-merged-no-done"
+      ],
+      "sides": [
+        {
+          "meaning": "the merge landed; re-validate it and write done",
+          "cells": {
+            "pi": "merged-unmarked"
+          }
+        },
+        {
+          "meaning": "the item is built and unmerged; the merge is not read",
+          "cells": {
+            "status": "built",
+            "guard": [
+              "built-unmerged"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "commit-past-integration",
+      "rows": [
+        "committed-unmarked",
+        "committed+halt"
+      ],
+      "sides": [
+        {
+          "meaning": "committed work that needs final checks and gates",
+          "cells": {
+            "pi": "committed-unmarked"
+          }
+        },
+        {
+          "meaning": "a branch exists, so the item is building",
+          "cells": {
+            "status": "building"
+          }
+        }
+      ]
+    },
+    {
+      "id": "item-commit-without-marker",
+      "rows": [
+        "commit-without-marker"
+      ],
+      "sides": [
+        {
+          "meaning": "an unattributable commit makes the state inconsistent",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "a branch exists, so the item is building",
+          "cells": {
+            "status": "building"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ref-for-an-undeclared-item",
+      "rows": [
+        "stray-item-not-in-binder"
+      ],
+      "sides": [
+        {
+          "meaning": "the binder is not read; the refs decide",
+          "cells": {
+            "pi": "built",
+            "guard": [
+              "built-unmerged"
+            ]
+          }
+        },
+        {
+          "meaning": "the item is not in the binder, so status warns and lists no entry",
+          "cells": {
+            "status": "not-in-binder"
+          }
+        }
+      ]
+    },
+    {
+      "id": "done-off-first-parent",
+      "rows": [
+        "done-off-first-parent"
+      ],
+      "sides": [
+        {
+          "meaning": "the refs contradict each other and need manual repair",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "the done ref is not trusted, so the item reads as built",
+          "cells": {
+            "status": "built"
+          }
+        },
+        {
+          "meaning": "a dirty delivery: the built ref is stranded and the done ref is suspect",
+          "cells": {
+            "guard": [
+              "built-unmerged",
+              "suspect-done"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "accepted-done-without-trailers",
+      "rows": [
+        "accepted-done-no-trailers"
+      ],
+      "sides": [
+        {
+          "meaning": "the refs contradict each other and need manual repair",
+          "cells": {
+            "pi": "inconsistent"
+          }
+        },
+        {
+          "meaning": "the done ref is not trusted and the accepted ref is ignored, so the branch decides",
+          "cells": {
+            "status": "building"
+          }
+        },
+        {
+          "meaning": "a dirty delivery: the accept is unfinished and the done ref is suspect",
+          "cells": {
+            "guard": [
+              "accepted-unmerged",
+              "suspect-done"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "done-ref-on-a-non-commit",
+      "rows": [
+        "done-ref-not-a-commit"
+      ],
+      "sides": [
+        {
+          "meaning": "no state at all: the derivation throws",
+          "cells": {
+            "pi": {
+              "skip": "deriveItemGitState rejects a marker ref that does not peel to a commit: it throws and returns no state"
+            }
+          }
+        },
+        {
+          "meaning": "the done ref is not trusted, so the branch decides",
+          "cells": {
+            "status": "building"
+          }
+        },
+        {
+          "meaning": "a dirty delivery: the done ref is suspect",
+          "cells": {
+            "guard": [
+              "suspect-done"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "halt_spec_digest": "8489a5deb454a360345c7868bca8672de92b446caf3d3b014af6a56e3d549d30",
+  "halt_record": {
+    "schema_version": 1,
+    "binder": "demo",
+    "item": "a",
+    "item_spec_sha256": "@spec",
+    "halt_kind": "gate-cap",
+    "gate": "acceptance-gate",
+    "phase": "build",
+    "attempt": 2,
+    "findings": [
+      {
+        "severity": "major",
+        "code": "ver-1-absence-without-presence",
+        "path": "backend/tests/test_pack_archive.py",
+        "line": 88
+      }
+    ],
+    "next_step": "fix-and-rerun",
+    "required_check_id": null,
+    "item_tip": "@item_tip",
+    "integration_tip": "@integration_tip",
+    "recorded_at": "2026-11-06T21:39:00Z",
+    "hatch_version": "2.46.7"
+  }
+}

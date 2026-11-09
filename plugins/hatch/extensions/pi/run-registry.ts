@@ -103,6 +103,10 @@ export function foldRunEvent(
       next.wave = event.wave;
       next.building = [...event.items];
       break;
+    // A kicked-back item's worker is running again until it builds or halts.
+    case "item-kicked-back":
+      next.building = addOnce(next.building, event.item);
+      break;
     case "item-built":
       next.building = remove(next.building, event.item);
       next.built = addOnce(next.built, event.item);
@@ -115,6 +119,7 @@ export function foldRunEvent(
       ];
       break;
     case "item-merged":
+      next.building = remove(next.building, event.item);
       next.landed = addOnce(next.landed, event.item);
       break;
     case "wave-finished":

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "max_bytes": 16384,
+  "max_findings": 50,
+  "max_depth": 32,
+  "withheld": "withheld",
+  "patterns": {
+    "slug": "[a-z0-9][a-z0-9-]*",
+    "sha256": "[0-9a-f]{64}",
+    "oid": "[0-9a-f]{40}(?:[0-9a-f]{24})?",
+    "token": "[A-Za-z0-9._:-]{1,80}",
+    "path": "[A-Za-z0-9._/@+=,~ -]{1,300}",
+    "timestamp": "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+    "version": "[0-9]+\\.[0-9]+\\.[0-9]+[0-9A-Za-z.+-]{0,40}"
+  },
+  "severities": ["critical", "major", "minor"],
+  "gates": {
+    "acceptance-gate": "acceptance gate",
+    "safety-gate": "safety gate",
+    "visual-gate": "visual gate"
+  },
+  "phases": {
+    "build": "build phase",
+    "merge": "merge phase",
+    "accept": "accept phase"
+  },
+  "kinds": {
+    "gate-cap": "Gate attempts used up",
+    "merge-check-failed": "A merge check failed",
+    "worker-blocked": "The worker reported itself blocked",
+    "provider-error": "The model provider returned an error",
+    "host-verdict": "The host stopped the item"
+  },
+  "next_steps": {
+    "human-decision": "choose fix, accept or defer at the prompt",
+    "fix-and-rerun": "fix the item and rerun",
+    "rerun-delivery": "deliver the binder again; the candidate is kept",
+    "replan": "replan the item"
+  },
+  "history": {
+    "spec-unknown": "hatch could not read this item's plan to compare",
+    "spec-changed": "this item's plan changed after this was recorded",
+    "tip-moved": "the item branch moved from {old} to {new} after this was recorded",
+    "outcome-written": "the item has a later built, done or accepted ref"
+  },
+  "reasons": {
+    "too-large": "it is over the size limit",
+    "too-deep": "it is nested too deeply",
+    "not-a-blob": "the ref does not point at a blob",
+    "not-json": "not valid JSON",
+    "not-an-object": "not a JSON object",
+    "wrong-item": "it names another item",
+    "bad-field": "the field {field} is not valid",
+    "not-read": "git did not return it",
+    "not-checked": "git did not answer"
+  }
+}

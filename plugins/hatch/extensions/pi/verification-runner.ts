@@ -6,6 +6,7 @@ import {
   type ChildRuntimeReport,
   type GateProviderPreflightReport,
 } from "./child-runtime.ts";
+import { GateProviderUnavailableError } from "./child-last-turn.ts";
 import { DispatchLockManager, type DispatchLockLease } from "./dispatch-lock.ts";
 import type { EnvServerContext } from "./env-server-runner.ts";
 import {
@@ -22,7 +23,7 @@ import {
   type GateModelInvoker,
   type HatchGateResult,
 } from "./gate-runner.ts";
-import { requireRoleModel } from "./role-models.ts";
+import { hatchModelsConfigPath, requireRoleModel, roleModelsOf } from "./role-models.ts";
 import { safeProgress, type HatchRunProgress } from "./run-events.ts";
 import {
   captureVisualEvidence,
@@ -319,6 +320,26 @@ export class HatchVerificationRunner {
       options.visionPreflight ?? ((ctx, _registry, target) => runGateAuthProbe(ctx, target));
     this.#captureVisual = options.captureVisual ?? captureVisualEvidence;
     this.#judgeVisual = options.judgeVisual ?? defaultJudgeVisual;
+  }
+
+  // Run start, before any worker or check: probe the acceptance and safety models on the
+  // run's context, so the gates reuse the success for the rest of the run. Returns why the
+  // run must stop when a provider cannot answer; any other probe failure still throws. A
+  // context with no pinned models never reaches a gate, so it is not probed.
+  async probeGateModels(ctx: ExtensionContext): Promise<string | undefined> {
+    if (!roleModelsOf(ctx)) return undefined;
+    for (const role of ["acceptance-gate", "safety-gate"] as const) {
+      try {
+        await this.#preflight.ensure(ctx, this.#children, requireRoleModel(ctx, role));
+      } catch (error) {
+        if (!(error instanceof GateProviderUnavailableError)) throw error;
+        const quota = error.lastTurn.providerError === "quota";
+        const model = `${error.provider}/${error.model}`;
+        const wait = quota ? `Wait for the quota on ${model} to reset` : `Check the provider's status for ${model} and wait`;
+        return `${quota ? "quota-exhausted" : "provider-error"}: the ${role} model ${model} did not answer the run-start probe. ${error.message.replace(/\.$/, "")}. Next: ${wait}, or pin the ${role} role to another model in ${hatchModelsConfigPath()} as {"roles":{"${role}":{"model":"<provider>/<model>"}}}, then run it again.`;
+      }
+    }
+    return undefined;
   }
 
   async run(

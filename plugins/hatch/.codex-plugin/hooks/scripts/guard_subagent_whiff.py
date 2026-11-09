@@ -49,7 +49,8 @@ archive/) where ALL hold:
   level; a dirty worktree is the one deterministic tell that work is in
   flight, so it excludes — a whiffed worker halts with nothing to show).
 
-Every exclusion errs toward silence: a standing ref of any state, a branch
+Every exclusion errs toward silence: a standing ref of any state (a halt ref
+is a record, not a state, and does not count), a branch
 with commits (worker died after committing), a missing integration branch, an
 unreadable binder, a dirty worktree, and a superseded binder all drop the item.
 A superseded binder's items are excluded because its live successor re-plans
@@ -218,7 +219,9 @@ def _superseded_slugs(root: str, live: list[str]) -> set[str]:
 def _items_with_any_ref(root: str, slug: str) -> set[str]:
     """Item ids with ANY standing ref under refs/hatch/<slug>/item-<id>/ —
     built/done/failed and any future state alike all mean "not a whiff", the
-    quieter direction. Read via plumbing, never .git/refs files."""
+    quieter direction. A halt ref is a record, not a state, so it is not counted:
+    left at an unchanged tip it would silence a later real whiff. Read via
+    plumbing, never .git/refs files."""
     prefix = f"refs/hatch/{slug}/item-"
     have: set[str] = set()
     r = _git(root, "for-each-ref", "--format=%(refname)", f"refs/hatch/{slug}/")
@@ -227,7 +230,7 @@ def _items_with_any_ref(root: str, slug: str) -> set[str]:
     for ref in r.stdout.splitlines():
         if ref.startswith(prefix):
             item, sep, state = ref[len(prefix):].rpartition("/")
-            if sep and item and state:
+            if sep and item and state and state != "halt":
                 have.add(item)
     return have
 
@@ -436,6 +439,19 @@ def _run_self_test() -> int:
         git(repo, "update-ref", "-d", "refs/hatch/wip/item-a/built")
         check("committed item branch with no ref allows (not the empty whiff)",
               substop(repo), 0)
+
+        # 11a. a halt record is not an item state: a blob-valued halt ref leaves
+        #      the whiff standing, and any real state ref still silences it
+        repo = whiff_repo(td, "halted")
+        blob = subprocess.run(
+            ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+            input=b"{}", capture_output=True).stdout.decode("ascii").strip()
+        git(repo, "update-ref", "refs/hatch/wip/item-a/halt", blob)
+        flag("the halt fixture's ref is a real blob",
+             git(repo, "cat-file", "-t", "refs/hatch/wip/item-a/halt").stdout.strip() == "blob")
+        check("a halt record does not silence the whiff", substop(repo), 2)
+        set_ref(repo, "wip", "a", "in-progress", "hatch/wip/integration")
+        check("a state ref beside a halt record still silences it", substop(repo), 0)
 
         # 11. any standing state ref silences the empty branch
         for state in ("failed", "done", "in-progress"):

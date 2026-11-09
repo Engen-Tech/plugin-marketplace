@@ -86,7 +86,9 @@ Usage:
       --repo DIR --slug S --wave N
   python3 skills/hatch-deliver/scripts/merge_item.py --self-test
 
-Exit codes: 0 = success, 1 = halt/failure (or self-test failure), 2 = usage error.
+Exit codes: 0 = success, 1 = halt/failure (or self-test failure), 2 = usage error,
+128 + the signal number = stopped by SIGTERM, SIGINT or SIGHUP during an oracle run, the
+oracle stopped with it.
 """
 from __future__ import annotations
 
@@ -98,9 +100,12 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -109,6 +114,11 @@ PROVENANCE = SCRIPT_DIR / "check_item_provenance.py"
 SHARED_TERMS = (SCRIPT_DIR / ".." / ".." / "hatch-plan" / "scripts" / "check_shared_terms.py").resolve()
 
 CAP_BYTES = 1024
+# Seconds a stopped run_oracle.py gets to end its command. Its own stop path waits up
+# to 20 s on a child that does not die.
+ORACLE_STOP_GRACE = 30
+STOP_SIGNALS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGINT", "SIGHUP")
+                     if hasattr(signal, name))
 
 
 def _cap(s: str) -> str:
@@ -224,18 +234,78 @@ def _run_oracle_record(command: str, cwd: Path, expect: str | None) -> dict:
     if expect:
         argv += ["--expect", expect]
     argv.append(command)
-    p = subprocess.run(
-        argv, capture_output=True, text=True, encoding="utf-8", env=_utf8_python_env())
+    # Not subprocess.run: on any exception it SIGKILLs the child, and a SIGKILLed
+    # run_oracle.py cannot kill its command. The group lets a terminal's Ctrl-C reach
+    # the runner by one path only, _stop_oracle, so the runner sees one signal.
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+             else {"start_new_session": True})
+    with _signals_stop_the_oracle(), subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", env=_utf8_python_env(), **group) as p:
+        try:
+            stdout, stderr = p.communicate()
+        finally:
+            if p.poll() is None:
+                _stop_oracle(p)
     try:
-        record = json.loads(p.stdout)
+        record = json.loads(stdout)
     except json.JSONDecodeError:
         record = {
             "success": False,
             "exit_status": p.returncode,
             "parse_error": "run_oracle.py produced no parseable record",
-            "decisive_output": {"head": _cap(p.stdout + p.stderr), "tail": ""},
+            "decisive_output": {"head": _cap(stdout + stderr), "tail": ""},
         }
     return record
+
+
+def _exit_on_signal(signum: int, _frame) -> None:
+    """The first stop decides. Later ones are ignored, so none can leave _stop_oracle
+    before the command is gone."""
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
+@contextlib.contextmanager
+def _signals_stop_the_oracle():
+    """The oracle runs in a session of its own, so a signal to this process never reaches
+    it. For the length of the call these signals become an exit that passes through
+    _stop_oracle. Outside it they keep their earlier handlers, so a stop cannot raise
+    into a git call: subprocess.run would SIGKILL git and could leave an index.lock. A
+    signal ignored at the start (`nohup`, a shell's `&`) stays ignored. Main thread only,
+    as signal.signal requires: this script starts no thread."""
+    earlier = {}
+    try:
+        for sig in STOP_SIGNALS:
+            handler = signal.getsignal(sig)
+            if handler not in (signal.SIG_IGN, None):
+                earlier[sig] = handler
+                signal.signal(sig, _exit_on_signal)
+        yield
+    finally:
+        for sig, handler in earlier.items():
+            signal.signal(sig, handler)
+
+
+def _stop_oracle(proc: subprocess.Popen) -> None:
+    """Stop a running run_oracle.py and wait until its command is gone. SIGTERM, not
+    SIGKILL: the command sits in a session of its own that only the runner's signal
+    handler reaches. On Windows ending the runner closes the job holding the command,
+    and KILL_ON_JOB_CLOSE ends it."""
+    if os.name == "nt":
+        proc.terminate()
+    else:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=ORACLE_STOP_GRACE)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
 
 
 def _forced_unwind(repo: Path, slug: str, tip: str) -> list[str]:
@@ -1130,6 +1200,152 @@ def _run_self_test() -> int:  # noqa: C901 — one hermetic harness, many named 
               "nothing else",
               code == 0 and res["tag"] == "hatch/s/wave-1" and tag_target == entry
               and clean_at(f, entry))
+
+        # 20. A stopped merge_item stops the oracle it started. Real CLI, real
+        # signals, real process groups. The marker's writer is a backgrounded
+        # descendant, so stopping only the shell, or only the top process, leaves it
+        # running.
+        if os.name != "nt":
+            stop_dir = tmp / "stop"
+            stop_dir.mkdir()
+            cases = iter(range(1000))
+            # The real runner's command sits in a session of its own. This stand-in
+            # leaves the command in the runner's group, and handles no signal, so
+            # only a signal to that whole group ends the command.
+            stand_in = stop_dir / "stand_in_runner.py"
+            stand_in.write_text(
+                "import subprocess, sys, time\n"
+                "subprocess.Popen(['sh', '-c', sys.argv[-1]])\n"
+                "time.sleep(60)\n", encoding="utf-8")
+            # Holds merge_item inside its stop until the group's SIGKILL.
+            stubborn = stop_dir / "stubborn_runner.py"
+            stubborn.write_text(
+                "import signal, subprocess, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "subprocess.Popen(['sh', '-c', sys.argv[-1]])\n"
+                "time.sleep(60)\n", encoding="utf-8")
+            driver = ("import pathlib, sys\n"
+                      "sys.dont_write_bytecode = True\n"
+                      "sys.path.insert(0, sys.argv[1])\n"
+                      "import merge_item\n"
+                      "merge_item.RUN_ORACLE = pathlib.Path(sys.argv[2])\n"
+                      "merge_item.ORACLE_STOP_GRACE = 0.6\n"
+                      "sys.exit(merge_item.main(sys.argv[3:]))\n")
+
+            def stop_cli(sig: signal.Signals, disposition=None, runner: Path | None = None,
+                         again: signal.Signals | None = None,
+                         gap: float = 0.0) -> tuple[int | None, bool, bool]:
+                """Start close-wave on a check that would write a marker in 2 s, signal
+                merge_item alone once the check runs, then `again` after `gap` seconds,
+                and report (exit, whether the command's group is gone, whether the marker
+                appeared)."""
+                case = next(cases)
+                pid_file = stop_dir / f"{case}.pid"
+                marker = stop_dir / f"{case}.marker"
+                command = (f"echo $$ > {_shell_quote_path(str(pid_file))}; "
+                           f"(sleep 2; touch {_shell_quote_path(str(marker))}) & wait")
+                cli = [sys.executable, str(Path(__file__).resolve())]
+                if runner is not None:
+                    cli = [sys.executable, "-c", driver, str(SCRIPT_DIR), str(runner)]
+
+                def set_disposition() -> None:
+                    if disposition is not None:
+                        signal.signal(sig, disposition)
+
+                group = 0
+                with subprocess.Popen(
+                        [*cli, *close_args(command)], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, env=_utf8_python_env(),
+                        preexec_fn=set_disposition) as cli_proc:
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline and not group:
+                        text = pid_file.read_text(encoding="utf-8").strip() if pid_file.exists() else ""
+                        group = int(text) if text else 0
+                        time.sleep(0.02)
+                    time.sleep(0.3)  # past the start of the runner's own stop path
+                    cli_proc.send_signal(sig)
+                    if again is not None:
+                        time.sleep(gap)
+                        cli_proc.send_signal(again)
+                    try:
+                        code = cli_proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        cli_proc.kill()
+                        code = None
+                time.sleep(2.5)
+                try:
+                    os.killpg(group, 0)
+                    gone = False
+                except ProcessLookupError:
+                    gone = True
+                written = marker.exists()
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(group, signal.SIGKILL)
+                return code, gone, written
+
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                code, gone, written = stop_cli(sig, signal.SIG_DFL)
+                check(f"{sig.name} to merge_item stops the oracle's command, "
+                      f"backgrounded descendant included",
+                      code == 128 + sig and gone and not written,
+                      f"exit={code} gone={gone} marker={written}")
+            code, _gone, written = stop_cli(signal.SIGTERM, signal.SIG_DFL, stand_in)
+            check("the stop signal reaches the whole group of the process merge_item "
+                  "started, not only that process",
+                  code == 128 + signal.SIGTERM and not written,
+                  f"exit={code} marker={written}")
+            code, gone, written = stop_cli(signal.SIGTERM, signal.SIG_DFL, again=signal.SIGTERM)
+            check("two signals in quick succession stop the oracle's command once",
+                  code == 128 + signal.SIGTERM and gone and not written,
+                  f"exit={code} gone={gone} marker={written}")
+            code, _gone, written = stop_cli(signal.SIGTERM, signal.SIG_DFL, stubborn,
+                                            again=signal.SIGINT, gap=0.2)
+            check("a second signal during the stop does not skip the group's SIGKILL, and "
+                  "the exit names the first signal",
+                  code == 128 + signal.SIGTERM and not written,
+                  f"exit={code} marker={written}")
+            code, _gone, written = stop_cli(signal.SIGHUP, signal.SIG_IGN)
+            check("SIGHUP ignored at the start stays ignored: the check finishes",
+                  code == 0 and written, f"exit={code} marker={written}")
+
+            # The handlers belong to the oracle call alone: outside it a signal must
+            # find what it found before this branch, so a git call can finish.
+            stop_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+            caller_handler = lambda *_: None  # noqa: E731
+            prior = {sig: signal.signal(sig, caller_handler) for sig in stop_signals}
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            before = {sig: signal.getsignal(sig) for sig in stop_signals}
+            try:
+                _run_oracle_record("echo OK", tmp, None)
+                check("the signal handlers after an oracle call equal those before it",
+                      {sig: signal.getsignal(sig) for sig in stop_signals} == before,
+                      str({sig.name: signal.getsignal(sig) for sig in stop_signals}))
+                run_cli(close_args("echo A"))
+                check("the signal handlers after main() equal those before it",
+                      {sig: signal.getsignal(sig) for sig in stop_signals} == before,
+                      str({sig.name: signal.getsignal(sig) for sig in stop_signals}))
+                stopper = threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM))
+                stopper.start()
+                try:
+                    _run_oracle_record("sleep 5", tmp, None)
+                    stopped = None
+                except SystemExit as e:
+                    stopped = e.code
+                stopper.join()
+                check("the signal handlers after a stopped oracle call equal those before it",
+                      stopped == 128 + signal.SIGTERM
+                      and {sig: signal.getsignal(sig) for sig in stop_signals} == before,
+                      f"exit={stopped}")
+            finally:
+                for sig, handler in prior.items():
+                    signal.signal(sig, handler)
+
+            # Negative control: nothing can catch SIGKILL, so the command outlives
+            # merge_item, which shows the probes above can see a survivor.
+            code, gone, written = stop_cli(signal.SIGKILL)
+            check("control: a command outliving a SIGKILLed merge_item is visible to "
+                  "the probes", code == -signal.SIGKILL and written,
+                  f"exit={code} gone={gone} marker={written}")
 
     finally:
         os.chdir(prior_cwd)

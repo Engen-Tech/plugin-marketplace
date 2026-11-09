@@ -1,6 +1,6 @@
 # Definition of Done
 
-"Done" means the oracle passes on the merged result. The definition of done is the minimum check you'd want CI to run — the project's real CI-facing checks (its tests, build, and type-check) plus item-specific assertions. It is not a check the model grades itself on.
+"Done" means the oracle passes on the merged result. The definition of done is the minimum check you'd want CI to run — the project's real CI-facing checks (its tests, build, and type-check) plus item-specific assertions a command or test can turn red. It is not a check the model grades itself on.
 
 ## Floor
 

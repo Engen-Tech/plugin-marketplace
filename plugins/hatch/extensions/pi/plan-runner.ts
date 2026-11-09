@@ -37,6 +37,7 @@ import { resolveHatchScript, type HatchScriptAction } from "./script-catalog.ts"
 const exec = promisify(execFile);
 const MAX_OUTPUT = 8 * 1024 * 1024;
 const SCRIPT_TIMEOUT = 120_000;
+const CHAIN_END_CHARACTERS = 140;
 const BINDER_ID = /^[a-z0-9][a-z0-9-]*$/;
 const BINDER_ROOT = ".hatch/binders";
 const ROUNDTABLE_ROOT = ".hatch/roundtable/";
@@ -254,11 +255,48 @@ function cardFacts(slug: string, raw: string): BinderCardFacts {
   };
 }
 
+/**
+ * The last characters of an oracle command, on one line, so a reviewer can read what a chain
+ * ends on without running it. Real binders hold multi-line commands of 40,000 characters. The
+ * line is for reading: the binder holds the command, and `…` marks a clipped one.
+ */
+function chainEnd(command: string): string {
+  const characters = [...command.replace(/[\p{Cc}\p{Cf}]/gu, " ").trim()];
+  const end = characters.slice(-CHAIN_END_CHARACTERS).join("");
+  return characters.length > CHAIN_END_CHARACTERS ? `…${end}` : end;
+}
+
+/**
+ * One item's row in the gate-strictness block. The assertion count, the marker and the chain
+ * end are read from the binder. The execution-required count cannot be: the acceptance reviewer
+ * decides that per assertion at gate time, so this number is the planner's reading, labelled as
+ * such, and a value that cannot be right reads as not stated rather than failing the commit.
+ */
+function strictnessRows(key: string, item: Record<string, unknown>, executionRequired: Record<string, number>): string[] {
+  const oracle = (item.oracle ?? {}) as Record<string, unknown>;
+  if (oracle.opt_out === true) return [`  ${key}: opted out`];
+  const count = Array.isArray(oracle.assertions) ? oracle.assertions.length : 0;
+  const assertions = `${count} ${count === 1 ? "assertion" : "assertions"}`;
+  const stated = executionRequired[key];
+  const planned =
+    Number.isInteger(stated) && stated >= 0 && stated <= count
+      ? `${stated} execution-required (planner's count)`
+      : "execution-required not stated";
+  const end = typeof oracle.command === "string" ? chainEnd(oracle.command) : "";
+  return [
+    oracle.type === "visual"
+      ? `  ${key}: ${assertions} (visual gate)`
+      : `  ${key}: ${assertions}, ${planned}, marker ${oracle.expect ? "yes" : "no"}`,
+    ...(end ? [`    ends: ${end}`] : []),
+  ];
+}
+
 function buildCard(
   facts: BinderCardFacts[],
   sme: string[],
   validation: string,
   provenance: string,
+  executionRequired: Record<string, number>,
   environment?: string,
 ): string {
   const set = facts.length > 1;
@@ -291,6 +329,13 @@ function buildCard(
     "",
     "Stack-pack provenance:",
     provenance || "(no .hatch/sme/ packs to classify)",
+    "",
+    "Gate strictness (the acceptance gate classifies each assertion itself):",
+    ...facts.flatMap((binder) =>
+      binder.workItems.flatMap((item) =>
+        strictnessRows(set ? `${binder.slug}/${item.id}` : String(item.id), item, executionRequired),
+      ),
+    ),
   );
   return lines.join("\n");
 }
@@ -375,6 +420,7 @@ export class HatchPlanRunner {
     ctx: ExtensionContext,
     binder: string,
     set: string[] = [],
+    executionRequired: Record<string, number> = {},
   ): Promise<HatchPlanCommitResult> {
     const slugs = [binder, ...set];
     for (const slug of slugs) {
@@ -445,7 +491,7 @@ export class HatchPlanRunner {
     }
     const sme = [...new Set(facts.flatMap((binder) => binder.sme))];
     const environmentLine = await environmentCardLine(root, facts);
-    const card = `${buildCard(facts, sme, escapeBlocks.join("\n\n"), output(provenance), environmentLine)}\n\n${
+    const card = `${buildCard(facts, sme, escapeBlocks.join("\n\n"), output(provenance), executionRequired, environmentLine)}\n\n${
       roundtable.required.length
         ? `Review record staged: ${roundtable.required.join(", ")}`
         : "Review record: this repository's roundtable settings require none for a plan commit."

@@ -19,7 +19,7 @@ Every real invocation also fires a fail-open, fire-and-forget `serve_status.py -
 (Hatch Watch hub revival), and the terminal map — never --footer, never --json — carries one
 nudge line when this repo is opted in but the hub is unreachable."""
 from __future__ import annotations
-import argparse, fnmatch, hashlib, json, os, subprocess, sys, time
+import argparse, fnmatch, hashlib, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 BINDERS_DIR = Path(".hatch/binders")
@@ -98,6 +98,7 @@ def derive_state(binders: list[dict], git_facts: dict,
     """The derived state. `recovery` (gather_recovery_facts) carries the facts
     that are not plain ref presence: each done ref's provenance verdict and
     waiver reason, stray refs, deleted binders and post-landing leftovers.
+    It also carries each item's halt record view, which no state depends on.
     Without it a done ref is trusted as present — the pure-derivation form the
     self-test and the benchmarks drive. `load_errors` (load_binders) are binder
     files that could not be read; they surface as errors, never vanish."""
@@ -206,6 +207,10 @@ def derive_state(binders: list[dict], git_facts: dict,
                 # derive had no provenance pass to read them
                 entry["waiver_reason"] = (rec_items.get(owner or slug, {}).get(it["id"])
                                           or {}).get("waiver_reason")
+            # shown beside the state, and never read to choose it
+            halt = rec.get("halts", {}).get(slug, {}).get(it["id"])
+            if halt:
+                entry["halt"] = halt
             detail.append(entry)
         row = {
             "slug": slug, "after": after[slug], "status": status,
@@ -1097,12 +1102,310 @@ def done_verdicts(repo: Path, slug: str, item_ids: list[str],
             for i in item_ids if f"refs/hatch/{slug}/item-{i}/done" in refs}
 
 
+def item_spec_digest(item: dict) -> str:
+    """The digest gate_attempts.py and Pi's itemSpecDigest give one work item."""
+    canonical = json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# The halt record: a JSON blob at refs/hatch/<slug>/item-<id>/halt saying why an
+# item stopped. references/halt-record.json holds its rules as data, for this
+# engine and extensions/pi/halt-record.ts alike, and the two parsers are held
+# equal by the rows of item-states.json. The bytes are untrusted: a worker can
+# write them on the skill route, and they reach a page and a model. So reading
+# never raises, a reason never echoes the record, and an item's state is worked
+# out before and without it. A view is "current" only while the item's spec
+# digest and tip still match and no later outcome ref stands beside it.
+# ---------------------------------------------------------------------------
+
+HALT_RULES_PATH = (Path(__file__).resolve().parent.parent
+                   / "references" / "halt-record.json")
+_HALT_RULES: dict | None = None                 # the one cached load
+_MAX_SAFE_INTEGER = 2 ** 53 - 1
+
+
+def load_halt_rules(path: Path = HALT_RULES_PATH) -> dict:
+    """The rules with their patterns compiled, or {"broken": the error's name} when the
+    file is missing or broken, which makes every record unreadable and fails nothing else."""
+    try:
+        rules = json.loads(path.read_text(encoding="utf-8"))
+        compiled = {name: re.compile(src) for name, src in rules["patterns"].items()}
+        for key in ("schema_version", "max_bytes", "max_findings", "max_depth", "severities", "gates",
+                    "phases", "kinds", "next_steps", "history", "reasons"):
+            rules[key]
+        return {**rules, "compiled": compiled}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, re.error) as error:
+        return {"broken": type(error).__name__}
+
+
+def _halt_rules() -> dict:
+    global _HALT_RULES
+    if _HALT_RULES is None:
+        _HALT_RULES = load_halt_rules()
+    return _HALT_RULES
+
+
+class _HaltDefect(ValueError):
+    """One field failed: its name, from the rules, never its value."""
+
+
+def _whole(value) -> int | None:
+    """A JSON number as a whole int, or None. Numbers parse to floats, so this reads
+    them as JavaScript does: 2.0 is whole, and past 2^53 nothing is."""
+    if isinstance(value, float) and value.is_integer() and abs(value) <= _MAX_SAFE_INTEGER:
+        return int(value)
+    return None
+
+
+def _halt_fields(doc: dict, rules: dict) -> dict:
+    """The validated fields, and only those. Raises _HaltDefect on the first bad one."""
+    compiled = rules["compiled"]
+
+    def text(name: str, pattern: str, nullable: bool = False):
+        value = doc.get(name)
+        if value is None and nullable:
+            return None
+        if not (isinstance(value, str) and compiled[pattern].fullmatch(value)):
+            raise _HaltDefect(name)
+        return value
+
+    gate = doc.get("gate")
+    if gate is not None and (not isinstance(gate, str) or gate not in rules["gates"]):
+        raise _HaltDefect("gate")
+    phase = doc.get("phase")
+    if not isinstance(phase, str) or phase not in rules["phases"]:
+        raise _HaltDefect("phase")
+    attempt = doc.get("attempt")
+    if attempt is not None:
+        attempt = _whole(attempt)
+        if attempt is None or attempt < 1:
+            raise _HaltDefect("attempt")
+    found = doc.get("findings")
+    if not isinstance(found, list) or len(found) > rules["max_findings"]:
+        raise _HaltDefect("findings")
+    findings = []
+    for one in found:
+        if not (isinstance(one, dict) and isinstance(one.get("severity"), str)
+                and one["severity"] in rules["severities"]
+                and isinstance(one.get("code"), str)
+                and compiled["token"].fullmatch(one["code"])):
+            raise _HaltDefect("findings")
+        path, line = one.get("path"), one.get("line")
+        if path is not None and not (isinstance(path, str) and compiled["path"].fullmatch(path)):
+            raise _HaltDefect("findings")
+        if line is not None:
+            line = _whole(line)
+            if line is None or line < 1:
+                raise _HaltDefect("findings")
+        findings.append({"severity": one["severity"], "code": one["code"],
+                         "path": path, "line": line})
+    return {
+        "item_spec_sha256": text("item_spec_sha256", "sha256"),
+        "halt_kind": text("halt_kind", "token"),
+        "gate": gate,
+        "phase": phase,
+        "attempt": attempt,
+        "findings": findings,
+        "next_step": text("next_step", "token"),
+        "required_check_id": text("required_check_id", "token", nullable=True),
+        "item_tip": text("item_tip", "oid", nullable=True),
+        "integration_tip": text("integration_tip", "oid", nullable=True),
+        "recorded_at": text("recorded_at", "timestamp"),
+        "hatch_version": text("hatch_version", "version"),
+    }
+
+
+def _nesting(text: str) -> int:
+    """How deep the brackets outside JSON strings go. JSON.parse has no such limit and
+    Python's parser raises at a depth that varies by version, so both languages cap it
+    first, and malformed text gets the same answer from each."""
+    depth = deepest = 0
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif ch in "]}":
+            depth -= 1
+    return deepest
+
+
+def parse_halt_record(raw: bytes, slug: str, item: str, rules: dict) -> dict:
+    """One record's bytes as {"status": "valid", "fields": ...}, {"status": "unsupported",
+    "schema": n} or {"status": "unreadable", "why": a fixed reason}, with "error" naming
+    the exception's type where one was caught, and never its text, which can quote the
+    bytes. Never raises. parse_int=float gives every number JSON.parse's one number type."""
+    def unreadable(why: str) -> dict:
+        return {"status": "unreadable", "why": why}
+
+    def no_constants(name: str):
+        raise ValueError(name)
+
+    if "broken" in rules:
+        return {**unreadable("no-rules"), "error": rules["broken"]}
+    if len(raw) > rules["max_bytes"]:
+        return unreadable("too-large")
+    try:
+        text = raw.decode("utf-8")
+        if _nesting(text) > rules["max_depth"]:
+            return unreadable("too-deep")
+        doc = json.loads(text, parse_int=float, parse_constant=no_constants)
+    except ValueError as error:
+        return {**unreadable("not-json"), "error": type(error).__name__}
+    if not isinstance(doc, dict):
+        return unreadable("not-an-object")
+    schema = doc.get("schema_version")
+    version = _whole(schema)
+    if version is None:
+        return unreadable("bad-field:schema_version")
+    if version != rules["schema_version"]:
+        return {"status": "unsupported", "schema": version}
+    if doc.get("binder") != slug or doc.get("item") != item:
+        return unreadable("wrong-item")
+    try:
+        return {"status": "valid", "fields": _halt_fields(doc, rules)}
+    except _HaltDefect as defect:
+        return unreadable(f"bad-field:{defect}")
+
+
+def _halt_headline(fields: dict, rules: dict) -> str:
+    kind = fields["halt_kind"]
+    label = rules["kinds"].get(kind) or f'Kind "{kind}" (not known to this hatch version)'
+    where = [rules["gates"][fields["gate"]]] if fields["gate"] else []
+    where.append(rules["phases"][fields["phase"]])
+    if fields["attempt"]:
+        where.append(f"attempt {fields['attempt']}")
+    return f"{label}: {', '.join(where)}. Recorded {fields['recorded_at']}."
+
+
+def _halt_finding_line(finding: dict) -> str:
+    where = finding["path"] or ""
+    if where and finding["line"]:
+        where += f":{finding['line']}"
+    return " ".join(p for p in (finding["severity"], finding["code"], where) if p)
+
+
+def _halt_reason_text(why: str, rules: dict) -> str:
+    if why == "no-rules":
+        return "hatch's halt rules file could not be read"
+    name, _, field = why.partition(":")
+    return rules["reasons"][name].replace("{field}", field)
+
+
+def halt_view(parsed: dict, rules: dict, ref: str, spec: str | None,
+              item_tip: str | None, outcome: bool) -> dict:
+    """What a reader is shown: status, why, label_key, lines, the caught error's name when
+    there was one, and for a valid record its fields under "record". A pure function of the parsed record and what git holds now."""
+    tail = "The item's state does not depend on it."
+    if parsed["status"] == "unreadable":
+        reason = _halt_reason_text(parsed["why"], rules)
+        named = {"error": parsed["error"]} if "error" in parsed else {}
+        return {"status": "unreadable", "why": parsed["why"], "label_key": "halt_unread", **named,
+                "lines": [f"A halt record exists at {ref} but hatch could not read it: "
+                          f"{reason}. {tail}"]}
+    if parsed["status"] == "unsupported":
+        return {"status": "unsupported", "why": None, "label_key": "halt_unread",
+                "lines": [f"A halt record exists from another hatch version (schema "
+                          f"{parsed['schema']}). This version does not read it. {tail}"]}
+    fields = parsed["fields"]
+    why = ("spec-unknown" if spec is None
+           else "spec-changed" if fields["item_spec_sha256"] != spec
+           else "tip-moved" if fields["item_tip"] != item_tip
+           else "outcome-written" if outcome else None)
+    headline = _halt_headline(fields, rules)
+    if why:
+        old, new = fields["item_tip"], item_tip
+        sentence = (rules["history"][why].replace("{old}", old[:7] if old else "no branch")
+                    .replace("{new}", new[:7] if new else "no branch"))
+        return {"status": "history", "why": why, "label_key": "halt_history", "record": fields,
+                "lines": [f"History, not the present reason: {sentence}.", headline]}
+    step = fields["next_step"]
+    known = rules["next_steps"].get(step)
+    next_line = (f"Next: {known}." if known
+                 else f'Next: "{step}" (not known to this hatch version).')
+    return {"status": "current", "why": None, "label_key": "halt", "record": fields,
+            "lines": [headline, *(_halt_finding_line(f) for f in fields["findings"]), next_line]}
+
+
+def _cat_blobs(oids: list[str]) -> dict[str, bytes]:
+    """{oid: bytes} from one `git cat-file --batch`. An oid it does not return is absent."""
+    try:
+        proc = subprocess.run(["git", "cat-file", "--batch"], capture_output=True,
+                              input="".join(f"{oid}\n" for oid in oids).encode("ascii"))
+    except OSError:
+        return {}
+    out, at, blobs = proc.stdout, 0, {}
+    while at < len(out):
+        end = out.find(b"\n", at)
+        if end < 0:
+            break
+        head = out[at:end].split()
+        at = end + 1
+        if len(head) == 3:
+            size = int(head[2])
+            blobs[head[0].decode("ascii")] = out[at:at + size]
+            at += size + 1
+    return blobs
+
+
+def _halt_views(binders: list[dict], refs: dict[str, str]) -> dict:
+    """{slug: {item: view}} for every declared item with a halt ref. Makes no git call
+    without one, and two with any number: object type and size first, so a blob over
+    the cap or a ref that is not a blob is never read."""
+    found = {f"refs/hatch/{b['slug']}/item-{it['id']}/halt": (b["slug"], it)
+             for b in binders for it in b.get("work_items", [])
+             if f"refs/hatch/{b['slug']}/item-{it['id']}/halt" in refs}
+    if not found:
+        return {}
+    rules = _halt_rules()
+    objects: dict[str, tuple[str, int]] = {}
+    if "broken" not in rules:
+        lines, _ = _for_each_ref(["--format=%(refname) %(objecttype) %(objectsize)",
+                                  "refs/hatch/*/*/halt"])
+        for line in lines:
+            name, kind, size = line.rsplit(" ", 2)
+            objects[name] = (kind, int(size))
+
+    def readable(ref: str) -> bool:
+        return objects.get(ref, ("", 0))[0] == "blob" and objects[ref][1] <= rules["max_bytes"]
+
+    wanted = [refs[ref] for ref in found if readable(ref)]
+    blobs = _cat_blobs(wanted) if wanted else {}
+    out: dict = {}
+    for ref, (slug, it) in found.items():
+        iid = it["id"]
+        base = f"refs/hatch/{slug}/item-{iid}"
+        kind, size = objects.get(ref, ("", 0))
+        if "broken" in rules or refs[ref] in blobs:
+            parsed = parse_halt_record(blobs.get(refs[ref], b""), slug, iid, rules)
+        else:
+            parsed = {"status": "unreadable",
+                      "why": ("not-read" if kind == "" or readable(ref)
+                              else "not-a-blob" if kind != "blob" else "too-large")}
+        outcome = any(f"{base}/{name}" in refs for name in ("built", "done", "accepted"))
+        out.setdefault(slug, {})[iid] = halt_view(
+            parsed, rules, ref, item_spec_digest(it), refs.get(f"refs/heads/hatch/{slug}/item-{iid}"),
+            outcome)
+    return out
+
+
 def gather_recovery_facts(binders: list[dict], git_facts: dict, default_branch: str,
                           archived: frozenset[str] = frozenset(),
                           binders_dir: Path = BINDERS_DIR) -> dict:
     """Facts for the states plain ref presence cannot tell apart. Read-only.
 
       items     {slug: {item: done_provenance verdict}} for every done ref
+      halts     {slug: {item: halt_view}} for every declared item with a halt ref
       warnings  stray item refs, and a missing provenance checker
       deleted   live binders committed in HEAD but gone from the working tree
       cleanup   merged branches / mounted worktrees a landed binder left behind
@@ -1145,6 +1448,13 @@ def gather_recovery_facts(binders: list[dict], git_facts: dict, default_branch: 
         rec["items"].setdefault(slug, {})[iid] = done_provenance(
             slug, iid, refs, default_branch, prov)
 
+    try:
+        rec["halts"] = _halt_views(binders, refs)
+    except Exception as error:                                 # noqa: BLE001
+        rec["halts"] = {}
+        rec["warnings"].append(f"halt records were not read ({type(error).__name__}); "
+                               "no item's state depends on them")
+
     # a committed live binder deleted from the working tree (or a crash between
     # the end-of-life `git mv` and its commit)
     rc, out = _git_rc("ls-tree", "--name-only", "HEAD", binders_dir.as_posix() + "/")
@@ -1183,6 +1493,554 @@ def gather_recovery_facts(binders: list[dict], git_facts: dict, default_branch: 
             rec["cleanup"] = {"slugs": sorted({b.split("/")[1] for b in leftover}) or gone,
                               "worktrees": wts, "branches": leftover}
     return rec
+
+
+# ---------------------------------------------------------------------------
+# The shared item-state table. references/item-states.json maps a ref
+# configuration to what each reader of hatch's git state derives from it, and
+# names where the readers disagree. This engine's self-test, both Stop guards'
+# (through the engine they already load) and tests/pi/git-state.test.ts read it.
+# scripts/validate_plugin.py fails when a Python self-test's output lacks a pass
+# line with the table's value for any row, or its real derivation is no longer
+# the one passed; for the Pi test it checks source text only and does not prove
+# the test runs. A self-test that cannot find the table fails and says where it
+# looked. The file ships beside this
+# script in every install shape, so a missing table is a broken install.
+# ---------------------------------------------------------------------------
+
+ITEM_STATES_FIXTURE = (Path(__file__).resolve().parent.parent
+                       / "references" / "item-states.json")
+
+
+def plant_halt_record(doc: dict, row: dict, repo: Path) -> None:
+    """Write a row's halt record to its real ref, then fail if the ref is absent: a
+    runner that ignored the key would pass while proving nothing. A test plants the
+    record because nothing else writes one yet."""
+    plant, slug, item = row["halt"], doc["binder"]["slug"], doc["item"]
+    root = f"{slug}/item-{item}"
+
+    def tip(name: str) -> str | None:
+        rc, out = _git_rc("rev-parse", "--verify", "--quiet", f"{name}^{{commit}}", repo=repo)
+        return out.strip() if rc == 0 else None
+
+    tips = {"@item_tip": tip(f"hatch/{root}"), "@integration_tip": tip(f"hatch/{slug}/integration"),
+            "@failed_tip": tip(f"refs/hatch/{root}/failed")}
+    declared = row.get("work_items", doc["binder"]["work_items"])
+    digest = item_spec_digest(next(it for it in declared if it["id"] == item))
+    if digest != doc["halt_spec_digest"]:
+        raise RuntimeError(f"item-states row {row['id']}: the digest {digest} is not the "
+                           f"table's {doc['halt_spec_digest']}")
+    if plant.get("commit"):
+        value = tips["@item_tip"]
+    else:
+        if "raw" in plant:
+            body = plant["raw"] * plant.get("repeat", 1)
+        else:
+            record = {**doc["halt_record"], **plant.get("fields", {})}
+            if "findings" in plant:
+                record["findings"] = record["findings"][:1] * plant["findings"]
+            body = json.dumps({k: digest if v == "@spec"
+                               else tips.get(v, v) if isinstance(v, str) else v
+                               for k, v in record.items()})
+        value = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                               input=body.encode("utf-8"), capture_output=True,
+                               check=True).stdout.decode("ascii").strip()
+    subprocess.run(["git", "-C", str(repo), "update-ref", f"refs/hatch/{root}/halt", value],
+                   capture_output=True, check=True)
+    assert_halt_ref(repo, slug, item)
+
+
+def assert_halt_ref(repo: Path, slug: str, item: str) -> None:
+    """The ref plant_halt_record exists to write. The negative control calls this alone."""
+    ref = f"refs/hatch/{slug}/item-{item}/halt"
+    if _git_rc("show-ref", "--verify", "--quiet", ref, repo=repo)[0] != 0:
+        raise RuntimeError(f"the planted halt record is not at {ref}")
+
+
+def _item_state_repo(doc: dict, row: dict, repo: Path) -> None:
+    """Build a row's ref configuration in a fresh repo: git steps and nothing else,
+    then the row's halt record when it carries one."""
+    repo.mkdir()
+    for step in [*doc["seed"], *(s for name in row["setup"] for s in doc["steps"][name])]:
+        proc = subprocess.run(["git", "-C", str(repo), *step], capture_output=True,
+                              text=True, encoding="utf-8")
+        if proc.returncode != 0:
+            raise RuntimeError(f"item-states step {step} failed: {proc.stderr.strip()}")
+    if "halt" in row:
+        plant_halt_record(doc, row, repo)
+
+
+def item_state_mismatch(reader: str, row: dict, got) -> str | None:
+    """The failure line for a reader that derived something other than its cell."""
+    want = row["expect"].get(reader)
+    if got == want:
+        return None
+    return f"item-states row {row['id']}: {reader} reads {got!r}, the table says {want!r}"
+
+
+def _read_item_states(path: Path) -> tuple[dict | None, str]:
+    """(table, "") or (None, a failure line naming the path)."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, f"item-states fixture missing at {path}"
+    except (OSError, ValueError) as e:
+        return None, f"item-states fixture unreadable at {path}: {e}"
+    if not isinstance(doc, dict) or not isinstance(doc.get("rows"), list):
+        return None, f"item-states fixture unreadable at {path}: it has no rows list"
+    return doc, ""
+
+
+def item_state_checks(reader: str, derive, path: Path | None = None) -> list[tuple[str, bool]]:
+    """(check name, ok) for one reader over every row. `derive(repo, binder, item)` is
+    the reader's real derivation over a real scratch repo. A row whose cell for
+    this reader is {"skip": why} prints that reason; it never passes silently. A
+    row that raises is that row's failure, and the other rows still run. A pass
+    line carries the derived value: scripts/validate_plugin.py requires one per row."""
+    import tempfile
+    path = path or ITEM_STATES_FIXTURE
+    doc, problem = _read_item_states(path)
+    if doc is None:
+        return [(problem, False)]
+    rows = doc["rows"]
+    checks = [(f"item-states table has rows ({len(rows)})", bool(rows))]
+
+    def binder_for(row: dict) -> dict:
+        return {"slug": doc["binder"]["slug"],
+                "work_items": row.get("work_items", doc["binder"]["work_items"])}
+
+    with tempfile.TemporaryDirectory() as td:
+        for n, row in enumerate(rows):
+            try:
+                cell = row["expect"].get(reader)
+                if isinstance(cell, dict):
+                    print(f"[SKIP] item-states row {row['id']}: {reader}: {cell['skip']}")
+                    continue
+                repo = Path(td) / f"row{n}"
+                _item_state_repo(doc, row, repo)
+                got = derive(repo, binder_for(row), doc["item"])
+                miss = item_state_mismatch(reader, row, got)
+                checks.append((miss or f"item-states row {row['id']}: {reader} reads {got!r}",
+                               miss is None))
+            except Exception as e:                             # noqa: BLE001
+                checks.append((f"item-states row {row.get('id')}: {reader} raised {e!r}", False))
+        # Selected by id, so a reordered table cannot move the control onto
+        # another row: the built row's cell over the failed row's refs must fail.
+        by_id = {row.get("id"): row for row in rows}
+        built, failed = by_id.get("built"), by_id.get("failed")
+        if built is None or failed is None:
+            checks.append(("item-states negative control needs the built and failed rows", False))
+        else:
+            try:
+                repo = Path(td) / "control"
+                _item_state_repo(doc, failed, repo)
+                got = derive(repo, binder_for(failed), doc["item"])
+                miss = item_state_mismatch(reader, built, got) or ""
+                checks.append((f"NEGATIVE CONTROL: built's cell over failed's refs fails {reader}",
+                               miss.startswith(f"item-states row built: {reader} reads ")))
+            except Exception as e:                             # noqa: BLE001
+                checks.append((f"item-states negative control: {reader} raised {e!r}", False))
+    return checks
+
+
+def _status_state(repo: Path, binder: dict) -> dict:
+    """The whole state a real derive gives over `repo`."""
+    old = Path.cwd()
+    os.chdir(repo)
+    try:
+        facts = gather_git_facts([binder], "main")
+        return derive_state([binder], facts,
+                            recovery=gather_recovery_facts([binder], facts, "main"))
+    finally:
+        os.chdir(old)
+
+
+def _status_item_state(repo: Path, binder: dict, item: str) -> str:
+    """The status a real derive gives the table's item, or not-in-binder when the
+    binder does not declare it and status lists no entry for it."""
+    detail = _status_state(repo, binder)["binders"][0]["items"]["detail"]
+    return next((e["status"] for e in detail if e["id"] == item), "not-in-binder")
+
+
+def _item_state_seam_checks() -> list[tuple[str, bool]]:
+    """What the real table cannot show: its absence fails and says where it looked,
+    a skipped row prints its reason and is not counted, and a derivation that
+    raises fails its own row while the rest still run."""
+    import contextlib, io, tempfile
+    doc, problem = _read_item_states(ITEM_STATES_FIXTURE)
+    if doc is None:
+        return [(problem, False)]
+    missing = item_state_checks("status", _status_item_state, Path("no-such") / "item-states.json")
+    by_id = {row.get("id"): row for row in doc["rows"]}
+    if not {"not-started", "built", "failed"} <= set(by_id):
+        return [("item-states seam checks need the not-started, built and failed rows", False)]
+    skipped = by_id["not-started"]
+    skipped["expect"]["status"] = {"skip": "a reason"}
+    skipped["setup"] = ["no-such-step"]
+
+    def raises(_repo: Path, _binder: dict, _item: str) -> str:
+        raise RuntimeError("derivation broke")
+
+    with tempfile.TemporaryDirectory() as td:
+        table = Path(td) / "table.json"
+        table.write_text(json.dumps({**doc, "rows": [skipped, by_id["built"], by_id["failed"]]}),
+                         encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            checks = item_state_checks("status", _status_item_state, table)
+        broken = item_state_checks("status", raises, table)
+        unreadable = Path(td) / "unreadable.json"
+        unreadable.write_text("{not json", encoding="utf-8")
+        garbled = item_state_checks("status", _status_item_state, unreadable)
+    return [
+        ("NEGATIVE CONTROL: a missing item-states table fails and names the path",
+         len(missing) == 1 and missing[0][1] is False
+         and "item-states fixture missing at no-such" in missing[0][0]),
+        ("NEGATIVE CONTROL: an unreadable item-states table fails and names the path",
+         len(garbled) == 1 and garbled[0][1] is False
+         and f"item-states fixture unreadable at {unreadable}" in garbled[0][0]),
+        ("an item-states skip prints its reason and is not reported as a pass",
+         "[SKIP] item-states row not-started: status: a reason" in out.getvalue()
+         and not any("row not-started:" in name for name, _ in checks)),
+        ("NEGATIVE CONTROL: a derivation that raises fails each row and the run goes on",
+         sum("status raised RuntimeError" in name and not ok for name, ok in broken) == 3),
+    ]
+
+
+def _without_halts(state: dict) -> dict:
+    """A derived state with every record's view removed."""
+    copy = json.loads(json.dumps(state))
+    for binder in copy["binders"]:
+        for entry in binder["items"]["detail"]:
+            entry.pop("halt", None)
+    return copy
+
+
+def _halt_view_of(state: dict) -> dict:
+    """The one record view a table row's derived state carries, or {}."""
+    views = [e.get("halt") for b in state["binders"] for e in b["items"]["detail"]]
+    return next((v for v in views if v), {})
+
+
+def halt_row_problem(row: dict, base: dict, base_state: dict, state: dict) -> str | None:
+    """Why a row with a record does not hold: its cells differ from its base row's, a
+    derived state differs from the base's in anything but the view, or the view is not
+    the row's. A view_skip for status leaves only the view's half unasked."""
+    if row["expect"] != base["expect"]:
+        return f"row {row['id']}: its cells differ from {base['id']}'s"
+    if _without_halts(state) != _without_halts(base_state):
+        return f"row {row['id']}: the record changed the derived state"
+    if "status" in row.get("view_skip", {}):
+        return None
+    view = _halt_view_of(state)
+    got = {"status": view.get("status"), "why": view.get("why")}
+    want = {"status": row["view"]["status"], "why": row["view"].get("why")}
+    if "lines" in row["view"]:
+        got["lines"], want["lines"] = view.get("lines"), row["view"]["lines"]
+    return None if got == want else f"row {row['id']}: view {got!r}, the table says {want!r}"
+
+
+def _halt_row_checks() -> list[tuple[str, bool]]:
+    """Every row with a record against its base row in real repos, over the engine's
+    whole derived state, plus the controls that make that comparison able to fail."""
+    import tempfile
+    doc, problem = _read_item_states(ITEM_STATES_FIXTURE)
+    if doc is None:
+        return [(problem, False)]
+    by_id = {row["id"]: row for row in doc["rows"]}
+    records = [row for row in doc["rows"] if "halt" in row]
+    checks = [(f"item-states has rows with a record ({len(records)})", bool(records))]
+
+    def binder_for(row: dict) -> dict:
+        return {"slug": doc["binder"]["slug"],
+                "work_items": row.get("work_items", doc["binder"]["work_items"])}
+
+    def state_of(row: dict, td: str, name: str) -> dict:
+        repo = Path(td) / name
+        _item_state_repo(doc, row, repo)
+        return _status_state(repo, binder_for(row))
+
+    with tempfile.TemporaryDirectory() as td:
+        bases: dict[str, dict] = {}
+        states: dict[str, dict] = {}
+        for n, row in enumerate(records):
+            base = by_id[row["base"]]
+            try:
+                if base["id"] not in bases:
+                    bases[base["id"]] = state_of(base, td, f"base{n}")
+                states[row["id"]] = state_of(row, td, f"record{n}")
+                if "status" in row.get("view_skip", {}):
+                    print(f"[SKIP] halt row {row['id']}: view: {row['view_skip']['status']}")
+                miss = halt_row_problem(row, base, bases[base["id"]], states[row["id"]])
+                seen = ("skipped" if "status" in row.get("view_skip", {})
+                        else _halt_view_of(states[row["id"]]).get("status"))
+                checks.append((miss or f"halt row {row['id']}: state equals {base['id']}, "
+                               f"view {seen}", miss is None))
+            except Exception as e:                             # noqa: BLE001
+                checks.append((f"halt row {row['id']} raised {e!r}", False))
+        unplanted = Path(td) / "unplanted"
+        _item_state_repo(doc, by_id["failed"], unplanted)
+        try:
+            assert_halt_ref(unplanted, doc["binder"]["slug"], doc["item"])
+            checks.append(("NEGATIVE CONTROL: a plant that wrote no ref fails", False))
+        except RuntimeError as e:
+            checks.append(("NEGATIVE CONTROL: a plant that wrote no ref fails",
+                           "the planted halt record is not at refs/hatch/demo/item-a/halt" in str(e)))
+    row, base = by_id["failed+halt-current"], by_id["failed"]
+    state = states.get(row["id"], {"binders": []})
+    moved = json.loads(json.dumps(state))
+    for entry in (e for b in moved["binders"] for e in b["items"]["detail"]):
+        entry["status"] = "building"
+    checks += [
+        ("NEGATIVE CONTROL: a state that reads the record fails its row",
+         halt_row_problem(row, base, bases.get("failed", {"binders": []}), moved)
+         == "row failed+halt-current: the record changed the derived state"),
+        ("NEGATIVE CONTROL: a view belonging to another row fails",
+         halt_row_problem({**row, "view": by_id["built+halt"]["view"]}, base,
+                          bases.get("failed", {"binders": []}), state)
+         == "row failed+halt-current: view {'status': 'current', 'why': None}, the table says "
+            "{'status': 'history', 'why': 'outcome-written'}"),
+        ("NEGATIVE CONTROL: words other than the table's fail",
+         (halt_row_problem({**row, "view": {**row["view"], "lines": ["other words"]}}, base,
+                           bases.get("failed", {"binders": []}), state) or "").endswith(
+             "'why': None, 'lines': ['other words']}")),
+        ("NEGATIVE CONTROL: a row whose cells are not its base's fails",
+         halt_row_problem(row, by_id["built"], {"binders": []}, {"binders": []})
+         == "row failed+halt-current: its cells differ from built's"),
+    ]
+    return checks
+
+
+def _halt_call_checks() -> list[tuple[str, bool]]:
+    """Reading records costs nothing without one and two git calls with any number, and
+    a record over the cap or not a blob never reaches cat-file."""
+    import tempfile
+    doc, problem = _read_item_states(ITEM_STATES_FIXTURE)
+    if doc is None:
+        return [(problem, False)]
+    by_id = {row["id"]: row for row in doc["rows"]}
+    binder = {"slug": doc["binder"]["slug"], "work_items": doc["binder"]["work_items"]}
+
+    def calls_for(repo: Path) -> list[list[str]]:
+        seen: list[list[str]] = []
+        real = subprocess.run
+
+        def counting(cmd, *a, **k):
+            seen.append([str(c) for c in cmd])
+            return real(cmd, *a, **k)
+
+        old = Path.cwd()
+        os.chdir(repo)
+        subprocess.run = counting
+        try:
+            gather_recovery_facts([binder], gather_git_facts([binder], "main"), "main")
+        finally:
+            subprocess.run = real
+            os.chdir(old)
+        return seen
+
+    def repo_for(row: dict, td: str, name: str) -> Path:
+        repo = Path(td) / name
+        _item_state_repo(doc, row, repo)
+        return repo
+
+    with tempfile.TemporaryDirectory() as td:
+        plain = len(calls_for(repo_for(by_id["failed"], td, "plain")))
+        one = repo_for(by_id["failed+halt-current"], td, "one")
+        with_one = calls_for(one)
+        both = repo_for(by_id["failed+halt-current"], td, "both")
+        subprocess.run(["git", "-C", str(both), "update-ref", "refs/hatch/demo/item-other/halt",
+                        "refs/hatch/demo/item-a/halt"], check=True)
+        with_two = len(calls_for(both))
+        large = calls_for(repo_for(by_id["failed+halt-toolarge"], td, "large"))
+        commit = calls_for(repo_for(by_id["failed+halt-commit"], td, "commit"))
+        beside = {}
+        for name in ("built", "done", "accepted"):
+            repo = repo_for(by_id["failed+halt-current"], td, f"beside-{name}")
+            subprocess.run(["git", "-C", str(repo), "update-ref", f"refs/hatch/demo/item-a/{name}",
+                            "hatch/demo/item-a"], check=True)
+            state = _status_state(repo, binder)
+            beside[name] = next(e for e in state["binders"][0]["items"]["detail"]
+                                if e["id"] == "a")["halt"]["why"]
+        real_views, old = globals()["_halt_views"], Path.cwd()
+        globals()["_halt_views"] = lambda *_: 1 / 0
+        os.chdir(one)
+        try:
+            broken = gather_recovery_facts([binder], gather_git_facts([binder], "main"), "main")
+        finally:
+            os.chdir(old)
+            globals()["_halt_views"] = real_views
+    return [
+        ("one halt record adds two git calls", len(with_one) == plain + 2),
+        ("two halt records add the same two git calls", with_two == plain + 2),
+        ("NEGATIVE CONTROL: a record over the cap never reaches cat-file",
+         len(large) == plain + 1 and not any("cat-file" in c for c in large)),
+        ("NEGATIVE CONTROL: a ref that is not a blob never reaches cat-file",
+         len(commit) == plain + 1 and not any("cat-file" in c for c in commit)),
+        *[(f"a matching record beside only a {name} ref is history",
+           beside[name] == "outcome-written") for name in beside],
+        ("NEGATIVE CONTROL: a reader that raises leaves a warning naming the error",
+         "halt records were not read (ZeroDivisionError); no item's state depends on them"
+         in broken["warnings"] and broken["halts"] == {}),
+    ]
+
+
+def _halt_parser_checks() -> list[tuple[str, bool]]:
+    """What the rows cannot reach: the parser's edges, a view with no spec to compare,
+    a missing rules file, and the exact words a reader is shown."""
+    rules = load_halt_rules()
+    if "broken" in rules:
+        return [(f"the halt rules file loads, not {rules['broken']}", False)]
+    tip, spec, oid = "a" * 40, "b" * 64, "c" * 40
+    good = {"schema_version": 1, "binder": "s", "item": "a", "item_spec_sha256": spec,
+            "halt_kind": "gate-cap", "gate": "acceptance-gate", "phase": "build", "attempt": 2,
+            "findings": [{"severity": "major", "code": "ver-1", "path": "a/b.py", "line": 88},
+                         {"severity": "minor", "code": "min-2"}],
+            "next_step": "fix-and-rerun", "required_check_id": None, "item_tip": tip,
+            "integration_tip": None, "recorded_at": "2026-11-06T21:39:00Z",
+            "hatch_version": "2.46.7"}
+
+    def parsed(**over) -> dict:
+        return parse_halt_record(json.dumps({**good, **over}).encode("utf-8"), "s", "a", rules)
+
+    def view(p: dict, *, now_spec=spec, now_tip=tip, outcome=False) -> dict:
+        return halt_view(p, rules, "refs/hatch/s/item-a/halt", now_spec, now_tip, outcome)
+
+    def why(p: dict) -> tuple:
+        return (p["status"], p.get("why"))
+
+    def nested(depth: int) -> dict:
+        body = json.dumps(good)[1:].replace('"schema_version": 1, ', "")
+        text = '{"schema_version": 1, "extra": ' + "[" * depth + "]" * depth + ", " + body
+        return parse_halt_record(text.encode("utf-8"), "s", "a", rules)
+
+    current = view(parsed())
+    unknown = view(parsed(), now_spec=None)
+    moved = view(parsed(), now_tip=oid)
+    gone = view(parsed(item_tip=None), now_tip=oid)
+    kind = view(parsed(halt_kind="quota-spent", next_step="ask-someone", gate=None))
+    bad = view(parse_halt_record(b"{not json", "s", "a", rules))
+    newer = view(parsed(schema_version=2))
+    missing = load_halt_rules(Path("no-such"))
+    norules = parse_halt_record(json.dumps(good).encode("utf-8"), "s", "a", missing)
+    capped = json.dumps({**good, "hatch_version": "2.46.7"}).encode("utf-8")
+    fit = capped + b" " * (rules["max_bytes"] - len(capped))
+    head = "Gate attempts used up: acceptance gate, build phase, attempt 2. Recorded 2026-11-06T21:39:00Z."
+    return [
+        ("a current record reads as the page words it",
+         current["label_key"] == "halt" and current["lines"] == [
+             head, "major ver-1 a/b.py:88", "minor min-2", "Next: fix the item and rerun."]),
+        ("a history record says so first, and shows no findings or next step",
+         moved["label_key"] == "halt_history" and moved["lines"] == [
+             f"History, not the present reason: the item branch moved from {tip[:7]} to "
+             f"{oid[:7]} after this was recorded.", head]),
+        ("a record of no branch names that",
+         gone["lines"][0] == f"History, not the present reason: the item branch moved from "
+                             f"no branch to {oid[:7]} after this was recorded."),
+        ("a view with no spec to compare is history",
+         why(unknown) == ("history", "spec-unknown") and unknown["lines"][0]
+         == "History, not the present reason: hatch could not read this item's plan to compare."),
+        ("an outcome beside a matching record is history",
+         why(view(parsed(), outcome=True)) == ("history", "outcome-written")),
+        ("no branch then and none now still binds", why(view(parsed(item_tip=None), now_tip=None))
+         == ("current", None)),
+        ("an unknown kind and next step render as literals, still bound",
+         kind["status"] == "current" and kind["lines"][0]
+         == 'Kind "quota-spent" (not known to this hatch version): build phase, attempt 2. '
+            "Recorded 2026-11-06T21:39:00Z."
+         and kind["lines"][-1] == 'Next: "ask-someone" (not known to this hatch version).'),
+        ("an unreadable record says where and that the state does not depend on it",
+         bad["label_key"] == "halt_unread" and bad["lines"] == [
+             "A halt record exists at refs/hatch/s/item-a/halt but hatch could not read it: "
+             "not valid JSON. The item's state does not depend on it."]),
+        ("an unsupported record names its schema and is never interpreted",
+         newer["status"] == "unsupported" and "record" not in newer and newer["lines"] == [
+             "A halt record exists from another hatch version (schema 2). This version does "
+             "not read it. The item's state does not depend on it."]),
+        ("unknown keys are not carried", "extra" not in parsed(extra="x")["fields"]),
+        ("a whole number spelled as a float reads as JavaScript reads it",
+         parsed(attempt=2.0)["fields"]["attempt"] == 2),
+        ("a record exactly at the cap is read", why(parse_halt_record(fit, "s", "a", rules))[0] == "valid"),
+        ("NEGATIVE CONTROL: one byte over the cap is too large",
+         why(parse_halt_record(fit + b" ", "s", "a", rules)) == ("unreadable", "too-large")),
+        ("NEGATIVE CONTROL: a trailing newline fails a pattern",
+         why(parsed(recorded_at="2026-11-06T21:39:00Z\n")) == ("unreadable", "bad-field:recorded_at")),
+        ("NEGATIVE CONTROL: invalid UTF-8 is not JSON",
+         why(parse_halt_record(b'{"a": "\xff"}', "s", "a", rules)) == ("unreadable", "not-json")),
+        ("NEGATIVE CONTROL: NaN is not JSON",
+         why(parse_halt_record(b'{"schema_version": NaN}', "s", "a", rules)) == ("unreadable", "not-json")),
+        ("NEGATIVE CONTROL: a list is not an object",
+         why(parse_halt_record(b"[]", "s", "a", rules)) == ("unreadable", "not-an-object")),
+        ("NEGATIVE CONTROL: a record for another binder is the wrong item",
+         why(parsed(binder="t")) == ("unreadable", "wrong-item")),
+        ("NEGATIVE CONTROL: a fractional attempt fails",
+         why(parsed(attempt=1.5)) == ("unreadable", "bad-field:attempt")),
+        ("NEGATIVE CONTROL: a boolean attempt fails",
+         why(parsed(attempt=True)) == ("unreadable", "bad-field:attempt")),
+        ("NEGATIVE CONTROL: a line of zero fails its findings",
+         why(parsed(findings=[{"severity": "major", "code": "c", "line": 0}]))
+         == ("unreadable", "bad-field:findings")),
+        ("NEGATIVE CONTROL: a schema version that is text is not read",
+         why(parsed(schema_version="2")) == ("unreadable", "bad-field:schema_version")),
+        ("NEGATIVE CONTROL: a gate outside the set fails",
+         why(parsed(gate="other")) == ("unreadable", "bad-field:gate")),
+        *[(f"NEGATIVE CONTROL: {name} fails", why(parsed(**over)) == ("unreadable", want))
+          for name, over, want in (
+              ("a gate that is not text", {"gate": 1}, "bad-field:gate"),
+              ("a gate that is a list", {"gate": ["acceptance-gate"]}, "bad-field:gate"),
+              ("a phase that is absent", {"phase": None}, "bad-field:phase"),
+              ("a phase that is a list", {"phase": ["build"]}, "bad-field:phase"),
+              ("an attempt of zero", {"attempt": 0}, "bad-field:attempt"),
+              ("a finding that is null", {"findings": [None]}, "bad-field:findings"),
+              ("a finding with a control byte in its code",
+               {"findings": [{"severity": "major", "code": "c\x1b[2J"}]}, "bad-field:findings"),
+              ("more findings than the cap",
+               {"findings": [{"severity": "major", "code": "c"}] * 51}, "bad-field:findings"),
+              ("findings that are not a list", {"findings": "x"}, "bad-field:findings"),
+              ("a finding that is not an object", {"findings": [1]}, "bad-field:findings"),
+              ("a severity that is not text",
+               {"findings": [{"severity": 1, "code": "c"}]}, "bad-field:findings"),
+              ("a code that is not text",
+               {"findings": [{"severity": "major", "code": 1}]}, "bad-field:findings"),
+              ("a path that is not text",
+               {"findings": [{"severity": "major", "code": "c", "path": 1}]}, "bad-field:findings"),
+              ("a line that is not a number",
+               {"findings": [{"severity": "major", "code": "c", "line": "1"}]}, "bad-field:findings"),
+              ("a code with a trailing newline",
+               {"findings": [{"severity": "major", "code": "c\n"}]}, "bad-field:findings"),
+              ("an attempt past the safe integers", {"attempt": 2 ** 53}, "bad-field:attempt"),
+              ("a line past the safe integers",
+               {"findings": [{"severity": "major", "code": "c", "line": 2 ** 53}]},
+               "bad-field:findings"))],
+        ("the largest safe integer is whole",
+         parsed(attempt=2 ** 53 - 1)["fields"]["attempt"] == 2 ** 53 - 1),
+        ("exactly the cap of findings is read",
+         why(parsed(findings=[{"severity": "major", "code": "c"}] * rules["max_findings"]))[0]
+         == "valid"),
+        ("nesting at the cap is read", why(nested(rules["max_depth"] - 1))[0] == "valid"),
+        ("NEGATIVE CONTROL: nesting one past the cap is too deep",
+         why(nested(rules["max_depth"])) == ("unreadable", "too-deep")),
+        ("NEGATIVE CONTROL: nesting past Python's recursion limit is too deep, not a crash",
+         why(nested(4000)) == ("unreadable", "too-deep")),
+        ("brackets inside text do not count as nesting",
+         parsed(extra='"[{\\' + "[" * 500)["status"] == "valid"),
+        ("the digest pin covers keys out of order, nesting and non-ASCII text",
+         item_spec_digest({"id": "é", "z": {"b": [1, "ü"], "a": None}})
+         == "8af560c7845a1e511a80abd393f5ef1ca453a6b2f726f0020fe3529b8712e310"),
+        ("a reason never echoes record content",
+         "SECRET" not in json.dumps(view(parsed(gate="SECRET")))),
+        ("a missing rules file reads every record as unreadable and raises nothing",
+         why(norules) == ("unreadable", "no-rules")
+         and halt_view(norules, missing, "r", spec, tip, False) == {
+             "status": "unreadable", "why": "no-rules", "label_key": "halt_unread",
+             "error": "FileNotFoundError", "lines": [
+                 "A halt record exists at r but hatch could not read it: hatch's halt rules "
+                 "file could not be read. The item's state does not depend on it."]}),
+        ("a record that is not JSON names the error's type",
+         bad["error"] == "JSONDecodeError" and "not json" not in bad["error"]),
+        ("a record that is not UTF-8 names the error's type",
+         parse_halt_record(b'"\xff"', "s", "a", rules)["error"] == "UnicodeDecodeError"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2216,6 +3074,11 @@ def _run_self_test() -> int:
         rendered = False; print(f"render raised: {exc}")
     checks.append(("renderers run", rendered))
 
+    checks.extend(item_state_checks("status", _status_item_state))
+    checks.extend(_item_state_seam_checks())
+    checks.extend(_halt_row_checks())
+    checks.extend(_halt_call_checks())
+    checks.extend(_halt_parser_checks())
     checks.extend(_git_facts_self_test_checks())
     checks.extend(_watch_self_test_checks())
 

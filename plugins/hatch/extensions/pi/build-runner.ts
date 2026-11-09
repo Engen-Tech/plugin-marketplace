@@ -6,9 +6,10 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HatchBuildFinalizer, type HatchBuildFinalizationResult } from "./build-finalizer.ts";
 import type { HatchCheckPlanEntry } from "./check-convergence.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
+import { dropFloorCache, lookupFloorCache, recordFloorCache } from "./floor-cache.ts";
 import { itemSpecDigest, readAttempts, recordHostCheck, recordVerification } from "./gate-attempts.ts";
 import { deriveItemGitState, type HatchItemRecoveryState } from "./git-state.ts";
-import { safeProgress, type HatchRunProgress } from "./run-events.ts";
+import { safeProgress, type HatchFloorListReused, type HatchRunProgress } from "./run-events.ts";
 import {
   HatchProcessManager,
   type BinderLifecycleOwner,
@@ -192,6 +193,7 @@ export class HatchBuildItemRunner {
   readonly #finalizer: HatchBuildFinalizer;
   readonly #processes: HatchProcessManager;
   readonly #checkpoint: HatchBuildCheckpoint;
+  readonly #probeGates: (ctx: ExtensionContext) => Promise<string | undefined>;
 
   constructor(
     locks: DispatchLockManager,
@@ -199,12 +201,14 @@ export class HatchBuildItemRunner {
     finalizer: HatchBuildFinalizer,
     processes: HatchProcessManager,
     checkpoint: HatchBuildCheckpoint = () => {},
+    probeGates: (ctx: ExtensionContext) => Promise<string | undefined> = async () => undefined,
   ) {
     this.#locks = locks;
     this.#workers = workers;
     this.#finalizer = finalizer;
     this.#processes = processes;
     this.#checkpoint = checkpoint;
+    this.#probeGates = probeGates;
   }
 
   async run(
@@ -226,7 +230,13 @@ export class HatchBuildItemRunner {
     // Only now does the run own the binder; a run refused the lock never reports a start.
     safeProgress(progress)({ kind: "run-started", binder, item });
     try {
-      return await this.#runLocked(ctx, binder, item, lease, owner, [item]);
+      // Before the worker and any check, so a gate model that cannot answer costs neither.
+      const refused = await this.#probeGates(ctx);
+      if (refused) {
+        const { state } = await deriveItemGitState(ctx.cwd, binder, item);
+        return { schema: "hatch-build-item-v1", binder, item, status: "blocked", recoveryState: state, attempts: 0, message: `Build stopped before the worker: ${refused}` };
+      }
+      return await this.#runLocked(ctx, binder, item, lease, owner, [item], undefined, undefined, safeProgress(progress));
     } finally {
       try {
         await this.#processes.stopOwner(owner);
@@ -244,12 +254,12 @@ export class HatchBuildItemRunner {
     owner: BinderLifecycleOwner,
     waveMates: readonly string[] = [item],
     ledger?: WaveHostLedger,
-    options?: { seedFeedback?: unknown[] },
+    options?: { seedFeedback?: unknown[]; onFloorListReused?: (event: HatchFloorListReused) => void },
   ): Promise<HatchBuildItemResult> {
     if (!(await this.#locks.owns(lease)) || owner.binder !== binder) {
       throw new Error("Hatch build item requires its delivery-owned binder lease and lifecycle");
     }
-    return this.#runLocked(ctx, binder, item, lease, owner, waveMates, ledger, options?.seedFeedback);
+    return this.#runLocked(ctx, binder, item, lease, owner, waveMates, ledger, options?.seedFeedback, options?.onFloorListReused);
   }
 
   async #runLocked(
@@ -261,6 +271,7 @@ export class HatchBuildItemRunner {
     waveMates: readonly string[],
     ledger?: WaveHostLedger,
     seedFeedback?: unknown[],
+    onFloorListReused?: (event: HatchFloorListReused) => void,
   ): Promise<HatchBuildItemResult> {
       // The whole of a build's host work is a host phase for its item, except the
       // worker invocation itself. The ledger records the surface the host authored
@@ -329,11 +340,29 @@ export class HatchBuildItemRunner {
         const beforeWorker = await deriveItemGitState(worktree, binder, item);
         const recoverCommitted = beforeWorker.state === "committed-unmarked";
         const recoverMerged = beforeWorker.state === "merged-unmarked";
+        // The first round of a recovery only needs a worker for its floor list, so a stored
+        // list for this spec stands in for it, on this item tree or after a hand fix that
+        // floor-cache.ts judges still fits it. A round with feedback edits,
+        // so it always runs a worker.
+        const stored = feedback.length === 0 && (recoverCommitted || recoverMerged)
+          ? await lookupFloorCache(repoRoot, {
+              binder,
+              item,
+              specDigest,
+              tree: await git(repoRoot, ["rev-parse", `refs/heads/${branch}^{tree}`]),
+              // Only a committed recovery can follow a hand fix: a landed tree already merged.
+              handFix: recoverCommitted,
+            })
+          : undefined;
+        const reused = stored?.hit ? stored : undefined;
+        if (reused) {
+          onFloorListReused?.({ kind: "floor-list-reused", item, match: reused.match, commands: reused.checks.length });
+        }
         await this.#checkpoint("before-worker");
         await session?.pause();
-        let worker: HatchWorkerResult;
+        let worker: HatchWorkerResult | undefined;
         try {
-          worker = await this.#workers.run(
+          worker = reused ? undefined : await this.#workers.run(
             ctx,
             worktree,
             branch,
@@ -355,8 +384,8 @@ export class HatchBuildItemRunner {
         } finally {
           await session?.resume();
         }
-        await this.#checkpoint("worker-attested");
-        if (worker.outcome === "blocked") {
+        if (worker) await this.#checkpoint("worker-attested");
+        if (worker?.outcome === "blocked") {
           return {
             schema: "hatch-build-item-v1",
             binder,
@@ -369,7 +398,8 @@ export class HatchBuildItemRunner {
             worker,
           };
         }
-        const dropped = [...requiredCheckIds].filter((id) => !worker.checks.some((check) => check.id === id));
+        const proposed = worker?.checks ?? reused?.checks ?? [];
+        const dropped = [...requiredCheckIds].filter((id) => !proposed.some((check) => check.id === id));
         if (dropped.length > 0) {
           return {
             schema: "hatch-build-item-v1",
@@ -386,7 +416,7 @@ export class HatchBuildItemRunner {
             worker,
           };
         }
-        const checks: HatchCheckPlanEntry[] = worker.checks.map((check) => ({
+        const checks: HatchCheckPlanEntry[] = proposed.map((check) => ({
           ...check,
           purpose: "floor",
         }));
@@ -404,7 +434,7 @@ export class HatchBuildItemRunner {
             worker,
           };
         }
-        if (!recoverMerged && feedback.length > 0 && afterWorker.state === "committed-unmarked") {
+        if (worker && !recoverMerged && feedback.length > 0 && afterWorker.state === "committed-unmarked") {
           // The worker was sent findings and changed nothing, so the committed tip is the
           // tip the gate already judged. Re-reviewing it would be a reviewer re-roll.
           if (previous?.status === "retry" && previous.commit) {
@@ -461,6 +491,11 @@ export class HatchBuildItemRunner {
             worker,
           };
         }
+        // A round that goes to finalization clears the floor cache file, and one that reaches
+        // the gates writes it back below. So a crash leaves no list, and a list that fails is
+        // gone: the next run asks a worker instead of halting on a stale command. A landed
+        // item's round finalizes on the merge tree, so it neither drops nor writes.
+        if (!recoverMerged) await dropFloorCache(repoRoot, binder, item);
         const recoveringExactCommit = afterWorker.state === "committed-unmarked";
         await this.#checkpoint("before-finalization");
         const finalization = recoverMerged
@@ -513,6 +548,16 @@ export class HatchBuildItemRunner {
             reviewedTree: finalization.targetTree,
             verification: finalization.verification,
           });
+        }
+        // Only a finalization that reached the gates carries a verification, so every stored
+        // list passed the host checks and the parity probe on this exact tree. Unlike the
+        // ledger row this ignores `ledgerError`: the file says nothing about attempt counts.
+        if (finalization.verification && finalization.targetTree && !recoverMerged) {
+          await recordFloorCache(
+            repoRoot,
+            { binder, item, specDigest, tree: finalization.targetTree, integrationRef, itemRef: `refs/heads/${branch}` },
+            proposed,
+          );
         }
         if (finalization.citationCheck && finalization.targetTree && !ledgerError) {
           await recordHostCheck(repoRoot, {

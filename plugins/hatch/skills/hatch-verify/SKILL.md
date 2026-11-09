@@ -164,6 +164,8 @@ The agent reads the binder on disk, dispositions each `oracle.assertions[i]` as 
 - **Re-plan the unmet assertion as an explicit oracle `opt_out` via hatch-plan, then rerun.** The binder is read-only to build, and hatch has no backlog.
 - **Get a human accept-waiver or defer at the delivery orchestrator's Phase-4 halt.** The orchestrator asks the human directly; this gate never records the accept.
 
+On Pi, the halt prompt also offers **Send back to the worker once**: the human may send the capped item to its own worker one more time with the gate's findings. It waives nothing, the cap stays spent, and this gate's automatic budget is unchanged.
+
 See `references/verification-gate.md`.
 
 **On SPEC-SUSPECT:** halt for human adjudication immediately. Do not loop; do not kick back. The boundary verdict dispatched alongside is recorded in the report but triggers no kickback — a halted item has no corrected diff to re-scan. In a wave the worker leaves the same `failed` anchor — a committed item branch + a `failed` ref carrying the spec-suspect reason (it means "halted at the gate," not "the code is bad"). The binder is amended through hatch-plan; alternatively the human may accept the divergence at the Phase-4 halt (the orchestrator records the waiver against the halted tip), never by this gate.

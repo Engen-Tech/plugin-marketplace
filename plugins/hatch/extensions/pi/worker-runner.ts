@@ -167,7 +167,7 @@ export function workerEnvelopeViolation(
   return null;
 }
 
-function checkProposalsViolation(checks: unknown[]): string | null {
+export function checkProposalsViolation(checks: unknown[]): string | null {
   const ids = new Set<string>();
   for (const [index, proposal] of checks.entries()) {
     const at = `checks[${index}]`;
