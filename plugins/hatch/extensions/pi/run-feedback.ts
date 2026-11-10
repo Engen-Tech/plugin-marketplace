@@ -4,7 +4,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { gateFileFor, type HatchGateRole } from "./gate-attempts.ts";
 import { roleModelsToken } from "./role-models.ts";
-import type { HatchRunEvent, HatchWaveNext } from "./run-events.ts";
+import { describeHatchProvenance, type HatchProvenance, type HatchRunEvent, type HatchRunGateAttempt, type HatchWaveNext } from "./run-events.ts";
 import type { HatchRunAction, HatchRunRecord, HatchRunRoleModels } from "./run-registry.ts";
 
 export const HATCH_RUN_PROGRESS_ENTRY = "hatch-run-progress";
@@ -62,6 +62,7 @@ export interface HatchRunResultDetails {
   finishedAt: string;
   elapsedMs: number;
   roleModels?: HatchRunRoleModels;
+  hatch?: HatchProvenance;
 }
 
 const SHORT_ACTION: Record<HatchRunAction, string> = {
@@ -122,12 +123,19 @@ export function describeRoleModels(roleModels: HatchRunRoleModels): string[] {
   });
 }
 
+function gateAttemptText(gate: HatchRunGateAttempt): string {
+  const source = gate.source ? ` (${gate.source})` : "";
+  const findings = gate.findings.map((finding) => `[${finding.severity}] ${finding.code}`).join(", ");
+  const attempt = gate.attempt !== undefined ? ` attempt ${gate.attempt}` : "";
+  return `${gate.role}${attempt} ${gate.verdict}${source}${findings ? ` ${findings}` : ""}`;
+}
+
 export function describeRunEvent(event: HatchRunEvent): string {
   switch (event.kind) {
     case "run-started":
       return `started${event.item ? ` ${event.item}` : ""}`;
     case "binder-loaded":
-      return `binder loaded: ${event.items.length} items, ${event.carried.length} already landed`;
+      return `binder loaded: ${event.items.length} items, ${event.landed.length} already landed`;
     case "wave-started":
       return `wave ${event.wave} started: ${list(event.items)}`;
     case "item-built":
@@ -143,6 +151,14 @@ export function describeRunEvent(event: HatchRunEvent): string {
       return event.match === "same-tree"
         ? `${event.item} floor list reused; no worker asked (tree unchanged)`
         : `${event.item} floor list reused, not re-derived: ${event.commands} command${event.commands === 1 ? "" : "s"} (hand fix changed only the item's own files)`;
+    case "checks-reused":
+      return event.site === "post-wave"
+        ? `wave ${event.wave} post-wave floor not rerun: ${event.item}'s merge checks covered it on tree ${event.tree.slice(0, 7)}`
+        : `${event.item} merge checks not rerun: the parity probe ran the same ${event.checks} check${event.checks === 1 ? "" : "s"} on tree ${event.tree.slice(0, 7)}`;
+    case "item-halt-unrecorded":
+      return `${event.item} halt not recorded: ${event.error}`;
+    case "gate-reviewed":
+      return `gates ${event.item} ${event.phase}: ${event.gates.map(gateAttemptText).join("; ")}${event.unrecorded ? ` (not recorded in the ledger: ${event.unrecorded})` : ""}`;
     case "gate-ledger-unrecorded":
       return `${event.item} gate verdicts not recorded${event.file ? ` in ${event.file}` : ""}: ${event.error}`;
     case "item-halted": {
@@ -196,6 +212,7 @@ export function runResultDetails(record: HatchRunRecord): HatchRunResultDetails 
     finishedAt: new Date(finishedAt).toISOString(),
     elapsedMs: Math.max(0, finishedAt - record.startedAt),
     ...(record.roleModels !== undefined ? { roleModels: structuredClone(record.roleModels) } : {}),
+    ...(record.hatch !== undefined ? { hatch: { ...record.hatch } } : {}),
   };
 }
 
@@ -274,7 +291,9 @@ export class HatchRunFeedback {
 
   event(record: HatchRunRecord, event: HatchRunEvent, ui: HatchUiSource): void {
     const state = this.#state(record, ui);
-    state.buffer.push(describeRunEvent(event));
+    const line = describeRunEvent(event);
+    // The run's first line names the hatch that runs it, whichever runner sent the start.
+    state.buffer.push(event.kind === "run-started" && record.hatch ? `${line} · ${describeHatchProvenance(record.hatch)}` : line);
     // The host passes run-started once per run, so the table is listed once.
     if (event.kind === "run-started" && record.roleModels) {
       state.buffer.push(...describeRoleModels(record.roleModels));

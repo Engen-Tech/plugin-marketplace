@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createGateCapabilityProfile, type GateCapabilityProfile } from "./capability-profile.ts";
 import {
   ChildRegistry,
   runGateAuthProbe,
@@ -12,11 +14,17 @@ import type { EnvServerContext } from "./env-server-runner.ts";
 import {
   buildHatchEvidence,
   type BuildEvidenceOptions,
+  canonicalJson,
   citationDefectSentence,
   type EvidenceCitationDefect,
   type HatchEvidenceManifest,
+  type HatchReviewedDiff,
+  reviewedDiffOf,
+  reviewInputDigest,
+  verifyEvidenceFreshness,
 } from "./evidence.ts";
 import {
+  composeGateSystemPrompt,
   effectiveGateVerdict,
   executeGateOnEvidence,
   hostNextStepWithRerun,
@@ -69,6 +77,8 @@ export interface HatchVerificationResult {
   requestedMode: HatchVerificationMode;
   effectiveMode: HatchVerificationMode | "skipped";
   evidenceHash: string;
+  // The diff the evidence carried: the gate ledger's range base and diff_sha256.
+  diff: HatchReviewedDiff;
   status: HatchVerificationStatus;
   // Reserved for oracle opt-out prose only — never a typed prerequisite. A spoof-proof
   // split: a machine-typed block uses blockedReason, human opt-out text uses reason.
@@ -88,6 +98,54 @@ export interface HatchVerificationResult {
   // repo-rule citations this item added that the host cannot resolve. Metadata beside
   // the gate verdicts, never inside them. Absent when the evidence lists none.
   citationDefects?: EvidenceCitationDefect[];
+  // Set when no gate ran at merge: the gates are this run's build-time verdicts, each
+  // keeping its own build evidence hash, and every reviewer input was equal (reviewKeys).
+  reused?: HatchReusedReview;
+}
+
+export interface HatchReusedReview {
+  phase: "build";
+  evidenceHash: string; // the build evidence the reused verdicts were given
+  reviewKeys: { acceptance: string; safety: string };
+}
+
+type ReviewedRole = "acceptance-gate" | "safety-gate";
+
+// What a reused review compares, beyond the evidence: the role's definition, the system
+// prompt with the evidence and profile hashes zeroed, and the gate model with the
+// thinking level the child is asked for.
+export interface ReviewKeyInput {
+  input: string; // reviewInputDigest of the evidence
+  role: ReviewedRole;
+  roleDefinitionHash: string;
+  promptTemplateHash: string;
+  model: { provider: string; id: string };
+  thinkingLevel: string;
+}
+
+export function buildReviewKey(input: ReviewKeyInput): string {
+  return createHash("sha256").update(canonicalJson(input)).digest("hex");
+}
+
+const ZERO_HASH = "0".repeat(64);
+
+// The prompt hash the gate binds, minus the two hashes that name the evidence.
+function promptTemplateHash(profile: GateCapabilityProfile): string {
+  return composeGateSystemPrompt({ ...profile, evidenceHash: ZERO_HASH, profileHash: ZERO_HASH }).promptHash;
+}
+
+// The level createChild (child-runtime.ts) asks Pi for: the role's pinned level, else the
+// session's. Pi may clamp it per model, and the model is in the key too. Undefined when
+// no models are pinned on this context.
+function requestedThinkingLevel(ctx: ExtensionContext, role: ReviewedRole): string | undefined {
+  const plan = roleModelsOf(ctx);
+  return plan && (plan.roles[role].thinkingLevel ?? ctx.thinkingLevel ?? "minimal");
+}
+
+interface BuildReviewMemo {
+  evidenceHash: string;
+  reviewKeys: { acceptance: string; safety: string };
+  gates: { acceptance: HatchGateResult; safety: HatchGateResult };
 }
 
 interface GatePreflight {
@@ -103,6 +161,9 @@ export type EvidenceBuilder = (options: BuildEvidenceOptions) => Promise<HatchEv
 export type EvidenceGateExecutor = typeof executeGateOnEvidence;
 export type VerificationEvidenceOptions = Pick<BuildEvidenceOptions, "target" | "checkManifest"> & {
   cwd?: string;
+  // A merge-time caller may take this run's build-time verdicts when every reviewer
+  // input is equal. Never set on an accept or a boundary-only review.
+  reuseBuildReview?: true;
 };
 
 // The optional, backwards-compatible lifecycle/process context a build-finalizer or
@@ -286,6 +347,62 @@ function gateStatus(gate: HatchGateResult): HatchVerificationStatus {
   return effectiveGateVerdict(gate.role, gate.verdict, gate.findings);
 }
 
+// A visual oracle runs its own acceptance path, and an opt-out runs no gate: neither has
+// a pair of verdicts to reuse.
+function reviewableOracle(evidence: HatchEvidenceManifest): boolean {
+  const itemOracle = oracle(evidence);
+  return itemOracle.opt_out !== true && itemOracle.type !== "visual";
+}
+
+type ThinkingLevels = Record<ReviewedRole, string | undefined>;
+
+// Read before the review runs, when the gate children take them: a level changed while
+// the review runs must not be credited to it.
+function thinkingLevelsOf(ctx: ExtensionContext): ThinkingLevels {
+  return {
+    "acceptance-gate": requestedThinkingLevel(ctx, "acceptance-gate"),
+    "safety-gate": requestedThinkingLevel(ctx, "safety-gate"),
+  };
+}
+
+// The memo a build-time verification leaves, or undefined when it may not be reused: both
+// gates gave an effective pass from a gate child on this evidence, under the role file
+// that is current now, at the thinking levels read before the review ran.
+function buildReviewMemo(
+  thinkingLevels: ThinkingLevels,
+  evidence: HatchEvidenceManifest,
+  judged: Omit<HatchVerificationResult, "diff">,
+): BuildReviewMemo | undefined {
+  const { acceptance, safety, visual } = judged.gates;
+  if (judged.status !== "pass" || judged.effectiveMode !== "full" || visual || !acceptance || !safety) return undefined;
+  if (!reviewableOracle(evidence)) return undefined;
+  const input = reviewInputDigest(evidence);
+  const key = (gate: HatchGateResult, role: ReviewedRole): string | undefined => {
+    if (gate.role !== role || gate.verdictSource === "host" || gate.evidenceHash !== evidence.evidenceHash) return undefined;
+    if (effectiveGateVerdict(role, gate.verdict, gate.findings) !== "pass") return undefined;
+    const profile = createGateCapabilityProfile(role, evidence);
+    if (gate.roleDefinitionHash !== profile.role.definitionHash) return undefined;
+    const thinkingLevel = thinkingLevels[role];
+    if (thinkingLevel === undefined) return undefined;
+    return buildReviewKey({
+      input,
+      role,
+      roleDefinitionHash: gate.roleDefinitionHash,
+      promptTemplateHash: promptTemplateHash(profile),
+      model: { provider: gate.provider, id: gate.model },
+      thinkingLevel,
+    });
+  };
+  const acceptanceKey = key(acceptance, "acceptance-gate");
+  const safetyKey = key(safety, "safety-gate");
+  if (!acceptanceKey || !safetyKey) return undefined;
+  return {
+    evidenceHash: evidence.evidenceHash,
+    reviewKeys: { acceptance: acceptanceKey, safety: safetyKey },
+    gates: { acceptance, safety },
+  };
+}
+
 export class HatchVerificationRunner {
   readonly #preflight: GatePreflight;
   readonly #children: ChildRegistry;
@@ -296,6 +413,11 @@ export class HatchVerificationRunner {
   readonly #visionPreflight: VisionPreflightProbe;
   readonly #captureVisual: VisualCaptureRunner;
   readonly #judgeVisual: VisualAcceptanceJudge;
+  readonly #verifyFreshness: (manifest: HatchEvidenceManifest) => Promise<void>;
+  // Build-time passes per delivery lease, keyed by item. A resumed run holds a new lease,
+  // so it starts empty and reviews again. Process memory only: nothing persisted, the
+  // gate ledger included, can grant a skip.
+  readonly #buildReviews = new WeakMap<DispatchLockLease, Map<string, BuildReviewMemo>>();
 
   constructor(
     preflight: GatePreflight,
@@ -308,6 +430,7 @@ export class HatchVerificationRunner {
       visionPreflight?: VisionPreflightProbe;
       captureVisual?: VisualCaptureRunner;
       judgeVisual?: VisualAcceptanceJudge;
+      verifyFreshness?: (manifest: HatchEvidenceManifest) => Promise<void>;
     } = {},
   ) {
     this.#preflight = preflight;
@@ -320,6 +443,7 @@ export class HatchVerificationRunner {
       options.visionPreflight ?? ((ctx, _registry, target) => runGateAuthProbe(ctx, target));
     this.#captureVisual = options.captureVisual ?? captureVisualEvidence;
     this.#judgeVisual = options.judgeVisual ?? defaultJudgeVisual;
+    this.#verifyFreshness = options.verifyFreshness ?? verifyEvidenceFreshness;
   }
 
   // Run start, before any worker or check: probe the acceptance and safety models on the
@@ -356,7 +480,7 @@ export class HatchVerificationRunner {
       safeProgress(progress)({ kind: "run-started", binder, item });
       // The context-less entrypoint (hatch_dispatch runVerification / the index.ts
       // construction) has no lifecycle owner, so a visual oracle blocks visual-no-context.
-      return await this.#runLocked(ctx, binder, item, requestedMode, {}, undefined);
+      return await this.#runLocked(ctx, binder, item, requestedMode, {}, undefined, lease);
     } finally {
       await this.#locks.release(lease);
     }
@@ -375,9 +499,13 @@ export class HatchVerificationRunner {
       throw new Error(`Hatch verification does not own the supplied lock for binder '${binder}'`);
     }
     if (ctx.signal?.aborted) throw new Error("Hatch verification was cancelled before dispatch");
-    return this.#runLocked(ctx, binder, item, requestedMode, evidenceOptions, visualContext);
+    return this.#runLocked(ctx, binder, item, requestedMode, evidenceOptions, visualContext, lease);
   }
 
+  // Builds the evidence and judges it. A full pass at a build target is remembered for
+  // the lease; a merge-time caller that asks for it gets those verdicts back, with no gate
+  // run, when the review key of each gate is equal (buildReviewKey). Any other build-time
+  // outcome, and a merge-time review that does not pass, forgets the item's entry.
   async #runLocked(
     ctx: ExtensionContext,
     binder: string,
@@ -385,17 +513,72 @@ export class HatchVerificationRunner {
     requestedMode: HatchVerificationMode,
     evidenceOptions: VerificationEvidenceOptions,
     visualContext: HatchVisualLifecycleContext | undefined,
+    lease: DispatchLockLease,
   ): Promise<HatchVerificationResult> {
-    const { cwd = ctx.cwd, ...targetOptions } = evidenceOptions;
+    const { cwd = ctx.cwd, reuseBuildReview, ...targetOptions } = evidenceOptions;
     const evidence = await this.#buildEvidence({
       cwd,
       binder,
       item,
       ...targetOptions,
     });
-    const result = await this.#judge(ctx, binder, item, requestedMode, evidence, visualContext);
     const defects = evidence.payload.citationDefects ?? [];
-    return defects.length > 0 ? { ...result, citationDefects: defects } : result;
+    const withDiff = (judged: Omit<HatchVerificationResult, "diff">): HatchVerificationResult => {
+      const result = { ...judged, diff: reviewedDiffOf(evidence) };
+      return defects.length > 0 ? { ...result, citationDefects: defects } : result;
+    };
+    let memos = this.#buildReviews.get(lease);
+    if (!memos) this.#buildReviews.set(lease, (memos = new Map()));
+    const kind = evidence.payload.git.targetKind;
+    const buildTarget = kind === "candidate-tree" || kind === "committed-tip";
+    if (reuseBuildReview && requestedMode === "full" && kind === "merge-tree" && reviewableOracle(evidence)) {
+      const memo = memos.get(item);
+      const keys = memo && this.#mergeReviewKeys(ctx, evidence);
+      if (memo && keys && keys.acceptance === memo.reviewKeys.acceptance && keys.safety === memo.reviewKeys.safety) {
+        await this.#verifyFreshness(evidence);
+        return withDiff({
+          schema: "hatch-verification-v1",
+          binder,
+          item,
+          requestedMode: "full",
+          effectiveMode: "full",
+          evidenceHash: evidence.evidenceHash,
+          status: "pass",
+          gates: { ...memo.gates },
+          reused: { phase: "build", evidenceHash: memo.evidenceHash, reviewKeys: { ...memo.reviewKeys } },
+        });
+      }
+    }
+    // Forget first, so a review that throws leaves no earlier pass behind.
+    if (buildTarget) memos.delete(item);
+    const thinkingLevels = thinkingLevelsOf(ctx);
+    const judged = await this.#judge(ctx, binder, item, requestedMode, evidence, visualContext);
+    if (buildTarget) {
+      const memo = requestedMode === "full" ? buildReviewMemo(thinkingLevels, evidence, judged) : undefined;
+      if (memo) memos.set(item, memo);
+    } else if (judged.status !== "pass") {
+      memos.delete(item);
+    }
+    return withDiff(judged);
+  }
+
+  // The review key each gate would have on this merge evidence, under the current role
+  // files and the run's pinned gate models and thinking levels.
+  #mergeReviewKeys(ctx: ExtensionContext, evidence: HatchEvidenceManifest): { acceptance: string; safety: string } {
+    const input = reviewInputDigest(evidence);
+    const key = (role: ReviewedRole): string => {
+      const profile = createGateCapabilityProfile(role, evidence);
+      const target = requireRoleModel(ctx, role);
+      return buildReviewKey({
+        input,
+        role,
+        roleDefinitionHash: profile.role.definitionHash,
+        promptTemplateHash: promptTemplateHash(profile),
+        model: { provider: target.provider, id: target.id },
+        thinkingLevel: requestedThinkingLevel(ctx, role)!, // requireRoleModel proved a plan
+      });
+    };
+    return { acceptance: key("acceptance-gate"), safety: key("safety-gate") };
   }
 
   async #judge(
@@ -405,7 +588,7 @@ export class HatchVerificationRunner {
     requestedMode: HatchVerificationMode,
     evidence: HatchEvidenceManifest,
     visualContext: HatchVisualLifecycleContext | undefined,
-  ): Promise<HatchVerificationResult> {
+  ): Promise<Omit<HatchVerificationResult, "diff">> {
     const itemOracle = oracle(evidence);
     if (itemOracle.opt_out === true) {
       return {
@@ -423,58 +606,60 @@ export class HatchVerificationRunner {
         gates: {},
       };
     }
-    // A full visual oracle dispatches no acceptance gate (acceptance stays skipped): it
-    // runs the boundary safety gate, then — if safety passes and a lifecycle context is
-    // present — the ordered visual acceptance path below. The mode is never downgraded — a
-    // full request stays full, so callers see requestedMode and effectiveMode as "full".
+    // A full non-visual oracle dispatches the acceptance and safety gates together on the
+    // same evidence, each in its own fresh read-only child, while this run keeps holding
+    // the one dispatch lock: neither gate writes, and neither reads what the other says
+    // (hatch-verify SKILL.md, "Parallel dispatch and verdict currency"). A full visual
+    // oracle dispatches no acceptance gate (acceptance stays skipped): it runs the boundary
+    // safety gate, then — if safety passes and a lifecycle context is present — the ordered
+    // visual acceptance path below. The mode is never downgraded — a full request stays
+    // full, so callers see requestedMode and effectiveMode as "full".
     const isVisualOracle = itemOracle.type === "visual";
     const effectiveMode: HatchVerificationMode = requestedMode;
     const gates: HatchVerificationResult["gates"] = {};
+    const dispatch = (role: "acceptance-gate" | "safety-gate") =>
+      this.#executeGate(ctx, role, evidence, this.#preflight, this.#children, this.#invoke);
+    const result = (status: HatchVerificationStatus): Omit<HatchVerificationResult, "diff"> => ({
+      schema: "hatch-verification-v1",
+      binder,
+      item,
+      requestedMode,
+      effectiveMode,
+      evidenceHash: evidence.evidenceHash,
+      status,
+      gates,
+    });
     if (effectiveMode === "full" && !isVisualOracle) {
-      gates.acceptance = await this.#executeGate(
-        ctx,
-        "acceptance-gate",
-        evidence,
-        this.#preflight,
-        this.#children,
-        this.#invoke,
-      );
-      if (gateStatus(gates.acceptance) !== "pass") {
-        return {
-          schema: "hatch-verification-v1",
-          binder,
-          item,
-          requestedMode,
-          effectiveMode,
-          evidenceHash: evidence.evidenceHash,
-          status: gateStatus(gates.acceptance),
-          gates,
-        };
+      // allSettled, so a gate that throws never releases the lock under the other gate.
+      const [acceptance, safety] = await Promise.allSettled([dispatch("acceptance-gate"), dispatch("safety-gate")]);
+      if (acceptance.status === "rejected") throw acceptance.reason;
+      if (safety.status === "rejected") throw safety.reason;
+      // Only verdicts bound to the same evidence, and so to the same diff, are combined.
+      if (
+        acceptance.value.evidenceHash !== evidence.evidenceHash ||
+        safety.value.evidenceHash !== evidence.evidenceHash
+      ) {
+        throw new Error("Hatch gate verdicts are bound to different evidence; refusing to combine them");
       }
+      gates.acceptance = acceptance.value;
+      gates.safety = safety.value;
+      // Both verdicts stay on the result, so a worker sent back gets both gates' findings
+      // in one round. A gate that gave no verdict halts, and a concern beside it never
+      // turns that halt into a retry; otherwise either gate's concern is the overall
+      // concern, and only two passes pass.
+      const statuses = [gateStatus(gates.acceptance), gateStatus(gates.safety)];
+      return result(
+        statuses.includes("blocked") ? "blocked" : statuses.includes("concerns") ? "concerns" : "pass",
+      );
     }
-    gates.safety = await this.#executeGate(
-      ctx,
-      "safety-gate",
-      evidence,
-      this.#preflight,
-      this.#children,
-      this.#invoke,
-    );
-    // Ordered, package-owned result derivation. Callers key on the top-level
-    // status/blockedReason, never on gates.safety.verdict as the overall verdict.
+    gates.safety = await dispatch("safety-gate");
+    // Ordered, package-owned result derivation for a boundary-only request and a visual
+    // oracle. Callers key on the top-level status/blockedReason, never on
+    // gates.safety.verdict as the overall verdict.
     // 1. A non-pass safety verdict is the overall failure and is never overwritten — a
     //    safety failure is surfaced as itself, never folded into a visual reason.
     if (gateStatus(gates.safety) !== "pass") {
-      return {
-        schema: "hatch-verification-v1",
-        binder,
-        item,
-        requestedMode,
-        effectiveMode,
-        evidenceHash: evidence.evidenceHash,
-        status: gateStatus(gates.safety),
-        gates,
-      };
+      return result(gateStatus(gates.safety));
     }
     // 2. Safety passed. A full visual oracle now runs the real visual acceptance path:
     //    vision preflight, then capture, then the visual gate — lifting the block only on
@@ -496,16 +681,7 @@ export class HatchVerificationRunner {
       };
     }
     // 3. Otherwise the passing safety verdict is the overall verdict.
-    return {
-      schema: "hatch-verification-v1",
-      binder,
-      item,
-      requestedMode,
-      effectiveMode,
-      evidenceHash: evidence.evidenceHash,
-      status: gateStatus(gates.safety),
-      gates,
-    };
+    return result(gateStatus(gates.safety));
   }
 
   // The ordered visual acceptance derivation, run only after safety passes for a full

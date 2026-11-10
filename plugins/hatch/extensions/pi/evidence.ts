@@ -244,6 +244,67 @@ export function hashEvidencePayload(payload: HatchEvidencePayload): string {
   return sha256(canonicalJson(payload));
 }
 
+// The payload paths a reused review does not compare. The item tip and target kind
+// differ between a build target and the merge of the same tree. Both are shown in the
+// `hatch_evidence summary` (`git: manifest.payload.git`), but carry no reviewable
+// content: the tip is an opaque SHA no reviewer tool can dereference, the commit's
+// content is targetTree (compared), and the target kind is a label that neither role
+// prompt nor the Pi gate contract branches on. Re-check this exclusion whenever a role
+// prompt (agents/hatch-acceptance-reviewer.md, agents/hatch-safety-auditor.md) or the Pi
+// contract names the target kind. The receipt fields are each run's own log and timing.
+// Every other payload field is compared, so a field added later can only cause an extra
+// review. `[]` walks every element of an array.
+//
+// Two gate-prompt inputs outside the payload are not keyed either. Pi's `<cwd>` section
+// holds repositoryRoot, which always differs (the item worktree at build, the
+// integration worktree at merge); it is inert text, because a gate child has no tool
+// that opens a path. The APPEND_SYSTEM.md addendum no longer reaches a gate child at
+// all (createIsolatedResourceLoader's noAppendSystemPrompt; see
+// docs/bugs/pi-gate-child-loads-append-system.md). Revisit the key if gate children gain
+// any path-based capability or Pi adds a cwd-derived prompt section.
+export const REVIEW_INPUT_EXCLUDED_PATHS = [
+  "git.itemTip",
+  "git.targetKind",
+  "checks.manifest.manifest.entries[].receipt.stdout",
+  "checks.manifest.manifest.entries[].receipt.stderr",
+  "checks.manifest.manifest.entries[].receipt.stdoutTruncated",
+  "checks.manifest.manifest.entries[].receipt.stderrTruncated",
+  "checks.manifest.manifest.entries[].receipt.durationMs",
+] as const;
+
+function deletePath(value: unknown, parts: readonly string[]): void {
+  if (!value || typeof value !== "object") return;
+  const [head, ...rest] = parts;
+  const record = value as Record<string, unknown>;
+  if (head.endsWith("[]")) {
+    const list = record[head.slice(0, -2)];
+    if (Array.isArray(list)) for (const entry of list) deletePath(entry, rest);
+  } else if (rest.length === 0) {
+    delete record[head];
+  } else {
+    deletePath(record[head], rest);
+  }
+}
+
+// The SHA-256 of everything a gate reviewer can read in the evidence, less the excluded
+// paths above. Equal digests mean a reviewer of either manifest sees the same inputs.
+export function reviewInputDigest(manifest: HatchEvidenceManifest): string {
+  const payload = structuredClone(manifest.payload);
+  for (const path of REVIEW_INPUT_EXCLUDED_PATHS) deletePath(payload, path.split("."));
+  return sha256(canonicalJson(payload));
+}
+
+// The diff an evidence manifest carries, named the way the gate ledger records it: the
+// range's base (the tree is the reviewed tree) and the SHA-256 of the diff bytes.
+export interface HatchReviewedDiff {
+  base: string;
+  sha256: string;
+}
+
+export function reviewedDiffOf(manifest: HatchEvidenceManifest): HatchReviewedDiff {
+  return { base: manifest.payload.git.diffBase, sha256: manifest.payload.diff.sha256 };
+}
+
 export function hashCheckCommand(command: string): string {
   return sha256(command);
 }
@@ -273,6 +334,26 @@ function validateIdentifier(kind: string, value: string): void {
   if (!IDENTIFIER.test(value)) throw new Error(`Invalid Hatch ${kind}: ${value}`);
 }
 
+// Read at call time, so a test can shorten it. Unset, invalid, or above the largest delay
+// a Node timer accepts (Node would fire it after 1 ms) keeps the 30 s default.
+function uvTimeoutMs(): number {
+  const override = Number(process.env.HATCH_EVIDENCE_UV_TIMEOUT_MS);
+  return Number.isInteger(override) && override > 0 && override <= 2_147_483_647 ? override : 30_000;
+}
+
+// A uv run that execFile killed for running past `timeout` names the command and the
+// limit, then any output, so a slow host is not reported as a bad binder or pack.
+// `killed` is the only field that tells this apart from a child that died of SIGTERM
+// itself or a maxBuffer overflow. Any other failure gives its output, else `fallback`.
+function uvFailure(error: unknown, script: string, timeout: number, fallback: string): Error {
+  const { stdout, stderr, killed } = error as { stdout?: string; stderr?: string; killed?: boolean };
+  const output = `${stdout ?? ""}${stderr ?? ""}`.trim();
+  const limit = timeout % 1000 === 0 ? `${timeout / 1000} s` : `${timeout} ms`;
+  const timedOut = `uv run --script ${script} did not finish in ${limit}`;
+  if (killed === true) return new Error(output ? `${timedOut}:\n${output}` : timedOut);
+  return new Error(output || fallback);
+}
+
 async function validateBinderSource(raw: string, slug: string): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "hatch-evidence-binder-"));
   const path = join(root, `${slug}.json`);
@@ -282,6 +363,7 @@ async function validateBinderSource(raw: string, slug: string): Promise<void> {
   environment.PYTHONNOUSERSITE = "1";
   environment.PYTHONSAFEPATH = "1";
   await writeFile(path, raw);
+  const timeout = uvTimeoutMs();
   try {
     await exec(
       "uv",
@@ -292,11 +374,10 @@ async function validateBinderSource(raw: string, slug: string): Promise<void> {
         "--binder",
         path,
       ],
-      { encoding: "utf8", env: environment, timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
+      { encoding: "utf8", env: environment, timeout, maxBuffer: 2 * 1024 * 1024 },
     );
   } catch (error) {
-    const output = `${(error as { stdout?: string }).stdout ?? ""}${(error as { stderr?: string }).stderr ?? ""}`.trim();
-    throw new Error(output || `Hatch binder '${slug}' failed package validation`);
+    throw uvFailure(error, "validate_binder.py", timeout, `Hatch binder '${slug}' failed package validation`);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -396,6 +477,27 @@ export function parseRepoRuleLine(line: string): RepoRuleLine | undefined {
   return cited ? { kind: "malformed", cited } : { kind: "malformed" };
 }
 
+// The tree the index holds, written from a private copy of the index. `git write-tree` on
+// the index itself takes the index lock and fails while another process holds it, and the
+// acceptance and safety gates check freshness on the same worktree at the same time.
+async function indexTree(cwd: string): Promise<string> {
+  const index = resolve(cwd, (await git(cwd, ["rev-parse", "--git-path", "index"])).trim());
+  const dir = await mkdtemp(join(tmpdir(), "hatch-index-"));
+  try {
+    const copy = join(dir, "index");
+    await writeFile(copy, await readFile(index));
+    const { stdout } = await exec("git", ["-C", cwd, "write-tree"], {
+      encoding: "utf8",
+      env: { ...process.env, GIT_INDEX_FILE: copy },
+    }).catch((error: { stderr?: string }) => {
+      throw new Error(error.stderr?.trim() || "git write-tree failed");
+    });
+    return stdout.trim();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function candidateTree(
   cwd: string,
   expectedBranch: string,
@@ -409,7 +511,7 @@ async function candidateTree(
       `Hatch candidate '${expectedBranch}' has unstaged or untracked changes; stage the exact candidate before verification`,
     );
   }
-  const tree = (await git(cwd, ["write-tree"])).trim();
+  const tree = await indexTree(cwd);
   const headTree = (await git(cwd, ["rev-parse", "HEAD^{tree}"])).trim();
   return tree === headTree ? undefined : { kind: "candidate-tree", tree };
 }
@@ -836,6 +938,7 @@ async function resolvePackChecklist(
   environment.PYTHONNOUSERSITE = "1";
   environment.PYTHONSAFEPATH = "1";
   await writeFile(path, content);
+  const timeout = uvTimeoutMs();
   try {
     const { stdout } = await exec(
       "uv",
@@ -845,7 +948,7 @@ async function resolvePackChecklist(
         requirePackagePath("skills/hatch-kaizen/scripts/resolve_pack_checklist.py"),
         path,
       ],
-      { encoding: "utf8", env: environment, timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
+      { encoding: "utf8", env: environment, timeout, maxBuffer: 2 * 1024 * 1024 },
     );
     const checklist = JSON.parse(stdout) as unknown;
     if (
@@ -863,8 +966,7 @@ async function resolvePackChecklist(
     }
     return checklist as EvidenceChecklistItem[];
   } catch (error) {
-    const output = `${(error as { stdout?: string }).stdout ?? ""}${(error as { stderr?: string }).stderr ?? ""}`.trim();
-    throw new Error(output || `Hatch pack '${id}' checklist resolution failed`);
+    throw uvFailure(error, "resolve_pack_checklist.py", timeout, `Hatch pack '${id}' checklist resolution failed`);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

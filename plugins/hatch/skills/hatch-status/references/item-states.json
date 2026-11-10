@@ -5,7 +5,7 @@
     "A cell is what that reader derives today, not what it should derive. It is a reader's own word: a Pi recovery state, a status item state (or not-in-binder when status lists no entry), or the sorted list of guard findings for the binder, where an empty list means the guard allows the stop. A cell of {\"skip\": why} says the reader does not model the row and why; the test prints it.",
     "A row's setup names entries of steps, run in order after seed in an empty directory, with git -C <repo> and nothing else. No sha is stored, so a row reads the same in any repo. A row's work_items replaces the binder's.",
     "disagreements lists each row where the readers mean different things by one configuration. They are findings for a later change: no reader was changed to agree, and none is named right. scripts/validate_plugin.py holds each side to the table's cells, requires every row outside its short list of agreeing readings to be covered here, and pins the row count and every skip.",
-    "A row with a halt key plants a record at refs/hatch/<slug>/item-<item>/halt after its setup, through one helper per language (plant_halt_record in hatch_next.py, tests/pi/fixtures/plant-halt-record.ts), and each helper fails when the ref is absent afterwards. halt.fields overrides halt_record; @item_tip, @integration_tip and @failed_tip resolve after the steps (null when absent) and @spec is the item's digest, which both helpers compare to halt_spec_digest. halt.raw writes those bytes, halt.repeat times; halt.findings repeats the first finding that many times; halt.commit points the ref at the item tip. base names the row this one equals except for the record: hatch_next.py --self-test fails unless the two rows' cells and their whole derived state agree. view is what each parser must read, and where it carries lines, the exact words both languages must show. view_skip names a language whose parser the row cannot reach, and why."
+    "A row with a halt key plants a record at refs/hatch/<slug>/item-<item>/halt after its setup, through one helper per language (plant_halt_record in hatch_next.py, tests/pi/fixtures/plant-halt-record.ts), and each helper fails when the ref is absent afterwards. halt.fields overrides halt_record; @item_tip, @integration_tip and @failed_tip resolve after the steps (null when absent) and @spec is the item's digest, which both helpers compare to halt_spec_digest. halt.raw writes those bytes, halt.repeat times; halt.findings repeats the first finding that many times; halt.commit points the ref at the item tip. halt.write ({}) writes halt_record's fields through the real writers instead (halt_record.py write in Python, gitHaltRecordStore().write in Pi, with recorded_at as the clock), which keep their own item tip, integration tip and hatch version, so those rows prove the writers' serializing, validation, secret scan and compare-and-swap; any other halt key fails both helpers. The rest stay planted: the malformed and unsupported rows hold bytes a writer refuses to make; failed+halt-kind holds a kind newer than this writer; failed+halt-spec-unknown is a Pi-only read condition; failed+halt-tip, -spec, -both and superseded+halt are bound to a tip or digest the state does not hold; built+halt, done+halt and accepted+halt model a record a crash or an older hatch left, since a writer skips beside an outcome; and no-branch+halt has no item branch, which halt_record.py write refuses. base names the row this one equals except for the record: hatch_next.py --self-test fails unless the two rows' cells and their whole derived state agree. view is what each parser must read, and where it carries lines, the exact words both languages must show. view_skip names a language whose parser the row cannot reach, and why."
   ],
   "readers": [
     "pi",
@@ -1049,7 +1049,9 @@
         "status": "failed",
         "guard": []
       },
-      "halt": {},
+      "halt": {
+        "write": {}
+      },
       "view": {
         "status": "current",
         "lines": [
@@ -1448,7 +1450,9 @@
         "status": "failed",
         "guard": []
       },
-      "halt": {},
+      "halt": {
+        "write": {}
+      },
       "view": {
         "status": "current"
       }
@@ -1465,7 +1469,9 @@
         "status": "building",
         "guard": []
       },
-      "halt": {},
+      "halt": {
+        "write": {}
+      },
       "view": {
         "status": "current"
       }
@@ -1483,7 +1489,9 @@
         "status": "building",
         "guard": []
       },
-      "halt": {},
+      "halt": {
+        "write": {}
+      },
       "view": {
         "status": "current"
       }

@@ -10,6 +10,7 @@ export const HATCH_SCRIPT_PATHS = {
   deliverPreflight: "skills/hatch-deliver/scripts/deliver_preflight.py",
   detectStack: "skills/hatch-plan/scripts/detect_stack.py",
   diffCapture: "skills/hatch-validate/scripts/diff_capture.py",
+  haltRecord: "skills/hatch-status/scripts/halt_record.py",
   gateAttempts: "skills/hatch-verify/scripts/gate_attempts.py",
   itemContext: "skills/hatch-build/scripts/item_context.py",
   hatchNext: "skills/hatch-status/scripts/hatch_next.py",

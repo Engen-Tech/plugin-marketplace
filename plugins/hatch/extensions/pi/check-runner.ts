@@ -11,6 +11,7 @@ import {
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT = 10 * 60 * 1000;
+const HATCH_HOST_PATH = "HATCH_HOST_PATH";
 
 export const CHECK_ENVIRONMENT_HASH = createHash("sha256")
   .update(
@@ -24,6 +25,7 @@ export const CHECK_ENVIRONMENT_HASH = createHash("sha256")
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
       ],
       ci: "default-1",
+      path: "host-first",
     }),
   )
   .digest("hex");
@@ -145,9 +147,6 @@ export async function runBoundCheck(options: RunCheckOptions): Promise<UnboundCh
   const stdout: BoundedOutput = { text: "", truncated: false };
   const stderr: BoundedOutput = { text: "", truncated: false };
   const shell = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : "/bin/sh";
-  const args = process.platform === "win32"
-    ? ["/d", "/s", "/c", options.command]
-    : ["-lc", options.command];
   return new Promise((resolveRun, rejectRun) => {
     let stopped: "timed-out" | "aborted" | undefined;
     let forceKill: NodeJS.Timeout | undefined;
@@ -156,6 +155,18 @@ export async function runBoundCheck(options: RunCheckOptions): Promise<UnboundCh
       delete environment[key];
     }
     environment.CI = environment.CI ?? "1";
+    // A login shell's profile can replace PATH (Debian's /etc/profile does), which drops the
+    // host's node, uv and venv entries. Put the host's entries back in front of the profile's.
+    // The value travels in the environment, never in the command text. `command` keeps a
+    // readonly PATH from ending the shell, and the separator is added only when PATH is set.
+    let shellCommand = options.command;
+    if (process.platform !== "win32" && typeof environment.PATH === "string") {
+      environment[HATCH_HOST_PATH] = environment.PATH;
+      shellCommand = `command export PATH="\${${HATCH_HOST_PATH}:+\${${HATCH_HOST_PATH}}\${PATH:+:}}\${PATH}"; unset ${HATCH_HOST_PATH}; ${options.command}`;
+    }
+    const args = process.platform === "win32"
+      ? ["/d", "/s", "/c", options.command]
+      : ["-lc", shellCommand];
     const child = spawn(shell, args, {
       cwd,
       env: environment,

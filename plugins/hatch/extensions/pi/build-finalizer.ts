@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  rememberParity,
   runStableTreeChecks,
   type CheckConvergenceResult,
   type HaltedCheckConvergenceResult,
@@ -16,17 +17,25 @@ import {
   buildHatchEvidence,
   CITATION_DEFECT_CODES,
   REPO_RULE_CITATION_SHAPE,
+  reviewedDiffOf,
   verifyEvidenceFreshness,
   type EvidenceCitationDefect,
   type HatchCheckManifest,
+  type HatchReviewedDiff,
 } from "./evidence.ts";
 import type { HatchGateFinding } from "./gate-runner.ts";
+import { haltDeleteLine, updateRefsTransaction } from "./halt-writer.ts";
 import { validateCandidateHooks, type HookValidationResult } from "./hook-runner.ts";
-import { requirePackagePath } from "./package-paths.ts";
 import {
   HatchProcessManager,
   type BinderLifecycleOwner,
 } from "./process-manager.ts";
+import {
+  protectedPathRefusal,
+  runSecretScan,
+  secretMatchRefusal,
+  type HostRefusal,
+} from "./secret-scan.ts";
 import {
   blockedVerificationMessage,
   type HatchVerificationResult,
@@ -72,8 +81,8 @@ export interface HatchBuildFinalizationResult {
   hookValidation?: HookValidationResult;
   verification?: HatchVerificationResult;
   // Set when the citation pre-check sent the candidate back before any check or gate:
-  // the preliminary evidence hash and one host-written finding per citation defect.
-  citationCheck?: { evidenceHash: string; findings: HatchGateFinding[] };
+  // the preliminary evidence hash and diff, and one host-written finding per citation defect.
+  citationCheck?: { evidenceHash: string; diff: HatchReviewedDiff; findings: HatchGateFinding[] };
   // Set when a check the worker itself proposed failed or timed out when the host reran
   // it, and the caller allowed the kickback: the worker wrote that check, so the worker
   // gets it back. The binder oracle and the environment checks never set it.
@@ -81,12 +90,16 @@ export interface HatchBuildFinalizationResult {
   // Set on an empty candidate whose already-present oracle probe changed the worktree
   // (tracked or untracked, not ignored); the host restored it to HEAD before returning.
   probeRestored?: boolean;
+  // Set on a `blocked` result the host refused before any gate: a secret-scan match or a
+  // change to protected orchestration state. No commit and no ref is written for it.
+  refusal?: HostRefusal;
   message: string;
 }
 
 export interface HatchWorkerCheckFailure {
-  // The preliminary evidence hash of the candidate the check ran on.
+  // The preliminary evidence hash and diff of the candidate the check ran on.
   evidenceHash: string;
+  diff: HatchReviewedDiff;
   check: {
     id: string;
     command: string;
@@ -139,38 +152,49 @@ async function nullObjectId(cwd: string): Promise<string> {
   throw new Error(`Hatch does not support Git object format '${format}'`);
 }
 
-async function scanSecrets(
-  cwd: string,
-  committedRange?: { base: string; target: string },
+/**
+ * The halt record's update line for the commit `failed` will name, so the record and the
+ * state land in one transaction. The build runner's callback never throws; a record it
+ * cannot keep gives no line, and the build says why.
+ */
+export type FailedHaltLines = (commit: string) => Promise<readonly string[]>;
+
+// `create` refuses a `failed` ref that already stands, as the old null-old-value update did.
+// The record's line rides the same transaction, so both land or neither does; a line git
+// refuses fails the whole write, as a refused `failed` write always has. A callback that
+// throws anyway is a record not kept, never a reason to leave `failed` unwritten.
+async function writeFailed(
+  worktree: string,
+  binder: string,
+  item: string,
+  commit: string,
+  haltLines: FailedHaltLines | undefined,
 ): Promise<void> {
-  const args = [
-    "run",
-    "--script",
-    requirePackagePath("skills/hatch-build/scripts/scan_secrets.py"),
-  ];
-  if (committedRange) args.push("--base", committedRange.base, "--target", committedRange.target);
-  try {
-    await exec(
-      "uv",
-      args,
-      { cwd, encoding: "utf8", maxBuffer: MAX_GIT_OUTPUT },
-    );
-  } catch (error) {
-    const stderr = (error as { stderr?: string }).stderr?.trim();
-    const stdout = (error as { stdout?: string }).stdout?.trim();
-    throw new Error(stderr || stdout || "Hatch secret scan failed");
-  }
+  const lines = haltLines ? await haltLines(commit).catch((): readonly string[] => []) : [];
+  await updateRefsTransaction(worktree, [`create refs/hatch/${binder}/item-${item}/failed ${commit}`, ...lines]);
 }
 
-async function rejectProtectedCandidate(cwd: string): Promise<void> {
+const CANDIDATE = "The build candidate";
+
+// The host's refusal of a staged change to .git or .hatch, or undefined.
+async function protectedCandidate(cwd: string, subject = CANDIDATE): Promise<HostRefusal | undefined> {
   const changed = await git(cwd, ["diff", "--cached", "--name-only", "-z"]);
-  const paths = changed.split("\0").filter(Boolean);
-  const protectedPath = paths.find(
-    (path) => path === ".git" || path.startsWith(".git/") || path === ".hatch" || path.startsWith(".hatch/"),
-  );
-  if (protectedPath) {
-    throw new Error(`Hatch build candidate modifies protected orchestration state: ${protectedPath}`);
-  }
+  return protectedPathRefusal(changed.split("\0").filter(Boolean), subject);
+}
+
+// The protected-path check, then the secret scan of the staged diff or the committed
+// range. A refusal is returned; a scan that could not run throws (secret-scan.ts).
+async function candidateRefusal(
+  cwd: string,
+  subject: string,
+  committedRange?: { base: string; target: string },
+): Promise<HostRefusal | undefined> {
+  return (await protectedCandidate(cwd, subject)) ??
+    secretMatchRefusal(await runSecretScan(cwd, committedRange), subject);
+}
+
+function refused(binder: string, item: string, refusal: HostRefusal, commit?: string): HatchBuildFinalizationResult {
+  return { status: "blocked", binder, item, ...(commit ? { commit } : {}), refusal, message: refusal.message };
 }
 
 // Tracked or untracked changes in a worktree; ignored files do not count.
@@ -271,6 +295,7 @@ export function workerCheckFailureOf(
   convergence: HaltedCheckConvergenceResult,
   plan: HatchCheckPlanEntry[],
   evidenceHash: string,
+  diff: HatchReviewedDiff,
 ): HatchWorkerCheckFailure | undefined {
   if (convergence.status !== "failed" && convergence.status !== "timed-out") return undefined;
   const id = convergence.check?.id;
@@ -281,6 +306,7 @@ export function workerCheckFailureOf(
   const ran = exitCode === null ? "stopped without an exit code" : `exited ${exitCode}`;
   return {
     evidenceHash,
+    diff,
     check: { id, command: entry.command, cwd: entry.cwd, status: convergence.status, exitCode, excerpt },
     findings: [{
       severity: "major",
@@ -446,8 +472,9 @@ export class HatchBuildFinalizer {
         }
         checks = convergence.manifest;
       }
-      await rejectProtectedCandidate(worktree);
-      await scanSecrets(worktree, { base: parents[0], target: integrationTip });
+      // These bytes are already on the integration branch, so a refusal here ends the run.
+      const landed = await candidateRefusal(worktree, "The landed merge", { base: parents[0], target: integrationTip });
+      if (landed) throw new Error(`Hatch landed merge recovery refused: ${landed.message}`);
       const evidence = await buildHatchEvidence({
         cwd: worktree,
         binder,
@@ -487,11 +514,10 @@ export class HatchBuildFinalizer {
       if ((await git(repository, ["rev-parse", integrationRef])) !== integrationTip) {
         throw new Error("Hatch integration tip moved during merged recovery");
       }
-      await git(repository, [
-        "update-ref",
-        `refs/hatch/${binder}/item-${item}/done`,
-        integrationTip,
-        await nullObjectId(repository),
+      // The halt record leaves in the transaction that writes `done`.
+      await updateRefsTransaction(repository, [
+        `create refs/hatch/${binder}/item-${item}/done ${integrationTip}`,
+        haltDeleteLine(binder, item),
       ]);
       await this.#checkpoint("done-ref-updated");
       return {
@@ -592,7 +618,7 @@ export class HatchBuildFinalizer {
         };
       }
       const parity = await this.#parityProbe(
-        ctx, binder, item, worktree, committedTree, checkPlan, processContext,
+        ctx, binder, item, worktree, committedTree, checkPlan, lease, processContext,
       );
       if (parity) {
         return {
@@ -607,8 +633,8 @@ export class HatchBuildFinalizer {
       }
       checks = convergence.manifest;
     }
-    await rejectProtectedCandidate(worktree);
-    await scanSecrets(worktree, { base: parent, target: commit });
+    const refusal = await candidateRefusal(worktree, "The committed candidate", { base: parent, target: commit });
+    if (refusal) return refused(binder, item, refusal, commit);
     const evidence = await buildHatchEvidence({
       cwd: worktree,
       binder,
@@ -713,6 +739,7 @@ export class HatchBuildFinalizer {
     worktree: string,
     lease: DispatchLockLease,
     candidate: HatchBuildFinalizationResult,
+    haltLines?: FailedHaltLines,
   ): Promise<HatchBuildFinalizationResult> {
     if (!(await this.#locks.owns(lease))) {
       throw new Error("Hatch recovered-failure recording requires the active binder lock lease");
@@ -739,12 +766,7 @@ export class HatchBuildFinalizer {
     ) {
       throw new Error("Hatch recovered committed candidate changed before failed ref update");
     }
-    await git(worktree, [
-      "update-ref",
-      `refs/hatch/${binder}/item-${item}/failed`,
-      head,
-      await nullObjectId(worktree),
-    ]);
+    await writeFailed(worktree, binder, item, head, haltLines);
     await this.#checkpoint("failed-ref-updated");
     return {
       ...candidate,
@@ -761,6 +783,7 @@ export class HatchBuildFinalizer {
     lease: DispatchLockLease,
     candidate: HatchBuildFinalizationResult,
     processContext?: { manager: HatchProcessManager; owner: BinderLifecycleOwner },
+    haltLines?: FailedHaltLines,
   ): Promise<HatchBuildFinalizationResult> {
     if (!(await this.#locks.owns(lease))) {
       throw new Error("Hatch failed-candidate recording requires the active binder lock lease");
@@ -821,12 +844,7 @@ export class HatchBuildFinalizer {
     if ((await git(worktree, ["rev-parse", "HEAD^{tree}"])) !== currentTree) {
       throw new Error("Hatch failed checkpoint does not preserve the reviewed tree");
     }
-    await git(worktree, [
-      "update-ref",
-      `refs/hatch/${binder}/item-${item}/failed`,
-      commit,
-      await nullObjectId(worktree),
-    ]);
+    await writeFailed(worktree, binder, item, commit, haltLines);
     await this.#checkpoint("failed-ref-updated");
     return {
       ...candidate,
@@ -852,6 +870,7 @@ export class HatchBuildFinalizer {
     worktree: string,
     tree: string,
     plan: HatchCheckPlanEntry[],
+    lease: DispatchLockLease,
     processContext?: { manager: HatchProcessManager; owner: BinderLifecycleOwner },
   ): Promise<CheckConvergenceResult | undefined> {
     const root = await mkdtemp(join(tmpdir(), "hatch-build-parity-"));
@@ -880,7 +899,10 @@ export class HatchBuildFinalizer {
           ? (pid) => processContext.manager.forgetProcess(pid)
           : undefined,
       });
-      return result.status === "stable" && result.targetTree === tree ? undefined : result;
+      if (result.status !== "stable" || result.targetTree !== tree) return result;
+      // Kept for this run only: the proposed merge binds it when every input is equal.
+      rememberParity(lease, item, result);
+      return undefined;
     } finally {
       if (registered) {
         await git(worktree, ["worktree", "remove", "--force", parity], true).catch(() => undefined);
@@ -1002,7 +1024,8 @@ export class HatchBuildFinalizer {
     if (stagedTree === headTree) {
       return this.#classifyEmptyCandidate(ctx, binder, item, worktree, headTree, processContext);
     }
-    await rejectProtectedCandidate(worktree);
+    const staged = await protectedCandidate(worktree);
+    if (staged) return refused(binder, item, staged);
     const preliminaryEvidence = await buildHatchEvidence({
       cwd: worktree,
       binder,
@@ -1022,6 +1045,7 @@ export class HatchBuildFinalizer {
         targetTree: preliminaryEvidence.payload.git.targetTree,
         citationCheck: {
           evidenceHash: preliminaryEvidence.evidenceHash,
+          diff: reviewedDiffOf(preliminaryEvidence),
           findings: citationDefectFindings(citationDefects),
         },
         message:
@@ -1060,7 +1084,7 @@ export class HatchBuildFinalizer {
         // The caller turns the kickback off on the last safety attempt and with an
         // unreadable ledger; then a failed worker check halts below like any other.
         const workerCheckFailure = options.workerCheckKickback
-          ? workerCheckFailureOf(convergence, checkPlan, preliminaryEvidence.evidenceHash)
+          ? workerCheckFailureOf(convergence, checkPlan, preliminaryEvidence.evidenceHash, reviewedDiffOf(preliminaryEvidence))
           : undefined;
         if (workerCheckFailure) {
           return {
@@ -1088,7 +1112,7 @@ export class HatchBuildFinalizer {
         };
       }
       const parity = await this.#parityProbe(
-        ctx, binder, item, worktree, convergence.targetTree, checkPlan, processContext,
+        ctx, binder, item, worktree, convergence.targetTree, checkPlan, lease, processContext,
       );
       if (parity) {
         return {
@@ -1103,8 +1127,8 @@ export class HatchBuildFinalizer {
       checks = convergence.manifest;
     }
     await this.#checkpoint("checks-bound");
-    await rejectProtectedCandidate(worktree);
-    await scanSecrets(worktree);
+    const refusal = await candidateRefusal(worktree, CANDIDATE);
+    if (refusal) return refused(binder, item, refusal);
     const evidence = await buildHatchEvidence({
       cwd: worktree,
       binder,

@@ -74,9 +74,9 @@ SENTINEL_NAME = "hatch-stop-gate.json"
 SENTINEL_MAX_SESSIONS = 20
 # The ref vocabulary the engine writes (skills/_shared/integration-branch.md),
 # kept equal to it so the gate and status read the same states. `evidence` (the
-# capped oracle evidence record) and `in-progress` change no decision; `accepted`
-# is checked below.
-REF_STATES = ("built", "done", "accepted", "failed", "evidence", "in-progress")
+# capped oracle evidence record), `halt` (the record of why an item last halted)
+# and `in-progress` change no decision; `accepted` is checked below.
+REF_STATES = ("built", "done", "accepted", "failed", "evidence", "halt", "in-progress")
 
 BUILT_UNMERGED_MSG = (
     "binder {slug}: items {ids} carry built but no done — the serial merge queue "

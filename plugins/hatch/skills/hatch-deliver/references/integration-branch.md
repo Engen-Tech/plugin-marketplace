@@ -56,6 +56,7 @@ Per-item outcomes:
 - `refs/hatch/<slug>/item-<id>/accepted` → the accepted item-branch commit a human waived. Written by the orchestrator only, and written **last**. The worker never writes this namespace under any mode
 - `refs/hatch/<slug>/item-<id>/failed` → committed item-branch tip that halted at the gate, not cleanly done
 - `refs/hatch/<slug>/item-<id>/evidence` → the capped oracle evidence record blob for the item's last validated run
+- `refs/hatch/<slug>/item-<id>/halt` → a JSON blob saying why the item last halted, bound to its spec digest and tip; written with `failed` where the halt writes one; never an outcome
 - `refs/hatch/<slug>/item-<id>/in-progress`
 
 Clear backups: `refs/hatch-backup/<slug>/<YYYYMMDDTHHMMSSZ>/<branch path after hatch/<slug>/>` → the old tip of an item or integration branch that Clear deleted while it held commits on no other branch, tag, or remote-tracking ref. The namespace is outside every Clear pattern, so a later Clear never removes it. Restore with `git branch hatch/<slug>/<path> <backup ref>`.

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import {
   bindCheckManifestEntry,
@@ -37,12 +38,17 @@ export interface RunCheckConvergenceOptions {
   environmentSetupRef?: string;
   signal?: AbortSignal;
   maxPasses?: number;
-  // Where the worktree sits; it only labels the diagnosis on a halt. Default "item".
+  // Where the worktree sits. It labels the diagnosis on a halt, is a term of the reuse key
+  // below, and is recorded in a stable result's inputs.site. Default "item".
   site?: HatchCheckSite;
   // Run the plan once on the staged tree instead of converging: stable only when the
   // run leaves the tree unchanged, otherwise "non-converging". A confirming probe on a
   // tree another worktree already converged.
   singlePass?: boolean;
+  // The parity probe's result for this item in this run. At a fresh-merge site, after the
+  // declared preflight, it is bound instead of running setup and the plan when every input
+  // the checks see is equal (see the reuse test below). Otherwise it is ignored.
+  reuse?: StableCheckConvergenceResult;
   onProcessStart?: (pid: number) => void;
   onProcessExit?: (pid: number) => Promise<void> | void;
   checkpoint?: (
@@ -57,12 +63,26 @@ export interface CheckEnvironmentDeclaration {
   preflightDeclared: boolean;
 }
 
+// What the checks saw, besides the target tree. `setupBlob` is the integration ref's
+// .hatch/environment.json blob, "none" when there is none, and null when it moved while
+// the site ran, which never matches.
+export interface CheckRunInputs {
+  site: HatchCheckSite;
+  head: string;
+  planHash: string;
+  setupBlob: string | null;
+  envDigest: string;
+}
+
 export interface StableCheckConvergenceResult {
   status: "stable";
   passes: number;
   targetTree: string;
   manifest: HatchCheckManifest;
   environment: CheckEnvironmentDeclaration;
+  inputs: CheckRunInputs;
+  // Set when this site bound another site's receipts instead of running the plan.
+  reused?: "fresh-parity";
 }
 
 type HaltedUnboundCheckResult = UnboundCheckResult & {
@@ -124,6 +144,52 @@ function validatePlan(checks: HatchCheckPlanEntry[]): void {
   if (checks.filter((check) => check.purpose === "oracle").length > 1) {
     throw new Error("Hatch stable-tree check plan contains more than one oracle");
   }
+}
+
+// The plan as the checks run it: order, id, purpose, command and cwd, as given.
+export function checkPlanHash(checks: HatchCheckPlanEntry[]): string {
+  const tuples = checks.map((check) => [check.id, check.purpose, check.command, check.cwd]);
+  return createHash("sha256").update(JSON.stringify(tuples)).digest("hex");
+}
+
+function environmentDigest(): string {
+  const entries = Object.entries(process.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+}
+
+export async function setupBlobOf(worktree: string, ref: string | undefined): Promise<string> {
+  if (!ref) return "none";
+  try {
+    const { stdout } = await exec(
+      "git",
+      ["-C", worktree, "rev-parse", "--verify", "--quiet", `${ref}:.hatch/environment.json`],
+      { encoding: "utf8" },
+    );
+    return stdout.trim() || "none";
+  } catch (error) {
+    // --quiet exits 1 with no output when the ref or the path is absent: the opt-out.
+    // Any other failure (not a repository, git missing) is not an absent file, so two of
+    // them must never compare equal as "none".
+    if ((error as { code?: unknown }).code === 1) return "none";
+    throw error;
+  }
+}
+
+// Run the declared preflight once, at the worktree root, before anything else at a site.
+// The caller decides what a failure means: runStableTreeChecks halts precondition-unmet; the
+// post-wave site that did not rerun its floor rolls the wave back.
+export async function runEnvironmentPreflight(
+  options: Pick<RunCheckConvergenceOptions, "worktree" | "signal" | "onProcessStart" | "onProcessExit">,
+  preflight: string,
+): Promise<UnboundCheckResult> {
+  return runBoundCheck({
+    worktree: options.worktree,
+    command: preflight,
+    cwd: ".",
+    signal: options.signal,
+    onProcessStart: options.onProcessStart,
+    onProcessExit: options.onProcessExit,
+  });
 }
 
 async function stageTree(worktree: string): Promise<string> {
@@ -188,6 +254,9 @@ export async function runStableTreeChecks(
   if (!Number.isInteger(maxPasses) || maxPasses < 1 || maxPasses > 10) {
     throw new Error("Hatch check convergence maxPasses must be an integer from 1 to 10");
   }
+  const head = await git(options.worktree, ["rev-parse", "HEAD"]);
+  const envDigest = environmentDigest();
+  const entryBlob = await setupBlobOf(options.worktree, options.environmentSetupRef);
   const environmentConfig = options.environmentSetupRef
     ? await readEnvironmentConfig(options.worktree, options.environmentSetupRef)
     : undefined;
@@ -238,14 +307,7 @@ export async function runStableTreeChecks(
     // clean with the project's remediation rather than running the real floor command
     // into the wall — a distinct "precondition-unmet" the caller maps to blocked (not a
     // worker retry: a missing daemon is not fixed by re-prompting an implementer).
-    const probe = await runBoundCheck({
-      worktree: options.worktree,
-      command: environmentConfig.preflight,
-      cwd: ".",
-      signal: options.signal,
-      onProcessStart: options.onProcessStart,
-      onProcessExit: options.onProcessExit,
-    });
+    const probe = await runEnvironmentPreflight(options, environmentConfig.preflight);
     if (probe.status !== "passed") {
       return halt(
         {
@@ -258,6 +320,29 @@ export async function runStableTreeChecks(
         { id: "environment-preflight", command: environmentConfig.preflight, cwd: "." },
       );
     }
+  }
+  // Reuse, after the preflight and before setup: the preflight is the project's live-service
+  // probe and always runs. The parity probe's receipts stand in for this site's run only when
+  // each input the checks see is equal: the site class (a fresh worktree set up by setup
+  // alone), the staged tree, the worktree HEAD, the plan, the setup blob and process.env.
+  // The run lease that holds the probe result is a scope, not identity; identity is this
+  // content key (INV-3, INV-37). An abort already raised is never answered with a reused
+  // result: the plan run below returns it as aborted.
+  const reuse = options.reuse;
+  if (
+    reuse &&
+    !options.signal?.aborted &&
+    reuse.status === "stable" &&
+    reuse.inputs.site === "fresh-parity" &&
+    options.site === "fresh-merge" &&
+    reuse.inputs.head === head &&
+    reuse.inputs.planHash === checkPlanHash(options.checks) &&
+    reuse.inputs.setupBlob !== null &&
+    reuse.inputs.setupBlob === entryBlob &&
+    reuse.inputs.envDigest === envDigest &&
+    reuse.targetTree === (await stageTree(options.worktree))
+  ) {
+    return { ...reuse, reused: "fresh-parity" };
   }
   const environmentSetup = environmentConfig?.setup;
   if (environmentSetup) {
@@ -312,6 +397,13 @@ export async function runStableTreeChecks(
       );
     }
   }
+  const inputs: CheckRunInputs = {
+    site: options.site ?? "item",
+    head,
+    planHash: checkPlanHash(options.checks),
+    setupBlob: (await setupBlobOf(options.worktree, options.environmentSetupRef)) === entryBlob ? entryBlob : null,
+    envDigest,
+  };
   if (options.singlePass) {
     const candidateTree = await stageTree(options.worktree);
     await options.checkpoint?.("candidate-staged", { pass: 1, tree: candidateTree });
@@ -335,7 +427,7 @@ export async function runStableTreeChecks(
     }
     const manifest = bindManifest(options, run.results, candidateTree);
     await options.checkpoint?.("manifest-bound", { pass: 1, tree: candidateTree });
-    return { status: "stable", passes: 1, targetTree: candidateTree, manifest, environment };
+    return { status: "stable", passes: 1, targetTree: candidateTree, manifest, environment, inputs };
   }
   let lastTree = "";
   for (let pass = 1; pass <= maxPasses; pass += 1) {
@@ -364,29 +456,12 @@ export async function runStableTreeChecks(
       await options.checkpoint?.("tree-drifted", { pass, tree: stabilizedTree });
       continue;
     }
-
-    const finalRun = await runPlan(options);
-    if (finalRun.status === "halted") {
-      return halt(
-        {
-          status: finalRun.result.status,
-          passes: pass,
-          targetTree: candidateTree,
-          check: { id: finalRun.id, result: finalRun.result },
-        },
-        planCheck(finalRun.id),
-      );
-    }
-    await options.checkpoint?.("final-checks-complete", { pass, tree: candidateTree });
-    const finalTree = await stageTree(options.worktree);
-    if (finalTree !== candidateTree) {
-      lastTree = finalTree;
-      await options.checkpoint?.("tree-drifted", { pass, tree: finalTree });
-      continue;
-    }
-    const manifest = bindManifest(options, finalRun.results, candidateTree);
+    // The first pass that started and ended on the same tree is bound; there is no
+    // confirming rerun. A check that passes once and would fail on a rerun in the same
+    // worktree slips through here; the parity probe's fresh-worktree run still reruns it.
+    const manifest = bindManifest(options, stabilization.results, candidateTree);
     await options.checkpoint?.("manifest-bound", { pass, tree: candidateTree });
-    return { status: "stable", passes: pass, targetTree: candidateTree, manifest, environment };
+    return { status: "stable", passes: pass, targetTree: candidateTree, manifest, environment, inputs };
   }
   return halt(
     {
@@ -396,4 +471,22 @@ export async function runStableTreeChecks(
     },
     wholePlan(),
   );
+}
+
+// The parity probe's passing result per item, kept for the run that ran it. The key is the
+// run's dispatch lease: a resumed run holds a new lease and finds nothing, and the entries
+// go when the lease does. Nothing is written to disk.
+const parityRuns = new WeakMap<object, Map<string, StableCheckConvergenceResult>>();
+
+export function rememberParity(run: object, item: string, result: StableCheckConvergenceResult): void {
+  let items = parityRuns.get(run);
+  if (!items) {
+    items = new Map();
+    parityRuns.set(run, items);
+  }
+  items.set(item, result);
+}
+
+export function parityResult(run: object, item: string): StableCheckConvergenceResult | undefined {
+  return parityRuns.get(run)?.get(item);
 }

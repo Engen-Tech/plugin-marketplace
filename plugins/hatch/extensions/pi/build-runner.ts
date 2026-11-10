@@ -7,9 +7,25 @@ import { HatchBuildFinalizer, type HatchBuildFinalizationResult } from "./build-
 import type { HatchCheckPlanEntry } from "./check-convergence.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
 import { dropFloorCache, lookupFloorCache, recordFloorCache } from "./floor-cache.ts";
-import { itemSpecDigest, readAttempts, recordHostCheck, recordVerification } from "./gate-attempts.ts";
+import { itemSpecDigest, readAttempts, recordHostCheck, recordVerification, type HatchGateRole } from "./gate-attempts.ts";
+import { effectiveGateVerdict, type HatchGateResult } from "./gate-runner.ts";
 import { deriveItemGitState, type HatchItemRecoveryState } from "./git-state.ts";
-import { safeProgress, type HatchFloorListReused, type HatchRunProgress } from "./run-events.ts";
+import { KICKBACK_BUDGET, type ChildFailure, type ChildOutcome, type KickbackSource } from "./child-outcome.ts";
+import { noHaltRecordStore, type HaltRecordStore } from "./halt-writer.ts";
+import { haltOfBuild, recordItemHalt, workerFailureReason } from "./item-halt.ts";
+import {
+  hatchProvenance,
+  runProgress,
+  safeProgress,
+  timePhase,
+  trackRun,
+  type HatchFloorListReused,
+  type HatchPhaseMs,
+  type HatchProvenance,
+  type HatchRunEvent,
+  type HatchRunGateAttempt,
+  type HatchRunProgress,
+} from "./run-events.ts";
 import {
   HatchProcessManager,
   type BinderLifecycleOwner,
@@ -51,6 +67,121 @@ export interface HatchBuildItemResult {
    * The halt is that unchanged attempt, not a spent attempt cap.
    */
   noChange?: true;
+  /**
+   * Set on a `blocked` result whose worker child failed: a provider error, or no usable
+   * envelope after its corrective turn. Nothing was committed and no ref was written.
+   */
+  failure?: ChildFailure;
+  // What a halt record needs, set once the build has read them: the item tip (the commit,
+  // or the worktree HEAD of a candidate that was never committed), the item's spec
+  // digest, the worker checks every later worker must re-propose, and each gate file's
+  // counted attempts when the build returned.
+  itemTip?: string;
+  specDigest?: string;
+  requiredCheckIds?: string[];
+  gateAttempts?: { acceptance: number; safety: number };
+  /**
+   * Set on a `failed` result whose gate cap ran out: the gate whose cap this build's last
+   * round spent. One round can carry concerns from more gates than the one it spent.
+   */
+  capGate?: HatchGateRole;
+  /**
+   * Set when the build halted and its halt record could not be kept: why. A `failed` ref
+   * was written all the same, alone; any other halt is unchanged. The delivery reports
+   * this as an `item-halt-unrecorded` event.
+   */
+  haltUnrecorded?: string;
+  /** This build's phase time: worker, checks (finalization less its gates) and gates. */
+  phaseMs?: HatchPhaseMs;
+  /** Set on a standalone build's result: the hatch version and commit that ran it. */
+  hatch?: HatchProvenance;
+}
+
+// Filled by a build as it reads each value, so the result can carry them whichever
+// return the build took.
+interface BuildTrace {
+  // Set when the build only re-reported a state an earlier run decided (terminalRecovery).
+  reReport?: boolean;
+  specDigest?: string;
+  requiredCheckIds?: ReadonlySet<string>;
+  gateAttempts?: () => { acceptance: number; safety: number };
+  // Why the halt record of a `failed` write could not be kept, set by the write's callback.
+  haltUnrecorded?: string;
+}
+
+// The trace's values as result fields, read when called.
+function traceFields(trace: BuildTrace): Partial<HatchBuildItemResult> {
+  return {
+    ...(trace.specDigest ? { specDigest: trace.specDigest } : {}),
+    ...(trace.requiredCheckIds ? { requiredCheckIds: [...trace.requiredCheckIds] } : {}),
+    ...(trace.gateAttempts ? { gateAttempts: trace.gateAttempts() } : {}),
+    ...(trace.haltUnrecorded !== undefined ? { haltUnrecorded: trace.haltUnrecorded } : {}),
+  };
+}
+
+// Whether a build's halt record is written alone, after the build returns. A `failed` build
+// kept its record in the `failed` write; a build that only re-reports a state an earlier
+// run decided (failed, failed-superseded, inconsistent, accept-pending) writes nothing, so
+// the halt the item holds stays.
+function writesHaltAlone(result: HatchBuildItemResult, trace: BuildTrace): boolean {
+  return !trace.reReport && result.status !== "built" && result.status !== "recovered" && result.status !== "failed";
+}
+
+async function traced(result: HatchBuildItemResult, trace: BuildTrace): Promise<HatchBuildItemResult> {
+  const itemTip = result.commit ??
+    (result.worktree ? await git(result.worktree, ["rev-parse", "HEAD"]).catch(() => undefined) : undefined);
+  return { ...result, ...(itemTip ? { itemTip } : {}), ...traceFields(trace) };
+}
+
+// One build attempt's gate verdicts and host-check rows. Built from the finalization, not
+// the ledger, so it is reported even when the ledger cannot be read or written. `counted`
+// is the ledger's own count per gate file before this attempt; each row is then numbered
+// as the ledger numbers it (1 + the file's counted concerns before the row). Without it,
+// as when `unrecorded` names why no row was written, no attempt number is given.
+function finalizationReview(
+  item: string,
+  finalization: HatchBuildFinalizationResult,
+  counted: { acceptance: number; safety: number } | undefined,
+  unrecorded: string | undefined,
+): Extract<HatchRunEvent, { kind: "gate-reviewed" }> | undefined {
+  const gates: HatchRunGateAttempt[] = [];
+  const add = (
+    role: "acceptance-gate" | "safety-gate" | "visual-gate",
+    verdict: string,
+    findings: readonly { severity: string; code: string }[],
+    source?: string,
+  ) => {
+    const file = role === "safety-gate" ? "safety" : "acceptance";
+    const isConcern = verdict === "concerns";
+    gates.push({
+      role,
+      ...(counted ? { attempt: counted[file] + 1 } : {}),
+      verdict,
+      counted: isConcern,
+      findings: findings.map((finding) => ({ severity: finding.severity, code: finding.code })),
+      ...(source ? { source } : {}),
+    });
+    if (counted && isConcern) counted[file] += 1;
+  };
+  const verdicts = finalization.verification?.gates;
+  if (verdicts && finalization.targetTree) {
+    if (verdicts.acceptance) add("acceptance-gate", effectiveGateVerdict("acceptance-gate", verdicts.acceptance.verdict, verdicts.acceptance.findings), verdicts.acceptance.findings);
+    if (verdicts.safety) add("safety-gate", effectiveGateVerdict("safety-gate", verdicts.safety.verdict, verdicts.safety.findings), verdicts.safety.findings);
+    if (verdicts.visual) add("visual-gate", effectiveGateVerdict("visual-gate", verdicts.visual.verdict, verdicts.visual.findings), verdicts.visual.findings);
+  }
+  if (finalization.citationCheck && finalization.targetTree) add("safety-gate", "concerns", finalization.citationCheck.findings, "host-citation-check");
+  if (finalization.workerCheckFailure && finalization.targetTree) add("safety-gate", "concerns", finalization.workerCheckFailure.findings, "host-worker-check");
+  if (gates.length === 0) return undefined;
+  return { kind: "gate-reviewed", item, phase: "build", gates, ...(unrecorded ? { unrecorded } : {}) };
+}
+
+// Runs a build as a phase-time collector and stamps its own phase time on the result.
+async function withPhaseMs(
+  progress: HatchRunProgress | undefined,
+  build: () => Promise<HatchBuildItemResult>,
+): Promise<HatchBuildItemResult> {
+  const { value, phaseMs } = await trackRun(progress, build);
+  return { ...value, phaseMs };
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -174,16 +305,42 @@ function terminalRecovery(
   return undefined;
 }
 
-function retryKind(result: HatchBuildFinalizationResult): "acceptance" | "safety" | undefined {
+// Every gate cap a retry spends, read from the policy table. Acceptance and safety run in
+// parallel, so one round can spend both, each against its own cap.
+function retryKinds(result: HatchBuildFinalizationResult): ("acceptance" | "safety")[] {
   // The citation pre-check applies the safety auditor's rule without a gate run. A failed
-  // check the worker proposed spends the same count: it is the worker's own floor.
-  if (result.citationCheck || result.workerCheckFailure) return "safety";
-  if (result.verification?.gates.acceptance?.verdict === "concerns") return "acceptance";
+  // check the worker proposed spends the cap its row in the table names: it is the
+  // worker's own floor.
+  if (result.citationCheck) return [KICKBACK_BUDGET["host-citation-check"].cap];
+  if (result.workerCheckFailure) return [KICKBACK_BUDGET["host-worker-check"].cap];
+  const gates = result.verification?.gates;
+  // The effective verdict, as the ledger counts it: a minor-only acceptance or visual
+  // concern is a pass with notes and spends nothing.
+  const concerns = (role: HatchGateResult["role"], gate?: { verdict: HatchGateResult["verdict"]; findings: HatchGateResult["findings"] }) =>
+    gate !== undefined && effectiveGateVerdict(role, gate.verdict, gate.findings) === "concerns";
+  const sources: KickbackSource[] = [];
   // A visual gate concern is a fidelity kickback, retried under the same bounded
   // acceptance-attempt cap as an acceptance concern; on cap exhaustion the host writes the
   // failed ref exactly as a capped acceptance/safety concern does.
-  if (result.verification?.gates.visual?.verdict === "concerns") return "acceptance";
-  if (result.verification?.gates.safety?.verdict === "concerns") return "safety";
+  if (concerns("acceptance-gate", gates?.acceptance)) sources.push("acceptance-concern");
+  if (concerns("visual-gate", gates?.visual)) sources.push("visual-concern");
+  if (concerns("safety-gate", gates?.safety)) sources.push("safety-concern");
+  // Acceptance and visual share one cap, so a round with both spends it once.
+  return [...new Set(sources.map((source) => KICKBACK_BUDGET[source].cap))];
+}
+
+// The gate whose cap a round spent, in the order item-halt.ts concernGate reads them:
+// acceptance, then visual (the two share the acceptance cap), then safety.
+function spentCapGate(
+  result: HatchBuildFinalizationResult,
+  spent: { acceptance: boolean; safety: boolean },
+): HatchGateRole | undefined {
+  const gates = result.verification?.gates;
+  const concerns = (role: HatchGateRole, gate?: { verdict: HatchGateResult["verdict"]; findings: HatchGateResult["findings"] }) =>
+    gate !== undefined && effectiveGateVerdict(role, gate.verdict, gate.findings) === "concerns";
+  if (spent.acceptance && concerns("acceptance-gate", gates?.acceptance)) return "acceptance-gate";
+  if (spent.acceptance && concerns("visual-gate", gates?.visual)) return "visual-gate";
+  if (spent.safety && concerns("safety-gate", gates?.safety)) return "safety-gate";
   return undefined;
 }
 
@@ -194,6 +351,7 @@ export class HatchBuildItemRunner {
   readonly #processes: HatchProcessManager;
   readonly #checkpoint: HatchBuildCheckpoint;
   readonly #probeGates: (ctx: ExtensionContext) => Promise<string | undefined>;
+  readonly #haltStore: HaltRecordStore;
 
   constructor(
     locks: DispatchLockManager,
@@ -202,7 +360,11 @@ export class HatchBuildItemRunner {
     processes: HatchProcessManager,
     checkpoint: HatchBuildCheckpoint = () => {},
     probeGates: (ctx: ExtensionContext) => Promise<string | undefined> = async () => undefined,
+    // Keeps a halted build's record: in the finalizer's `failed` transaction, or alone once
+    // the build has returned. index.ts passes the Git store.
+    haltStore: HaltRecordStore = noHaltRecordStore,
   ) {
+    this.#haltStore = haltStore;
     this.#locks = locks;
     this.#workers = workers;
     this.#finalizer = finalizer;
@@ -234,9 +396,26 @@ export class HatchBuildItemRunner {
       const refused = await this.#probeGates(ctx);
       if (refused) {
         const { state } = await deriveItemGitState(ctx.cwd, binder, item);
-        return { schema: "hatch-build-item-v1", binder, item, status: "blocked", recoveryState: state, attempts: 0, message: `Build stopped before the worker: ${refused}` };
+        return { schema: "hatch-build-item-v1", binder, item, status: "blocked", recoveryState: state, attempts: 0, message: `Build stopped before the worker: ${refused}`, hatch: hatchProvenance() };
       }
-      return await this.#runLocked(ctx, binder, item, lease, owner, [item], undefined, undefined, safeProgress(progress));
+      const trace: BuildTrace = {};
+      // The run-start probe above is a whole-run stop, not an item halt; a build that
+      // halted is one, and its record is written while this run still holds the binder.
+      // A standalone build has no wave-mates, so no host session.
+      const result = await this.#writeHalt(
+        ctx.cwd,
+        await traced(
+          await withPhaseMs(progress, () =>
+            this.#runLocked(ctx, binder, item, lease, owner, [item], undefined, undefined, safeProgress(progress), trace)),
+          trace,
+        ),
+        trace,
+      );
+      // A halted build kept its record, or says here why it could not.
+      if (result.haltUnrecorded !== undefined) {
+        safeProgress(progress)({ kind: "item-halt-unrecorded", item, error: result.haltUnrecorded });
+      }
+      return { ...result, hatch: hatchProvenance() };
     } finally {
       try {
         await this.#processes.stopOwner(owner);
@@ -259,7 +438,64 @@ export class HatchBuildItemRunner {
     if (!(await this.#locks.owns(lease)) || owner.binder !== binder) {
       throw new Error("Hatch build item requires its delivery-owned binder lease and lifecycle");
     }
-    return this.#runLocked(ctx, binder, item, lease, owner, waveMates, ledger, options?.seedFeedback, options?.onFloorListReused);
+    const trace: BuildTrace = {};
+    const result = await traced(
+      await withPhaseMs(undefined, () =>
+        this.#runLocked(ctx, binder, item, lease, owner, waveMates, ledger, options?.seedFeedback, options?.onFloorListReused, trace)),
+      trace,
+    );
+    if (!writesHaltAlone(result, trace)) return result;
+    // The record is a write under this item's root while wave-mates' workers may run, so it
+    // is made in a host session: the ledger then records it as this host's, not a worker's.
+    const session = ledger?.session(item);
+    await session?.resume();
+    try {
+      return await this.#writeHalt(ctx.cwd, result, trace);
+    } finally {
+      await session?.close();
+    }
+  }
+
+  // Writes the record of a build that halted with no `failed`, alone, mapped from the
+  // result the build returns: the same mapping the delivery makes of it again
+  // (delivery-runner.ts buildHaltOf; build-runner.test.ts pins them equal). Never throws:
+  // a record that cannot be kept leaves the halt unchanged, and the result carries why on
+  // `haltUnrecorded`.
+  async #writeHalt(cwd: string, result: HatchBuildItemResult, trace: BuildTrace): Promise<HatchBuildItemResult> {
+    if (!writesHaltAlone(result, trace)) return result;
+    const integrationTip = await git(cwd, ["rev-parse", "--verify", `refs/heads/hatch/${result.binder}/integration`])
+      .catch(() => null);
+    const { sinkError } = await recordItemHalt(
+      { ...haltOfBuild(result, { integrationTip }), reason: result.message },
+      (halt) => this.#haltStore.write(cwd, halt),
+    );
+    return sinkError === undefined ? result : { ...result, haltUnrecorded: sinkError };
+  }
+
+  // The halt record's line for the finalizer's `failed` write, mapped from the result this
+  // build returns once `failed` stands at `commit`: the same mapping the delivery makes of
+  // it again (delivery-runner.ts buildHaltOf; build-runner.test.ts pins them equal). Never
+  // throws: a record that cannot be kept gives no line, `failed` is written alone, and the
+  // result carries why on `haltUnrecorded`.
+  #failedHaltLines(
+    repoRoot: string,
+    trace: BuildTrace,
+    provisional: (commit: string) => HatchBuildItemResult,
+  ): (commit: string) => Promise<readonly string[]> {
+    return async (commit) => {
+      const build: HatchBuildItemResult = { ...provisional(commit), itemTip: commit, ...traceFields(trace) };
+      const integrationTip = await git(repoRoot, ["rev-parse", "--verify", `refs/heads/hatch/${build.binder}/integration`])
+        .catch(() => null);
+      let lines: readonly string[] = [];
+      const { sinkError } = await recordItemHalt(
+        { ...haltOfBuild(build, { integrationTip }), reason: build.message },
+        async (halt) => {
+          lines = await this.#haltStore.lines(repoRoot, halt);
+        },
+      );
+      if (sinkError !== undefined) trace.haltUnrecorded = sinkError;
+      return lines;
+    };
   }
 
   async #runLocked(
@@ -272,6 +508,7 @@ export class HatchBuildItemRunner {
     ledger?: WaveHostLedger,
     seedFeedback?: unknown[],
     onFloorListReused?: (event: HatchFloorListReused) => void,
+    trace: BuildTrace = {},
   ): Promise<HatchBuildItemResult> {
       // The whole of a build's host work is a host phase for its item, except the
       // worker invocation itself. The ledger records the surface the host authored
@@ -284,9 +521,15 @@ export class HatchBuildItemRunner {
       let state = await deriveItemGitState(ctx.cwd, binder, item);
       await this.#checkpoint("state-derived");
       const terminal = terminalRecovery(binder, item, state);
-      if (terminal) return terminal;
+      if (terminal) {
+        trace.reReport = true;
+        return terminal;
+      }
 
       const repoRoot = await git(ctx.cwd, ["rev-parse", "--show-toplevel"]);
+      // A new attempt: the last halt's record no longer says why the item is stopped.
+      // Deleted here, inside this item's host phase; a re-report above keeps it.
+      await this.#haltStore.clear(repoRoot, binder, item);
       const integrationRef = `refs/heads/hatch/${binder}/integration`;
       const assignment = parseAssignment(
         await git(repoRoot, ["show", `${integrationRef}:.hatch/binders/${binder}.json`]),
@@ -332,6 +575,9 @@ export class HatchBuildItemRunner {
       // Every later worker must propose a check with each id, so a worker can never pass
       // its own floor by deleting the check that failed.
       const requiredCheckIds = new Set<string>();
+      trace.specDigest = specDigest;
+      trace.requiredCheckIds = requiredCheckIds;
+      trace.gateAttempts = () => ({ acceptance: acceptanceAttempts, safety: safetyAttempts });
       // The first round always runs, so a resumed run or a Fix and rerun validates once;
       // a further round needs budget in the gate that raised the concern, which the cap
       // test after each concern enforces. Each gate is capped on its own count only.
@@ -360,9 +606,9 @@ export class HatchBuildItemRunner {
         }
         await this.#checkpoint("before-worker");
         await session?.pause();
-        let worker: HatchWorkerResult | undefined;
+        let outcome: ChildOutcome<HatchWorkerResult> | undefined;
         try {
-          worker = reused ? undefined : await this.#workers.run(
+          outcome = reused ? undefined : await timePhase("worker", () => this.#workers.run(
             ctx,
             worktree,
             branch,
@@ -380,10 +626,24 @@ export class HatchBuildItemRunner {
             () => this.#checkpoint("first-worker-edit"),
             waveMates,
             ledger,
-          );
+          ));
         } finally {
           await session?.resume();
         }
+        if (outcome && !outcome.ok) {
+          return {
+            schema: "hatch-build-item-v1",
+            binder,
+            item,
+            status: "blocked",
+            recoveryState: state.state,
+            attempts,
+            worktree,
+            message: workerFailureReason(outcome.failure, binder, item),
+            failure: outcome.failure,
+          };
+        }
+        const worker = outcome?.value;
         if (worker) await this.#checkpoint("worker-attested");
         if (worker?.outcome === "blocked") {
           return {
@@ -438,12 +698,27 @@ export class HatchBuildItemRunner {
           // The worker was sent findings and changed nothing, so the committed tip is the
           // tip the gate already judged. Re-reviewing it would be a reviewer re-roll.
           if (previous?.status === "retry" && previous.commit) {
+            const reviewed = previous;
             const failed = await this.#finalizer.recordRecoveredFailedCandidate(
               binder,
               item,
               worktree,
               lease,
               previous,
+              this.#failedHaltLines(repoRoot, trace, (commit) => ({
+                schema: "hatch-build-item-v1",
+                binder,
+                item,
+                status: "failed",
+                recoveryState: state.state,
+                attempts,
+                worktree,
+                commit,
+                message: reviewed.message,
+                worker,
+                finalization: { ...reviewed, status: "failed", commit },
+                noChange: true,
+              })),
             );
             if (failed.status !== "failed") {
               return {
@@ -498,7 +773,8 @@ export class HatchBuildItemRunner {
         if (!recoverMerged) await dropFloorCache(repoRoot, binder, item);
         const recoveringExactCommit = afterWorker.state === "committed-unmarked";
         await this.#checkpoint("before-finalization");
-        const finalization = recoverMerged
+        // Finalization time less its gate reviews is the build's check time.
+        const finalization = await timePhase("checks", async () => recoverMerged
           ? await this.#finalizer.recoverMergedCandidate(
               ctx,
               binder,
@@ -533,11 +809,29 @@ export class HatchBuildItemRunner {
                 citationPrecheck: !ledgerError && safetyAttempts + 1 < safetyCap,
                 workerCheckKickback: !ledgerError && safetyAttempts + 1 < safetyCap,
               },
-            );
+            ));
         await this.#checkpoint("finalization-returned");
         // The finalizer sets `targetTree` with every verification: it is the tree the
         // gate evidence bound (the staged candidate tree or the committed tip's tree).
         // A staged candidate has no commit yet, so its item tip is the worktree HEAD.
+        // Every attempt's verdicts and codes are reported from the finalization itself,
+        // before and whatever the ledger write, so an unreadable ledger hides nothing.
+        // The numbers come from the ledger, read before this attempt's rows are written (the
+        // finalizer writes none). The gates run in parallel since G2, so a round reports both
+        // verdicts, and the loop's own counters raise each gate that had concerns.
+        let counted: { acceptance: number; safety: number } | undefined;
+        if (!ledgerError) {
+          try {
+            const before = await readAttempts(repoRoot, binder, item, specDigest);
+            if (!before.acceptance.error && !before.safety.error) {
+              counted = { acceptance: before.acceptance.counted, safety: before.safety.counted };
+            }
+          } catch {
+            // No numbers then; the verdicts and codes are still reported.
+          }
+        }
+        const review = finalizationReview(item, finalization, counted, ledgerError);
+        if (review) runProgress()(review);
         if (finalization.verification && finalization.targetTree && !ledgerError) {
           await recordVerification(repoRoot, {
             binder,
@@ -567,6 +861,7 @@ export class HatchBuildItemRunner {
             phase: "build",
             itemTip: await git(worktree, ["rev-parse", "HEAD"]),
             reviewedTree: finalization.targetTree,
+            diff: finalization.citationCheck.diff,
             evidenceHash: finalization.citationCheck.evidenceHash,
             findings: finalization.citationCheck.findings,
           });
@@ -579,6 +874,7 @@ export class HatchBuildItemRunner {
             phase: "build",
             itemTip: await git(worktree, ["rev-parse", "HEAD"]),
             reviewedTree: finalization.targetTree,
+            diff: finalization.workerCheckFailure.diff,
             evidenceHash: finalization.workerCheckFailure.evidenceHash,
             findings: finalization.workerCheckFailure.findings,
             source: "host-worker-check",
@@ -633,8 +929,8 @@ export class HatchBuildItemRunner {
             finalization,
           };
         }
-        const kind = retryKind(finalization);
-        if (!kind) {
+        const kinds = retryKinds(finalization);
+        if (kinds.length === 0) {
           // The oracle, an environment-setup check, or a worker check past its kickback
           // failed — not a gate or host check raising a retryable concern. A failing
           // environment or a broken merged tip is not fixed by re-prompting, so halt
@@ -653,16 +949,51 @@ export class HatchBuildItemRunner {
             finalization,
           };
         }
-        if (kind === "acceptance") acceptanceAttempts += 1;
-        else safetyAttempts += 1;
-        const capped =
-          Boolean(ledgerError) ||
-          (kind === "acceptance" ? acceptanceAttempts >= acceptanceCap : safetyAttempts >= safetyCap);
+        if (kinds.includes("acceptance")) acceptanceAttempts += 1;
+        if (kinds.includes("safety")) safetyAttempts += 1;
+        const spent = {
+          acceptance: kinds.includes("acceptance") && acceptanceAttempts >= acceptanceCap,
+          safety: kinds.includes("safety") && safetyAttempts >= safetyCap,
+        };
+        const capped = Boolean(ledgerError) || spent.acceptance || spent.safety;
         if (capped && (finalization.citationCheck || finalization.workerCheckFailure)) {
-          // Both host checks are off on the last safety attempt and with an unreadable ledger.
-          throw new Error("Hatch host check reached the safety cap");
+          // Both host checks are off on the last safety attempt and with an unreadable ledger,
+          // so a finalizer broke that contract. The candidate has no commit and no gate
+          // verdict, so nothing is committed and no failed ref is written: the item halts
+          // blocked as a spent safety cap and the run goes on.
+          const check = finalization.citationCheck ? "repo-rule citation check" : "worker-check kickback";
+          return {
+            schema: "hatch-build-item-v1",
+            binder,
+            item,
+            status: "blocked",
+            recoveryState: state.state,
+            attempts,
+            worktree,
+            message: `The host's ${check} reached the safety cap (${safetyAttempts} of ${safetyCap} safety attempts); the candidate is not committed and no failed ref is written. Fix it by hand and rerun.`,
+            worker,
+            finalization,
+          };
         }
         if (capped) {
+          // The gate whose cap ran out, from the cap test itself; none when the ledger
+          // cannot be trusted, since no cap was read.
+          const capGate = ledgerError ? undefined : spentCapGate(finalization, spent);
+          const named = capGate ? { capGate } : {};
+          const haltLines = this.#failedHaltLines(repoRoot, trace, (commit) => ({
+            schema: "hatch-build-item-v1",
+            binder,
+            item,
+            status: "failed",
+            recoveryState: state.state,
+            attempts,
+            worktree,
+            commit,
+            message: finalization.message,
+            worker,
+            finalization: { ...finalization, status: "failed", commit },
+            ...named,
+          }));
           const failed = recoveringExactCommit
             ? await this.#finalizer.recordRecoveredFailedCandidate(
                 binder,
@@ -670,6 +1001,7 @@ export class HatchBuildItemRunner {
                 worktree,
                 lease,
                 finalization,
+                haltLines,
               )
             : await this.#finalizer.recordFailedCandidate(
                 ctx,
@@ -679,6 +1011,7 @@ export class HatchBuildItemRunner {
                 lease,
                 finalization,
                 { manager: this.#processes, owner },
+                haltLines,
               );
           return {
             schema: "hatch-build-item-v1",
@@ -694,6 +1027,7 @@ export class HatchBuildItemRunner {
               : failed.message,
             worker,
             finalization: failed,
+            ...(failed.status === "failed" ? named : {}),
           };
         }
         if (finalization.citationCheck) {

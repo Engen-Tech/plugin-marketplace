@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  parityResult,
   runStableTreeChecks,
   type CheckConvergenceResult,
   type HatchCheckPlanEntry,
@@ -14,14 +15,22 @@ import {
   buildHatchEvidence,
   verifyEvidenceFreshness,
   type HatchCheckManifest,
+  type HatchEvidenceManifest,
 } from "./evidence.ts";
-import type { HatchGateFinding } from "./gate-runner.ts";
+import { effectiveGateVerdict, type HatchGateFinding, type HatchGateResult } from "./gate-runner.ts";
+import { haltDeleteLine, updateRefsTransaction } from "./halt-writer.ts";
+import { runProgress } from "./run-events.ts";
 import { validateMergeHooks, type HookValidationResult } from "./hook-runner.ts";
-import { requirePackagePath } from "./package-paths.ts";
 import {
   HatchProcessManager,
   type BinderLifecycleOwner,
 } from "./process-manager.ts";
+import {
+  protectedPathRefusal,
+  runSecretScan,
+  secretMatchRefusal,
+  type HostRefusal,
+} from "./secret-scan.ts";
 import {
   blockedVerificationMessage,
   type HatchVerificationResult,
@@ -42,6 +51,26 @@ function verificationHaltMessage(verification: HatchVerificationResult): string 
     "failed",
     verification.citationDefects ?? [],
   );
+}
+
+// The safety verdict a full review already returned beside an acceptance concern, when
+// it can stand for the bytes being accepted: the review and its safety verdict are both
+// bound to the evidence this accept built, whose hash covers the diff digest
+// (payload.diff.sha256). Anything else is not reused, and the accept reruns safety alone.
+function boundSafetyVerdict(
+  verification: HatchVerificationResult,
+  evidence: HatchEvidenceManifest,
+): HatchGateResult | undefined {
+  const safety = verification.gates.safety;
+  if (!safety) return undefined;
+  if (verification.evidenceHash !== evidence.evidenceHash || safety.evidenceHash !== evidence.evidenceHash) {
+    return undefined;
+  }
+  return safety;
+}
+
+function safetyPassed(safety: HatchGateResult): boolean {
+  return effectiveGateVerdict(safety.role, safety.verdict, safety.findings) === "pass";
 }
 
 export type HatchIntegrationCheckpoint = (
@@ -73,6 +102,9 @@ export interface HatchIntegrationResult {
   safetyVerification?: HatchVerificationResult;
   hookValidation?: HookValidationResult;
   accepted?: boolean;
+  // Set on a `blocked` result the host refused before any gate: a secret-scan match or a
+  // change to protected orchestration state in the proposed merge. No merge is made.
+  refusal?: HostRefusal;
   message: string;
 }
 
@@ -125,6 +157,15 @@ function oracleCheck(workItem: Record<string, unknown>): HatchCheckPlanEntry | u
   };
 }
 
+// A visual oracle's merge review starts the app in the proposed merge worktree, which only
+// setup provisions, so that merge never takes the parity reuse (the build review's reuse
+// excludes a visual oracle the same way, verification-runner.ts reviewableOracle).
+function visualOracle(workItem: Record<string, unknown>): boolean {
+  const oracle = workItem.oracle;
+  return Boolean(oracle) && typeof oracle === "object" && !Array.isArray(oracle) &&
+    (oracle as Record<string, unknown>).type === "visual";
+}
+
 function failedCheckId(convergence: CheckConvergenceResult): string | undefined {
   return convergence.status === "stable" ? undefined : convergence.check?.id;
 }
@@ -162,28 +203,6 @@ function proposedCheckFailureMessage(
 
 function plannedCheckSummary(plan: HatchCheckPlanEntry[]): HatchCheckPlanEntry[] {
   return plan.map(({ id, command, cwd, purpose }) => ({ id, command, cwd, purpose }));
-}
-
-async function scanSecrets(
-  cwd: string,
-  committedRange?: { base: string; target: string },
-): Promise<void> {
-  const args = [
-    "run",
-    "--script",
-    requirePackagePath("skills/hatch-build/scripts/scan_secrets.py"),
-  ];
-  if (committedRange) args.push("--base", committedRange.base, "--target", committedRange.target);
-  try {
-    await exec(
-      "uv",
-      args,
-      { cwd, encoding: "utf8", maxBuffer: MAX_OUTPUT },
-    );
-  } catch (error) {
-    const output = `${(error as { stdout?: string }).stdout ?? ""}${(error as { stderr?: string }).stderr ?? ""}`.trim();
-    throw new Error(output || "Hatch integration secret scan failed");
-  }
 }
 
 export class HatchIntegrationRunner {
@@ -326,7 +345,9 @@ export class HatchIntegrationRunner {
       }
       checks = convergence.manifest;
     }
-    await scanSecrets(integrationWorktree, { base: parents[0], target: mergeCommit });
+    // These bytes are already on the integration branch, so a match here ends the run.
+    const landed = secretMatchRefusal(await runSecretScan(integrationWorktree, { base: parents[0], target: mergeCommit }), "The accepted merge");
+    if (landed) throw new Error(`Hatch accepted merge recovery refused: ${landed.message}`);
     const evidence = await buildHatchEvidence({
       cwd: integrationWorktree,
       binder,
@@ -355,7 +376,12 @@ export class HatchIntegrationRunner {
       reviewPassed = verification.gates.acceptance.findings.every((finding) =>
         waivedCodes.has(finding.code),
       );
-      if (reviewPassed) {
+      // Safety is never waived. The parallel review's own safety verdict decides when it
+      // is bound to these bytes; otherwise safety runs again alone.
+      const boundSafety = boundSafetyVerdict(verification, evidence);
+      if (reviewPassed && boundSafety) {
+        reviewPassed = safetyPassed(boundSafety);
+      } else if (reviewPassed) {
         safetyVerification = await this.#verification.runWithLease(
           ctx,
           binder,
@@ -373,11 +399,10 @@ export class HatchIntegrationRunner {
       );
     }
     if (!done) {
-      await git(integrationWorktree, [
-        "update-ref",
-        `refs/hatch/${binder}/item-${item}/done`,
-        mergeCommit,
-        await nullObjectId(integrationWorktree),
+      // The halt record leaves in the transaction that writes `done`.
+      await updateRefsTransaction(integrationWorktree, [
+        `create refs/hatch/${binder}/item-${item}/done ${mergeCommit}`,
+        haltDeleteLine(binder, item),
       ]);
       await this.#checkpoint("done-ref-updated");
     }
@@ -485,6 +510,9 @@ export class HatchIntegrationRunner {
           checks: plan,
           environmentSetupRef: `refs/heads/hatch/${binder}/integration`,
           site: "fresh-merge",
+          // This run's parity probe for the item; bound only on identical inputs, and never
+          // for a visual oracle, whose merge review needs this worktree set up.
+          reuse: visualOracle(preliminaryEvidence.payload.workItem) ? undefined : parityResult(lease, item),
           signal: ctx.signal,
           onProcessStart: processContext
             ? (pid) => processContext.manager.registerProcess(pid, {
@@ -512,21 +540,37 @@ export class HatchIntegrationRunner {
             message: proposedCheckFailureMessage(convergence, plan),
           };
         }
+        if (convergence.reused) {
+          runProgress()({
+            kind: "checks-reused",
+            item,
+            site: "merge",
+            source: "parity-probe",
+            tree: convergence.targetTree,
+            checks: convergence.manifest.entries.length,
+          });
+        }
         checks = convergence.manifest;
       }
       await this.#checkpoint("checks-bound");
-      const protectedPaths = (await git(proposedWorktree, [
-        "diff",
-        "--cached",
-        "--name-only",
-        "-z",
-      ])).split("\0").filter(Boolean).filter(
-        (path) => path === ".hatch" || path.startsWith(".hatch/") || path === ".git" || path.startsWith(".git/"),
-      );
-      if (protectedPaths.length > 0) {
-        throw new Error(`Hatch integration modifies protected state: ${protectedPaths[0]}`);
+      const staged = (await git(proposedWorktree, ["diff", "--cached", "--name-only", "-z"])).split("\0").filter(Boolean);
+      const refusal = protectedPathRefusal(staged, "The proposed merge") ??
+        secretMatchRefusal(await runSecretScan(proposedWorktree), "The proposed merge");
+      if (refusal) {
+        // Before the gates and before acceptance.authorize, so Accept cannot waive it.
+        return {
+          schema: "hatch-integration-item-v1",
+          binder,
+          item,
+          status: "blocked",
+          base,
+          itemTip,
+          targetTree,
+          checks,
+          refusal,
+          message: refusal.message,
+        };
       }
-      await scanSecrets(proposedWorktree);
       const evidence = await buildHatchEvidence({
         cwd: integrationWorktree,
         binder,
@@ -541,7 +585,9 @@ export class HatchIntegrationRunner {
         item,
         "full",
         lease,
-        { cwd: integrationWorktree, target: "merge", checkManifest: checks },
+        // A plain merge may take this run's build-time verdicts when every reviewer
+        // input is equal; an accept always reviews the bytes it waives.
+        { cwd: integrationWorktree, target: "merge", checkManifest: checks, ...(acceptance ? {} : { reuseBuildReview: true as const }) },
         processContext
           ? { processes: processContext, worktree: proposedWorktree, treeish: targetTree }
           : undefined,
@@ -567,15 +613,38 @@ export class HatchIntegrationRunner {
             };
           }
           findings = verification.gates.acceptance.findings;
-          safetyVerification = await this.#verification.runWithLease(
-            ctx,
-            binder,
-            item,
-            "boundary-only",
-            lease,
-            { cwd: integrationWorktree, target: "merge", checkManifest: checks },
-          );
-          if (safetyVerification.status !== "pass" && safetyVerification.status !== "skipped") {
+          // Safety is never waived. The parallel review's own safety verdict decides when
+          // it is bound to these bytes; otherwise safety runs again alone.
+          const boundSafety = boundSafetyVerdict(verification, evidence);
+          if (boundSafety && !safetyPassed(boundSafety)) {
+            return {
+              schema: "hatch-integration-item-v1",
+              binder,
+              item,
+              status: "blocked",
+              base,
+              itemTip,
+              targetTree,
+              checks,
+              verification,
+              message: blockedVerificationMessage(
+                verification,
+                "Human acceptance cannot waive a safety-gate failure.",
+                "failed",
+              ),
+            };
+          }
+          if (!boundSafety) {
+            safetyVerification = await this.#verification.runWithLease(
+              ctx,
+              binder,
+              item,
+              "boundary-only",
+              lease,
+              { cwd: integrationWorktree, target: "merge", checkManifest: checks },
+            );
+          }
+          if (safetyVerification && safetyVerification.status !== "pass" && safetyVerification.status !== "skipped") {
             return {
               schema: "hatch-integration-item-v1",
               binder,
@@ -784,11 +853,10 @@ export class HatchIntegrationRunner {
           };
         }
       }
-      await git(integrationWorktree, [
-        "update-ref",
-        `refs/hatch/${binder}/item-${item}/done`,
-        mergeCommit,
-        await nullObjectId(integrationWorktree),
+      // The halt record leaves in the transaction that writes `done`.
+      await updateRefsTransaction(integrationWorktree, [
+        `create refs/hatch/${binder}/item-${item}/done ${mergeCommit}`,
+        haltDeleteLine(binder, item),
       ]);
       await this.#checkpoint("done-ref-updated");
       if (waiver) {

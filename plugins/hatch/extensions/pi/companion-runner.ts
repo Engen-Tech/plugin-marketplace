@@ -1629,7 +1629,7 @@ export class HatchCompanionRunner {
         let result: HatchWriterResult;
         try {
           before = await snapshotWorkerAuthority(worktree);
-          result = await this.#writers.run(
+          const outcome = await this.#writers.run(
             ctx,
             writer,
             worktree,
@@ -1638,6 +1638,15 @@ export class HatchCompanionRunner {
             processContext.owner.id,
             surfaceReview,
           );
+          // A failed outcome is raised as the error the catch below has always
+          // mapped: an authority change to its refusal, anything else to the
+          // plain error or the `writer-error` refusal.
+          if (!outcome.ok) {
+            throw outcome.failure.kind === "authority-violation"
+              ? new HatchWriterAuthorityError(`Hatch writer violated host authority: ${outcome.failure.problem}`)
+              : new Error(outcome.failure.problem);
+          }
+          result = outcome.value;
         } catch (error) {
           if (ctx.signal?.aborted || error === reviewFailure) throw error;
           if (authorityRefusal) throw new WriterRefusals([authorityRefusal]);

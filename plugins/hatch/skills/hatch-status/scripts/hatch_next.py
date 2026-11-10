@@ -1512,12 +1512,48 @@ ITEM_STATES_FIXTURE = (Path(__file__).resolve().parent.parent
                        / "references" / "item-states.json")
 
 
+HALT_PLANT_KEYS = {"fields", "raw", "repeat", "findings", "commit", "write"}
+HALT_RECORD_WRITER = Path(__file__).resolve().parent / "halt_record.py"
+
+
+def write_halt_record(doc: dict, item: str, declared: list, repo: Path) -> None:
+    """Write the table's halt_record through the skill route's real writer: the
+    halt_record.py write CLI, run with this interpreter, given a binder file named for
+    the slug and the template's fields. It keeps its own item tip, integration tip and
+    hatch version; every other field comes from the template."""
+    import tempfile
+    record = doc["halt_record"]
+    with tempfile.TemporaryDirectory() as td:
+        binder = Path(td) / f"{doc['binder']['slug']}.json"
+        binder.write_text(json.dumps({**doc["binder"], "work_items": declared}), encoding="utf-8")
+        args = [sys.executable, str(HALT_RECORD_WRITER), "write", "--repo", str(repo),
+                "--binder", str(binder), "--item", item, "--kind", record["halt_kind"],
+                "--phase", record["phase"], "--next-step", record["next_step"],
+                "--recorded-at", record["recorded_at"], "--findings-json", "-"]
+        for flag, key in (("--gate", "gate"), ("--attempt", "attempt"),
+                          ("--required-check-id", "required_check_id")):
+            if record[key] is not None:
+                args += [flag, str(record[key])]
+        proc = subprocess.run(args, input=json.dumps(record["findings"]), capture_output=True,
+                              text=True, encoding="utf-8")
+    try:
+        written = json.loads(proc.stdout).get("written") is True
+    except ValueError:
+        written = False
+    if proc.returncode != 0 or not written:
+        raise RuntimeError(f"halt_record.py write exited {proc.returncode} without writing: "
+                           f"{proc.stdout.strip()} {proc.stderr.strip()}".strip())
+
+
 def plant_halt_record(doc: dict, row: dict, repo: Path) -> None:
     """Write a row's halt record to its real ref, then fail if the ref is absent: a
-    runner that ignored the key would pass while proving nothing. A test plants the
-    record because nothing else writes one yet."""
+    runner that ignored the key would pass while proving nothing. halt.write goes
+    through the real writer; every other plant writes bytes or a state no writer makes."""
     plant, slug, item = row["halt"], doc["binder"]["slug"], doc["item"]
     root = f"{slug}/item-{item}"
+    unknown = sorted(set(plant) - HALT_PLANT_KEYS)
+    if unknown:
+        raise RuntimeError(f"item-states row {row['id']}: unknown plant {', '.join(unknown)}")
 
     def tip(name: str) -> str | None:
         rc, out = _git_rc("rev-parse", "--verify", "--quiet", f"{name}^{{commit}}", repo=repo)
@@ -1530,6 +1566,10 @@ def plant_halt_record(doc: dict, row: dict, repo: Path) -> None:
     if digest != doc["halt_spec_digest"]:
         raise RuntimeError(f"item-states row {row['id']}: the digest {digest} is not the "
                            f"table's {doc['halt_spec_digest']}")
+    if "write" in plant:
+        write_halt_record(doc, item, declared, repo)
+        assert_halt_ref(repo, slug, item)
+        return
     if plant.get("commit"):
         value = tips["@item_tip"]
     else:

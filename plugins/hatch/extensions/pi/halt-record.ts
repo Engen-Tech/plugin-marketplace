@@ -45,6 +45,7 @@ export interface HaltRules {
   max_bytes: number;
   max_findings: number;
   max_depth: number;
+  withheld: string;
   patterns: Record<string, string>;
   severities: string[];
   gates: Record<string, string>;

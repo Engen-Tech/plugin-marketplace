@@ -23,12 +23,13 @@ import {
 } from "./evidence.ts";
 import type { CheckToolDetails } from "./check-tool.ts";
 import { loadHatchRole } from "./role-catalog.ts";
+import { timePhase } from "./run-events.ts";
 import { describeRoleModelSource, hatchModelsConfigPath, requireRoleModel } from "./role-models.ts";
-import { promptForJsonEnvelope } from "./child-envelope.ts";
+import { promptForJsonEnvelope, readJson } from "./child-envelope.ts";
+import { CHILD_FAILURE_POLICY, classifyChildFailure, correctiveTurnAllowed, type Parsed } from "./child-outcome.ts";
 import {
   describeLastTurn,
   GateProviderUnavailableError,
-  lastTurnEndedInError,
   readLastTurn,
   type ChildLastTurn,
 } from "./child-last-turn.ts";
@@ -108,7 +109,8 @@ export interface HatchGateResult extends ChildGateVerdict {
 
 export interface HatchGateDispatch {
   stage: "preflight" | "review";
-  outcome: "verdict" | "no-verdict" | "provider-error";
+  // "protocol-lapse": the child returned a verdict that breaks a role rule.
+  outcome: "verdict" | "no-verdict" | "provider-error" | "protocol-lapse";
   problem?: string; // why the host could not use the reply (the parse error), at most 300 characters
   lastTurn?: ChildLastTurn;
   durationMs: number; // host wall time for this child
@@ -116,7 +118,7 @@ export interface HatchGateDispatch {
 
 // The codes a host-written verdict carries. A model may write a finding with one of
 // these codes too, so consumers key on `verdictSource`, never on the code.
-export type HatchHostGateCode = "quota-exhausted" | "provider-error" | "no-verdict";
+export type HatchHostGateCode = "quota-exhausted" | "provider-error" | "no-verdict" | "protocol-lapse";
 
 interface GatePreflight {
   ensure(
@@ -150,12 +152,13 @@ function hash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function exactKeys(value: Record<string, unknown>, allowed: string[], label: string): void {
+function keysProblem(value: Record<string, unknown>, allowed: string[], label: string): string | null {
   const keys = Object.keys(value).sort();
   const expected = [...allowed].sort();
   if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
-    throw new Error(`Malformed Hatch gate ${label}: expected keys ${expected.join(", ")}`);
+    return `Malformed Hatch gate ${label}: expected keys ${expected.join(", ")}`;
   }
+  return null;
 }
 
 function safeRelativePath(path: string): boolean {
@@ -169,35 +172,36 @@ function safeRelativePath(path: string): boolean {
   );
 }
 
-function parseFinding(value: unknown, index: number): HatchGateFinding {
+function findingProblem(value: unknown, index: number): string | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Malformed Hatch gate finding ${index + 1}`);
+    return `Malformed Hatch gate finding ${index + 1}`;
   }
   const finding = value as Record<string, unknown>;
   const required = ["severity", "code", "message"];
   const optional = ["path", "line", "nextStep"].filter((key) => finding[key] !== undefined);
-  exactKeys(finding, [...required, ...optional], `finding ${index + 1}`);
+  const keys = keysProblem(finding, [...required, ...optional], `finding ${index + 1}`);
+  if (keys !== null) return keys;
   if (!(["critical", "major", "minor"] as unknown[]).includes(finding.severity)) {
-    throw new Error(`Malformed Hatch gate finding ${index + 1}: invalid severity`);
+    return `Malformed Hatch gate finding ${index + 1}: invalid severity`;
   }
   if (typeof finding.code !== "string" || !FINDING_CODE.test(finding.code)) {
-    throw new Error(`Malformed Hatch gate finding ${index + 1}: invalid code`);
+    return `Malformed Hatch gate finding ${index + 1}: invalid code`;
   }
   if (
     typeof finding.message !== "string" ||
     !finding.message.trim() ||
     finding.message.length > MAX_FINDING_TEXT
   ) {
-    throw new Error(`Malformed Hatch gate finding ${index + 1}: invalid message`);
+    return `Malformed Hatch gate finding ${index + 1}: invalid message`;
   }
   if (finding.path !== undefined && (typeof finding.path !== "string" || !safeRelativePath(finding.path))) {
-    throw new Error(`Malformed Hatch gate finding ${index + 1}: invalid path`);
+    return `Malformed Hatch gate finding ${index + 1}: invalid path`;
   }
   if (
     finding.line !== undefined &&
     (!Number.isInteger(finding.line) || (finding.line as number) <= 0)
   ) {
-    throw new Error(`Malformed Hatch gate finding ${index + 1}: invalid line`);
+    return `Malformed Hatch gate finding ${index + 1}: invalid line`;
   }
   if (
     finding.nextStep !== undefined &&
@@ -205,37 +209,37 @@ function parseFinding(value: unknown, index: number): HatchGateFinding {
       !finding.nextStep.trim() ||
       finding.nextStep.length > MAX_FINDING_TEXT)
   ) {
-    throw new Error(`Malformed Hatch gate finding ${index + 1}: invalid nextStep`);
+    return `Malformed Hatch gate finding ${index + 1}: invalid nextStep`;
   }
-  return finding as unknown as HatchGateFinding;
+  return null;
 }
 
-export function parseGateVerdict(
-  text: string,
-  expected: {
-    role: HatchGateRoleId;
-    evidenceHash: string;
-    roleDefinitionHash: string;
-    promptHash: string;
-    profileHash: string;
-  },
-): ChildGateVerdict {
-  let value: unknown;
-  try {
-    value = JSON.parse(text);
-  } catch {
+type GateVerdictExpectation = {
+  role: HatchGateRoleId;
+  evidenceHash: string;
+  roleDefinitionHash: string;
+  promptHash: string;
+  profileHash: string;
+};
+
+// The gate's verdict, or the first rule it breaks. Total: every defect is a value.
+export function readGateVerdict(text: string, expected: GateVerdictExpectation): Parsed<ChildGateVerdict> {
+  const defect = (problem: string): Parsed<ChildGateVerdict> => ({ ok: false, problem });
+  const json = readJson(text);
+  if (!json.ok) {
     const snippet = text.trim().slice(0, 200).replace(/\s+/g, " ");
-    throw new Error(
+    return defect(
       `Malformed Hatch gate verdict: response must be exactly one JSON object (last assistant text: ${
         snippet ? `"${snippet}"` : "<empty>"
       })`,
     );
   }
+  const value = json.value;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("Malformed Hatch gate verdict: response is not an object");
+    return defect("Malformed Hatch gate verdict: response is not an object");
   }
   const verdict = value as Record<string, unknown>;
-  exactKeys(
+  const keys = keysProblem(
     verdict,
     [
       "schema",
@@ -250,37 +254,50 @@ export function parseGateVerdict(
     ],
     "verdict",
   );
-  if (verdict.schema !== VERDICT_SCHEMA) throw new Error("Unsupported Hatch gate verdict schema");
+  if (keys !== null) return defect(keys);
+  if (verdict.schema !== VERDICT_SCHEMA) return defect("Unsupported Hatch gate verdict schema");
   for (const key of ["evidenceHash", "roleDefinitionHash", "promptHash", "profileHash"] as const) {
     if (typeof verdict[key] !== "string" || !HASH.test(verdict[key] as string)) {
-      throw new Error(`Malformed Hatch gate verdict: invalid ${key}`);
+      return defect(`Malformed Hatch gate verdict: invalid ${key}`);
     }
     if (verdict[key] !== expected[key]) {
-      throw new Error(`Hatch gate verdict ${key} does not match dispatch evidence`);
+      return defect(`Hatch gate verdict ${key} does not match dispatch evidence`);
     }
   }
-  if (verdict.role !== expected.role) throw new Error("Hatch gate verdict role does not match dispatch");
+  if (verdict.role !== expected.role) return defect("Hatch gate verdict role does not match dispatch");
   if (!(["pass", "concerns", "blocked"] as unknown[]).includes(verdict.verdict)) {
-    throw new Error("Malformed Hatch gate verdict: invalid verdict");
+    return defect("Malformed Hatch gate verdict: invalid verdict");
   }
   if (typeof verdict.summary !== "string" || !verdict.summary.trim()) {
-    throw new Error("Malformed Hatch gate verdict: invalid summary");
+    return defect("Malformed Hatch gate verdict: invalid summary");
   }
   // Length alone never voids a completed review: the summary is display prose.
   // The corrective turn asks for a shorter one; if the reviewer does not comply,
   // the host clamps rather than discarding the judgement it already made.
   verdict.summary = clampSummary(verdict.summary, MAX_SUMMARY_LENGTH);
   if (!Array.isArray(verdict.findings) || verdict.findings.length > MAX_FINDINGS) {
-    throw new Error("Malformed Hatch gate verdict: invalid findings");
+    return defect("Malformed Hatch gate verdict: invalid findings");
   }
-  const findings = verdict.findings.map(parseFinding);
+  for (const [index, finding] of verdict.findings.entries()) {
+    const problem = findingProblem(finding, index);
+    if (problem !== null) return defect(problem);
+  }
+  const findings = [...verdict.findings] as HatchGateFinding[];
   if (verdict.verdict === "pass" && findings.length !== 0) {
-    throw new Error("Malformed Hatch gate verdict: pass cannot contain findings");
+    return defect("Malformed Hatch gate verdict: pass cannot contain findings");
   }
   if (verdict.verdict === "concerns" && findings.length === 0) {
-    throw new Error("Malformed Hatch gate verdict: concerns requires findings");
+    return defect("Malformed Hatch gate verdict: concerns requires findings");
   }
-  return { ...(verdict as unknown as ChildGateVerdict), findings };
+  return { ok: true, value: { ...(verdict as unknown as ChildGateVerdict), findings } };
+}
+
+// The throwing form of readGateVerdict, for the visual gate, whose caller turns a
+// throw into a blocked verification.
+export function parseGateVerdict(text: string, expected: GateVerdictExpectation): ChildGateVerdict {
+  const parsed = readGateVerdict(text, expected);
+  if (!parsed.ok) throw new Error(parsed.problem);
+  return parsed.value;
 }
 
 function piExecutionContract(
@@ -334,27 +351,25 @@ export function gateVerdictViolation(
   text: string,
   expected: Parameters<typeof parseGateVerdict>[1] | null,
 ): string | null {
-  try {
-    const value = JSON.parse(text.trim());
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      return "the verdict must be a single JSON object";
-    }
-    const record = value as Record<string, unknown>;
-    if (record.schema !== VERDICT_SCHEMA) return `"schema" must be "${VERDICT_SCHEMA}"`;
-    // Asked for even though the parse now clamps it: a reviewer's own shorter
-    // summary is better than the host's cut, so spend the turn on it.
-    if (typeof record.summary === "string" && record.summary.length > MAX_SUMMARY_LENGTH) {
-      return `"summary" is ${record.summary.length} characters; the limit is ${MAX_SUMMARY_LENGTH}` +
-        " — shorten it and resend the same verdict, keeping every other field byte-identical";
-    }
-    // Without the dispatch's expected hashes only the shape can be judged; the
-    // hash comparison then belongs to the strict parse alone.
-    if (!expected) return null;
-    parseGateVerdict(text, expected);
-    return null;
-  } catch (error) {
-    return error instanceof Error ? error.message : String(error);
+  const json = readJson(text.trim());
+  if (!json.ok) return json.problem;
+  const value = json.value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "the verdict must be a single JSON object";
   }
+  const record = value as Record<string, unknown>;
+  if (record.schema !== VERDICT_SCHEMA) return `"schema" must be "${VERDICT_SCHEMA}"`;
+  // Asked for even though the parse now clamps it: a reviewer's own shorter
+  // summary is better than the host's cut, so spend the turn on it.
+  if (typeof record.summary === "string" && record.summary.length > MAX_SUMMARY_LENGTH) {
+    return `"summary" is ${record.summary.length} characters; the limit is ${MAX_SUMMARY_LENGTH}` +
+      " — shorten it and resend the same verdict, keeping every other field byte-identical";
+  }
+  // Without the dispatch's expected hashes only the shape can be judged; the
+  // hash comparison then belongs to the strict parse alone.
+  if (!expected) return null;
+  const parsed = readGateVerdict(text, expected);
+  return parsed.ok ? null : parsed.problem;
 }
 
 function looksLikeGateVerdict(text: string): boolean {
@@ -365,7 +380,7 @@ export function promptGateForVerdict(
   session: Parameters<typeof promptForJsonEnvelope>[0],
   userPrompt: string,
   expected: Parameters<typeof parseGateVerdict>[1] | null = null,
-  canRepair?: () => boolean,
+  canRepair?: (text: string) => boolean,
 ): Promise<string> {
   return promptForJsonEnvelope(
     session,
@@ -473,12 +488,11 @@ export function citationVerdictNudge(
   if (profile.role.id !== "safety-gate") return null;
   const review = profile.evidenceToolState.citationReview;
   if (review.tooLarge.length === 0 && review.unverifiable.length === 0 && review.defects === 0) return null;
-  let verdict: unknown;
-  try {
-    verdict = (JSON.parse(text.trim()) as { verdict?: unknown }).verdict;
-  } catch {
-    return null;
-  }
+  // Called only after the verdict passed the strict parse, so a reply that is not
+  // JSON never reaches here; it gets no nudge if it does.
+  const json = readJson(text.trim());
+  if (!json.ok) return null;
+  const verdict = (json.value as { verdict?: unknown } | null)?.verdict;
   if (review.tooLarge.length > 0) {
     if (verdict === "blocked") return null;
     const unshown = review.tooLarge.map((index) => `citation ${index}`).join(", ");
@@ -494,7 +508,7 @@ export async function promptGateForGroundedVerdict(
   evidenceGaps: () => string[],
   expected: Parameters<typeof parseGateVerdict>[1] | null = null,
   citationNudge: (text: string) => string | null = () => null,
-  canRepair?: () => boolean,
+  canRepair?: (text: string) => boolean,
 ): Promise<string> {
   const text = await promptGateForVerdict(session, userPrompt, expected, canRepair);
   if (gateVerdictViolation(text, expected) !== null) return text;
@@ -547,7 +561,7 @@ export async function promptGateChild(
       evidenceGaps,
       expected,
       citationNudge,
-      () => !lastTurnEndedInError(session.messages),
+      (reply) => correctiveTurnAllowed("gate", readLastTurn({ messages: session.messages, prompts, providerRetries }), reply),
     );
     const lastTurn = readLastTurn({
       messages: session.messages,
@@ -601,21 +615,24 @@ function classifyRetry(verdict: HatchGateVerdict): HatchRetryClassification {
   return "halt";
 }
 
-function validateRoleToolResult(
+// A verdict that breaks a role rule, in words, or null when it breaks none. A lapse is
+// the model's, not the host's: the caller spends the gate's fresh child on it and
+// then writes a host `blocked` verdict (`protocol-lapse`). It never throws.
+function roleRuleLapse(
   profile: GateCapabilityProfile,
   verdict: ChildGateVerdict,
-): void {
+): string | null {
   for (const action of ["summary", "workItem", "diff"]) {
     if (!profile.evidenceToolState.actions.has(action)) {
-      throw new Error(`Hatch gate '${profile.role.id}' did not read required ${action} evidence`);
+      return `Hatch gate '${profile.role.id}' did not read required ${action} evidence`;
     }
   }
   if (!profile.roleToolState.invoked) {
-    throw new Error(`Hatch gate '${profile.role.id}' did not invoke its required role tool`);
+    return `Hatch gate '${profile.role.id}' did not invoke its required role tool`;
   }
   const details = profile.roleToolState.details as { evidenceHash?: unknown } | undefined;
   if (details?.evidenceHash !== profile.evidenceHash) {
-    throw new Error(`Hatch gate '${profile.role.id}' role tool returned the wrong evidence hash`);
+    return `Hatch gate '${profile.role.id}' role tool returned the wrong evidence hash`;
   }
   if (profile.role.id === "safety-gate") {
     const review = profile.evidenceToolState.citationReview;
@@ -629,26 +646,27 @@ function validateRoleToolResult(
       verdict.verdict !== "blocked" &&
       (unreadPacks.length > 0 || unreadCitations.length > 0)
     ) {
-      throw new Error("Hatch safety gate did not read every pinned rule set and repo-rule citation");
+      return "Hatch safety gate did not read every pinned rule set and repo-rule citation";
     }
     // Only a citation the host could not show is incomplete evidence. A citation that
     // is malformed, missing, or not a file is complete evidence of an undeclared
     // override: concerns sends it back to the worker, and only a pass is refused.
     if (review.tooLarge.length > 0 && verdict.verdict !== "blocked") {
-      throw new Error("Hatch safety gate must block when repo-rule citation evidence is incomplete");
+      return "Hatch safety gate must block when repo-rule citation evidence is incomplete";
     }
     if ((review.unverifiable.length > 0 || review.defects > 0) && verdict.verdict === "pass") {
-      throw new Error("Hatch safety gate cannot pass while a repo-rule citation is malformed, missing, or not a file");
+      return "Hatch safety gate cannot pass while a repo-rule citation is malformed, missing, or not a file";
     }
-    return;
+    return null;
   }
   const check = details as CheckToolDetails;
   if (verdict.verdict === "pass" && ["failed", "missing"].includes(check.status)) {
-    throw new Error("Hatch acceptance gate cannot pass without a passing bound check manifest");
+    return "Hatch acceptance gate cannot pass without a passing bound check manifest";
   }
   if (check.status === "missing" && verdict.verdict !== "blocked") {
-    throw new Error("Hatch acceptance gate must block when its bound check manifest is missing");
+    return "Hatch acceptance gate must block when its bound check manifest is missing";
   }
+  return null;
 }
 
 const MAX_PROBLEM_TEXT = 300;
@@ -679,29 +697,6 @@ function problemOf(error: unknown): string {
   return clip(error instanceof Error ? error.message : String(error), MAX_PROBLEM_TEXT);
 }
 
-// How a child that returned no verdict is routed, from its last turn. A provider
-// error is never retried here: Pi already retried what it judged transient, and a
-// quota does not reset in seconds. Only a shape a fresh context can fix (an empty
-// reply, a turn that ended on a tool call, no reply, prose) earns one fresh child.
-type NoVerdictRoute =
-  | { kind: "cancelled" }
-  | { kind: "provider"; code: "quota-exhausted" | "provider-error" }
-  | { kind: "retry" }
-  | { kind: "final"; cutOff: boolean };
-
-function routeNoVerdict(turn: ChildLastTurn | undefined): NoVerdictRoute {
-  if (!turn || turn.stopReason === undefined) return { kind: "retry" };
-  if (turn.stopReason === "aborted") return { kind: "cancelled" };
-  if (turn.stopReason === "error") {
-    return { kind: "provider", code: turn.providerError === "quota" ? "quota-exhausted" : "provider-error" };
-  }
-  // A reply cut at the output limit gets no second child, even when it was cut on a
-  // tool call: the same model with the same budget would be cut again.
-  if (turn.stopReason === "length") return { kind: "final", cutOff: true };
-  if (turn.stopReason === "stop" || turn.stopReason === "toolUse" || turn.endedOnToolCall) return { kind: "retry" };
-  return { kind: "final", cutOff: false };
-}
-
 function hostCodeInWords(code: HatchHostGateCode): string {
   switch (code) {
     case "quota-exhausted":
@@ -710,6 +705,8 @@ function hostCodeInWords(code: HatchHostGateCode): string {
       return "the provider returned an error";
     case "no-verdict":
       return "no usable reply";
+    case "protocol-lapse":
+      return "its verdict broke a role rule";
   }
 }
 
@@ -718,7 +715,8 @@ function hostCodeInWords(code: HatchHostGateCode): string {
 // child would have judged) and says who wrote it with `verdictSource: "host"`, the
 // same rule as `reportedVerdict`: the record never claims the model said something
 // it did not.
-// A gate child with no verdict fails closed.
+// A gate child with no verdict fails closed, and so does one whose verdict breaks a
+// role rule twice (`protocol-lapse`).
 // It becomes `blocked`, named by a code, never a pass and never an exception out of
 // the dispatch.
 function hostGateVerdict(input: {
@@ -760,7 +758,7 @@ function hostGateVerdict(input: {
       break;
     }
     case "no-verdict":
-      message = `${subject} ${where} returned no verdict from ${reviews} ${reviews === 1 ? "child" : "children"}. Last turn: ${
+      message = `${subject} ${where} on ${model} returned no verdict from ${reviews} ${reviews === 1 ? "child" : "children"}. Last turn: ${
         turn ? describeLastTurn(turn) : "not reported"
       }. The host could not use the reply: ${last?.problem ?? "no reply"}.`;
       nextStep = `${RERUN_SENTENCE} If this gate returns nothing again, pin the ${roleId} role to another model in ${path}.${
@@ -769,7 +767,12 @@ function hostGateVerdict(input: {
           : ""
       }`;
       break;
+    case "protocol-lapse":
+      message = `${subject} ${where} on ${model} returned a verdict that broke a role rule from ${reviews} ${reviews === 1 ? "child" : "children"}, so the host did not use it: ${last?.problem ?? "no problem recorded"}.`;
+      nextStep = `${RERUN_SENTENCE} If this gate breaks a role rule again, pin the ${roleId} role to another model in ${path}.`;
+      break;
   }
+  const said = code === "protocol-lapse" ? "returned no usable verdict" : "returned no verdict";
   return {
     schema: VERDICT_SCHEMA,
     role: roleId,
@@ -778,7 +781,7 @@ function hostGateVerdict(input: {
     promptHash: input.expected.promptHash,
     profileHash: input.expected.profileHash,
     verdict: "blocked",
-    summary: `The ${roleId} child returned no verdict on evidence ${manifest.evidenceHash.slice(0, 12)}: ${hostCodeInWords(code)}.`,
+    summary: `The ${roleId} child ${said} on evidence ${manifest.evidenceHash.slice(0, 12)}: ${hostCodeInWords(code)}.`,
     findings: [{ severity: "major", code, message, nextStep }],
     retry: classifyRetry("blocked"),
     provider: runtime.provider,
@@ -793,13 +796,25 @@ function hostGateVerdict(input: {
 
 const MAX_REVIEW_CHILDREN = 2;
 
-export async function executeGateOnEvidence(
+// The whole gate, preflight and every child, is the run's gate phase time.
+export function executeGateOnEvidence(
   ctx: ExtensionContext,
   roleId: HatchGateRoleId,
   manifest: HatchEvidenceManifest,
   preflight: GatePreflight,
   registry: ChildRegistry,
   invoke: GateModelInvoker = invokeGateModel,
+): Promise<HatchGateResult> {
+  return timePhase("gates", () => runGateOnEvidence(ctx, roleId, manifest, preflight, registry, invoke));
+}
+
+async function runGateOnEvidence(
+  ctx: ExtensionContext,
+  roleId: HatchGateRoleId,
+  manifest: HatchEvidenceManifest,
+  preflight: GatePreflight,
+  registry: ChildRegistry,
+  invoke: GateModelInvoker,
 ): Promise<HatchGateResult> {
   // Resolved once, before any work: the preflight and every child run on the same
   // pinned target, and an unpinned context fails here.
@@ -879,32 +894,46 @@ export async function executeGateOnEvidence(
     if (currentRole.definitionHash !== profile.role.definitionHash) {
       throw new Error("Hatch gate role changed during dispatch");
     }
-    let parsed: ChildGateVerdict;
-    try {
-      parsed = parseGateVerdict(text, expected);
-    } catch (error) {
-      const route = routeNoVerdict(lastTurn);
-      if (route.kind === "cancelled") throw new Error(`Hatch gate '${roleId}' was cancelled`);
+    const read = readGateVerdict(text, expected);
+    if (!read.ok) {
+      // How the child failed decides its route, through the policy table. A provider error
+      // is never retried here: Pi already retried what it judged transient, and a quota does
+      // not reset in seconds. A cut-off gets no second child: the same model with the same
+      // output budget would be cut again. (An aborted turn has already thrown above.)
+      const kind = classifyChildFailure(lastTurn, text);
+      const provider = kind === "provider-quota" || kind === "provider-error";
       dispatches.push({
         stage: "review",
-        outcome: route.kind === "provider" ? "provider-error" : "no-verdict",
-        problem: problemOf(error),
+        outcome: provider ? "provider-error" : "no-verdict",
+        problem: problemOf(read.problem),
         ...(lastTurn ? { lastTurn } : {}),
         durationMs,
       });
-      if (route.kind === "retry" && attempt < MAX_REVIEW_CHILDREN) continue;
+      if (CHILD_FAILURE_POLICY.gate[kind].freshChild && attempt < MAX_REVIEW_CHILDREN) continue;
       return hostGateVerdict({
         roleId,
         manifest,
         expected,
         target,
         runtime,
-        code: route.kind === "provider" ? route.code : "no-verdict",
+        code: kind === "provider-quota" ? "quota-exhausted" : provider ? "provider-error" : "no-verdict",
         dispatches,
-        cutOff: route.kind === "final" && route.cutOff,
+        cutOff: kind === "cut-off",
       });
     }
-    validateRoleToolResult(profile, parsed);
+    const parsed = read.value;
+    const lapse = roleRuleLapse(profile, parsed);
+    if (lapse !== null) {
+      dispatches.push({
+        stage: "review",
+        outcome: "protocol-lapse",
+        problem: clip(lapse, MAX_PROBLEM_TEXT),
+        ...(lastTurn ? { lastTurn } : {}),
+        durationMs,
+      });
+      if (CHILD_FAILURE_POLICY.gate["protocol-lapse"].freshChild && attempt < MAX_REVIEW_CHILDREN) continue;
+      return hostGateVerdict({ roleId, manifest, expected, target, runtime, code: "protocol-lapse", dispatches });
+    }
     if (dispatches.length > 0) {
       dispatches.push({ stage: "review", outcome: "verdict", ...(lastTurn ? { lastTurn } : {}), durationMs });
     }

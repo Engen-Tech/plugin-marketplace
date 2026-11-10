@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { HatchRunEvent } from "./run-events.ts";
+import { hatchProvenance, type HatchProvenance, type HatchRunEvent } from "./run-events.ts";
 import type { HatchModelRole, RoleModelSummaryEntry } from "./role-models.ts";
 
 export type HatchRunAction = "deliverBinder" | "buildItem" | "runVerification";
@@ -41,6 +41,8 @@ export interface HatchRunRecord {
   readonly model?: string;
   readonly roleModels?: HatchRunRoleModels;
   readonly roleModelNotes?: readonly string[];
+  // The hatch version and commit this process runs, read when the run opens.
+  readonly hatch: HatchProvenance;
   state: HatchRunState;
   started: boolean;
   attachedCount: number;
@@ -67,6 +69,7 @@ export interface HatchRunSnapshot {
   model?: string;
   roleModels?: HatchRunRoleModels;
   roleModelNotes?: string[];
+  hatch: HatchProvenance;
   cancelRequested?: boolean;
   progress: HatchRunProgressSnapshot;
   finishedAt?: string;
@@ -93,11 +96,12 @@ export function foldRunEvent(
   event: HatchRunEvent,
   at: string,
 ): HatchRunProgressSnapshot {
-  const next: HatchRunProgressSnapshot = { ...progress, phase: event.kind };
+  // A gate review is a detail of the build or merge under way, not a phase of its own.
+  const next: HatchRunProgressSnapshot = { ...progress, phase: event.kind === "gate-reviewed" ? progress.phase : event.kind };
   switch (event.kind) {
     case "binder-loaded":
       next.total = event.items.length;
-      next.landed = event.carried.reduce(addOnce, next.landed);
+      next.landed = event.landed.reduce(addOnce, next.landed);
       break;
     case "wave-started":
       next.wave = event.wave;
@@ -185,6 +189,7 @@ export class HatchRunRegistry {
       ...(spec.roleModelNotes !== undefined && spec.roleModelNotes.length > 0
         ? { roleModelNotes: spec.roleModelNotes }
         : {}),
+      hatch: hatchProvenance(),
       state: "running",
       started: false,
       attachedCount: 0,
@@ -280,6 +285,7 @@ export class HatchRunRegistry {
       ...(record.model !== undefined ? { model: record.model } : {}),
       ...(record.roleModels !== undefined ? { roleModels: structuredClone(record.roleModels) } : {}),
       ...(record.roleModelNotes !== undefined ? { roleModelNotes: [...record.roleModelNotes] } : {}),
+      hatch: { ...record.hatch },
       ...(record.cancelRequested ? { cancelRequested: true } : {}),
       progress: structuredClone(record.progress),
       ...(record.finishedAt !== undefined

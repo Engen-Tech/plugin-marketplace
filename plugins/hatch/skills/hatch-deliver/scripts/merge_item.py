@@ -43,7 +43,9 @@ revalidation, done_ref, halted_at} — the same keys on every path, with
   (e2) CLEAN AND UNMOVED. After the oracle, porcelain must be empty
        ("dirty-after-oracle" otherwise) and HEAD/branch/ref must still be the
        just-made merge commit on the integration branch ("tip-moved" otherwise).
-  (f)  On success, write refs/hatch/<slug>/item-<id>/done at the merge commit.
+  (f)  On success, write refs/hatch/<slug>/item-<id>/done at the merge commit and
+       delete the item's halt record (refs/hatch/<slug>/item-<id>/halt) in the same
+       ref transaction; a refused transaction writes neither.
 
 Every halt after the merge started goes through ONE SHARED UNWIND ROUTINE — a
 fixed, forced sequence that works from any state the oracle can leave:
@@ -132,8 +134,9 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8")
+def _git(repo: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                          encoding="utf-8", input=stdin)
 
 
 def _rev(repo: Path, ref: str) -> str | None:
@@ -511,8 +514,10 @@ def cmd_merge(args: argparse.Namespace) -> int:
         _forced_unwind(repo, slug, pre_tip)
         return halt("dirty-after-oracle")
 
-    # (f) done ref.
-    upd = _git(repo, "update-ref", done_ref, merge_commit or "")
+    # (f) done ref, with the halt record's delete in the same transaction.
+    halt_ref = f"refs/hatch/{slug}/item-{item}/halt"
+    upd = _git(repo, "update-ref", "--stdin",
+               stdin=f"start\nupdate {done_ref} {merge_commit or ''}\ndelete {halt_ref}\nprepare\ncommit\n")
     if upd.returncode != 0:
         print(f"merge_item: update-ref failed: {upd.stderr.strip()}", file=sys.stderr)
         return halt("done-ref-write")
@@ -936,6 +941,37 @@ def _run_self_test() -> int:  # noqa: C901 — one hermetic harness, many named 
                                               "merge_commit", "revalidation", "done_ref",
                                               "halted_at"},
               str(sorted(res or {})))
+
+        # 1b. the halt record leaves with done, in the same ref transaction
+        halt_ref = "refs/hatch/s/item-a/halt"
+
+        def plant_halt(f: Fx) -> str:
+            blob = subprocess.run(["git", "-C", str(f.repo), "hash-object", "-w", "--stdin"],
+                                  input="{}\n", capture_output=True, text=True,
+                                  encoding="utf-8", check=True).stdout.strip()
+            g(f.repo, "update-ref", halt_ref, blob)
+            return blob
+
+        f = fixture("haltgone", "echo OK", expect="OK")
+        plant_halt(f)
+        code, res = run_cli(merge_args(f))
+        check("a clean merge deletes the halt record with the done ref",
+              code == 0 and res is not None and res["halted_at"] is None
+              and not no_done(f) and _git(f.repo, "rev-parse", "--verify", "--quiet",
+                                          halt_ref).returncode != 0,
+              f"code={code}")
+
+        f = fixture("haltkept", "echo OK", expect="OK")
+        blob = plant_halt(f)
+        # A ref under done/ makes the done write refuse (a directory/file conflict), so
+        # the transaction carrying the halt delete is refused as a whole.
+        g(f.repo, "update-ref", "refs/hatch/s/item-a/done/x", f.item_tip)
+        code, res = run_cli(merge_args(f))
+        check("a refused done write keeps the halt record",
+              code == 1 and res is not None and res["halted_at"] == "done-ref-write"
+              and no_done(f) and _git(f.repo, "rev-parse", "--verify", "--quiet",
+                                      halt_ref).stdout.strip() == blob,
+              f"code={code} res={res}")
 
         # 2-4. built/failed preconditions
         f = fixture("nobuilt", "echo OK")

@@ -29,13 +29,17 @@
     "merge-check-failed": "A merge check failed",
     "worker-blocked": "The worker reported itself blocked",
     "provider-error": "The model provider returned an error",
-    "host-verdict": "The host stopped the item"
+    "host-verdict": "The host stopped the item",
+    "secret-match": "The secret scan found a credential",
+    "protected-path": "The change touches .hatch or .git",
+    "authority-violation": "A worker changed what the host owns"
   },
   "next_steps": {
     "human-decision": "choose fix, accept or defer at the prompt",
     "fix-and-rerun": "fix the item and rerun",
     "rerun-delivery": "deliver the binder again; the candidate is kept",
-    "replan": "replan the item"
+    "replan": "replan the item",
+    "change-model": "wait for the provider or pin another model, then deliver again"
   },
   "history": {
     "spec-unknown": "hatch could not read this item's plan to compare",

@@ -82,9 +82,9 @@ def _read_stdin_text() -> str:
 SENTINEL_NAME = "hatch-stop-gate.json"
 SENTINEL_MAX_SESSIONS = 20
 # The ref vocabulary the engine writes (skills/_shared/integration-branch.md),
-# kept equal to it so the gate and status read the same states. `evidence` and
-# `in-progress` change no decision; `accepted` is checked below.
-REF_STATES = ("built", "done", "accepted", "failed", "evidence", "in-progress")
+# kept equal to it so the gate and status read the same states. `evidence`, `halt`
+# and `in-progress` change no decision; `accepted` is checked below.
+REF_STATES = ("built", "done", "accepted", "failed", "evidence", "halt", "in-progress")
 
 BUILT_UNMERGED_MSG = (
     "binder {slug}: items {ids} carry built but no done — the serial merge queue "

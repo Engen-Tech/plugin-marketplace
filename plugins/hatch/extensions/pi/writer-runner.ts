@@ -19,8 +19,9 @@ import {
   type HatchWriterRole,
   type WriterCapabilityProfile,
 } from "./writer-profile.ts";
-import { parseJsonEnvelope, promptForJsonEnvelope, type EnvelopePrompter } from "./child-envelope.ts";
-import { lastTurnEndedInError } from "./child-last-turn.ts";
+import { promptForJsonEnvelope, readJsonEnvelope, type EnvelopePrompter } from "./child-envelope.ts";
+import { readLastTurn, type ChildLastTurn } from "./child-last-turn.ts";
+import { classifyChildFailure, correctiveTurnAllowed, type ChildFailure, type ChildOutcome, type Parsed } from "./child-outcome.ts";
 
 const WRITER_SCHEMA = "hatch-writer-result-v1";
 
@@ -34,7 +35,8 @@ export const KAIZEN_SEEDED_CACHE_RULE =
   "into `proposedScaffolds` with no file changed.";
 
 // The writer changed host authority (refs, index, config, hooks, protected
-// paths). Typed so the companion runner records it as a confinement refusal.
+// paths). The writer runner returns that as an `authority-violation` outcome; the
+// companion runner raises this type from it, so it records a confinement refusal.
 export class HatchWriterAuthorityError extends Error {
   constructor(message: string) {
     super(message);
@@ -55,8 +57,10 @@ export function writerEnvelopeViolation(
   text: string,
   expected: { binder: string; profile: WriterCapabilityProfile; runtime: ChildRuntimeReport } | null,
 ): string | null {
+  const json = readJsonEnvelope(text, "writer");
+  if (!json.ok) return json.problem;
+  const value = json.value;
   try {
-    const value = parseJsonEnvelope(text, "writer");
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       return "the result must be a single JSON object";
     }
@@ -155,7 +159,9 @@ export interface WriterSession extends EnvelopePrompter {
 }
 
 // At most four prompts: the request, an envelope repair, the correction, an
-// envelope repair. A provider error skips every repair and the correction. The
+// envelope repair. Whether a repair or the correction is sent is
+// CHILD_FAILURE_POLICY.writer's call for the kind the last turn reads as: a
+// provider error skips every repair and the correction, and so does an abort. The
 // review runs only on an envelope the strict parse accepts, so it judges exactly
 // what the host will parse after the session closes.
 export async function promptWriterChild(
@@ -164,7 +170,9 @@ export async function promptWriterChild(
   runtime: ChildRuntimeReport,
 ): Promise<string> {
   const expected = { binder: invocation.binder, profile: invocation.profile, runtime };
-  const canRepair = () => !lastTurnEndedInError(session.messages);
+  // Read per call, so the table decides each turn as it stands.
+  const canRepair = (reply: string) =>
+    correctiveTurnAllowed("writer", readLastTurn({ messages: session.messages, prompts: 0, providerRetries: 0 }), reply);
   const ask = (message: string) =>
     promptForJsonEnvelope(
       session,
@@ -179,7 +187,7 @@ export async function promptWriterChild(
       canRepair,
     );
   const text = await ask(invocation.userPrompt);
-  if (!invocation.surfaceReview || writerEnvelopeViolation(text, expected) !== null || !canRepair()) {
+  if (!invocation.surfaceReview || writerEnvelopeViolation(text, expected) !== null || !canRepair(text)) {
     return text;
   }
   const correction = await invocation.surfaceReview(
@@ -188,13 +196,17 @@ export async function promptWriterChild(
   return correction === null ? text : ask(correction);
 }
 
-export type WriterModelInvoker = (
-  invocation: WriterInvocation,
-) => Promise<{ text: string; runtime: ChildRuntimeReport }>;
+// `lastTurn` is how the child's last turn ended, read before the session closed. An
+// injected invoker that cannot read a session may leave it out.
+export interface WriterModelResponse {
+  text: string;
+  runtime: ChildRuntimeReport;
+  lastTurn?: ChildLastTurn;
+}
 
-async function invokeWriter(
-  invocation: WriterInvocation,
-): Promise<{ text: string; runtime: ChildRuntimeReport }> {
+export type WriterModelInvoker = (invocation: WriterInvocation) => Promise<WriterModelResponse>;
+
+async function invokeWriter(invocation: WriterInvocation): Promise<WriterModelResponse> {
   const { session, report } = await createWorkerChildSession(
     invocation.ctx,
     invocation.systemPrompt,
@@ -211,10 +223,28 @@ async function invokeWriter(
   const abort = () => void session.abort();
   invocation.ctx.signal?.addEventListener("abort", abort, { once: true });
   if (invocation.ctx.signal?.aborted) abort();
+  let prompts = 0;
+  let providerRetries = 0;
+  const unsubscribe = session.subscribe((event) => {
+    if (event.type === "auto_retry_start") providerRetries += 1;
+  });
   try {
-    const text = await promptWriterChild(session, invocation, report);
-    return { text, runtime: report };
+    const counted: WriterSession = {
+      get messages() {
+        return session.messages;
+      },
+      prompt: (message: string) => {
+        prompts += 1;
+        return session.prompt(message);
+      },
+      getLastAssistantText: () => session.getLastAssistantText(),
+    };
+    const text = await promptWriterChild(counted, invocation, report);
+    // Read before the session closes: the session is the only record of a provider error.
+    const lastTurn = readLastTurn({ messages: session.messages, prompts, providerRetries, stats: session.getSessionStats() });
+    return { text, runtime: report, lastTurn };
   } finally {
+    unsubscribe();
     invocation.ctx.signal?.removeEventListener("abort", abort);
     invocation.registry.delete(session);
     session.dispose();
@@ -244,7 +274,9 @@ function parseWriterResult(
   profile: WriterCapabilityProfile,
   runtime: ChildRuntimeReport,
 ): HatchUnattestedWriterResult {
-  const parsed = parseJsonEnvelope(text, "writer");
+  const json = readJsonEnvelope(text, "writer");
+  if (!json.ok) throw new Error(json.problem);
+  const parsed = json.value;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Hatch writer returned a non-object result");
   }
@@ -322,6 +354,26 @@ function parseWriterResult(
   };
 }
 
+// The strict parse, total: a value or the named defect, never a throw.
+function readWriterResult(
+  text: string,
+  binder: string,
+  profile: WriterCapabilityProfile,
+  runtime: ChildRuntimeReport,
+): Parsed<HatchUnattestedWriterResult> {
+  try {
+    return { ok: true, value: parseWriterResult(text, binder, profile, runtime) };
+  } catch (error) {
+    return { ok: false, problem: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+const MAX_PROBLEM = 300;
+
+function clip(text: string): string {
+  return text.length > MAX_PROBLEM ? `${text.slice(0, MAX_PROBLEM - 1)}…` : text;
+}
+
 export function attestWriterAuthority(
   writer: HatchWriterRole,
   before: WorkerAuthoritySnapshot,
@@ -382,7 +434,8 @@ export class HatchWriterRunner {
     },
     parentId?: string,
     surfaceReview?: WriterSurfaceReview,
-  ): Promise<HatchWriterResult> {
+  ): Promise<ChildOutcome<HatchWriterResult>> {
+    const started = Date.now();
     // Resolved before any work, so an unpinned call fails before the authority snapshot.
     const target = requireRoleModel(ctx, writer);
     const profile = createWriterCapabilityProfile(worktree, writer);
@@ -391,7 +444,7 @@ export class HatchWriterRunner {
       `### ${instruction.path} (blob ${instruction.blob}, sha256 ${instruction.sha256})\n\n${instruction.content}`,
     ).join("\n\n");
     const before = await snapshotWorkerAuthority(worktree);
-    let response: { text: string; runtime: ChildRuntimeReport } | undefined;
+    let response: WriterModelResponse | undefined;
     let invocationError: unknown;
     try {
       response = await this.#invoke({
@@ -411,14 +464,35 @@ export class HatchWriterRunner {
     // Compared against `before` config first, so no status runs under a config the writer changed.
     const after = await snapshotWorkerAuthority(worktree, undefined, undefined, { before });
     const attestation = attestWriterAuthority(writer, before, after);
-    if (!attestation.passed) {
-      throw new HatchWriterAuthorityError(`Hatch writer violated host authority: ${attestation.issues.join("; ")}`);
+    const lastTurn = response?.lastTurn;
+    // Cancellation ends the run; it is never read as the model's failure, not even an
+    // authority change. A last turn that ended `aborted` is cancellation, signal or not.
+    if (ctx.signal?.aborted || lastTurn?.stopReason === "aborted") {
+      throw invocationError ?? new Error(`Hatch ${writer} writer was cancelled`);
     }
+    const failure = (kind: ChildFailure["kind"], problem: string): ChildOutcome<HatchWriterResult> => ({
+      ok: false,
+      failure: {
+        kind,
+        role: writer,
+        problem: clip(problem),
+        model: response ? `${response.runtime.provider}/${response.runtime.model}` : `${target.provider}/${target.id}`,
+        prompts: lastTurn?.prompts ?? 1,
+        children: 1,
+        durationMs: Date.now() - started,
+        ...(lastTurn ? { lastTurn } : {}),
+      },
+    });
+    // Checked before an invoker error, so the companion runner still restores what the
+    // writer changed. No corrective turn: the change is already made.
+    if (!attestation.passed) return failure("authority-violation", attestation.issues.join("; "));
     if (invocationError) throw invocationError;
     if (!response) throw new Error("Hatch writer returned no response");
-    return {
-      ...parseWriterResult(response.text, binder, profile, response.runtime),
-      attestation,
-    } as HatchWriterResult;
+    const parsed = readWriterResult(response.text, binder, profile, response.runtime);
+    if (parsed.ok) return { ok: true, value: { ...parsed.value, attestation } as HatchWriterResult };
+    // A provider error is named by the provider's own text, never as a malformed reply.
+    const kind = classifyChildFailure(lastTurn, response.text);
+    const providerText = kind === "provider-quota" || kind === "provider-error" ? lastTurn?.errorMessage : undefined;
+    return failure(kind, providerText ?? parsed.problem);
   }
 }

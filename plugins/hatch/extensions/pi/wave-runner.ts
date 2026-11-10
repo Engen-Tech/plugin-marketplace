@@ -2,16 +2,21 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  runEnvironmentPreflight,
   runStableTreeChecks,
+  setupBlobOf,
   type HatchCheckPlanEntry,
 } from "./check-convergence.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
+import { readEnvironmentConfig } from "./environment.ts";
+import { hashCheckCommand } from "./evidence.ts";
 import type { HatchIntegrationResult } from "./integration-runner.ts";
 import { requirePackagePath } from "./package-paths.ts";
 import {
   HatchProcessManager,
   type BinderLifecycleOwner,
 } from "./process-manager.ts";
+import { runProgress } from "./run-events.ts";
 
 const exec = promisify(execFile);
 const MAX_OUTPUT = 8 * 1024 * 1024;
@@ -95,6 +100,38 @@ function dedupeChecks(checks: HatchCheckPlanEntry[]): HatchCheckPlanEntry[] {
   return result;
 }
 
+// The lone landed merge whose merge checks already cover the post-wave floor, or undefined.
+// Each rule is content, read now: the tip is that one merge on the wave base, its merge
+// checks bound the tree the clean worktree holds, every post-wave command has a passing
+// receipt there with the same cwd, and the setup the merge checks read is the setup at the
+// tip. A recovered pending wave carries no merge checks, so it always reruns.
+async function coveringMerge(
+  worktree: string,
+  anchor: HatchWaveAnchor,
+  tip: string,
+  integrated: HatchIntegrationResult[],
+  plan: HatchCheckPlanEntry[],
+): Promise<HatchIntegrationResult | undefined> {
+  if (integrated.length !== 1) return undefined;
+  const [lone] = integrated;
+  const checks = lone.checks;
+  if (lone.mergeCommit !== tip || lone.base !== anchor.base || !checks) return undefined;
+  const { stdout: status } = await exec(
+    "git",
+    ["-C", worktree, "status", "--porcelain=v2", "-z", "--untracked-files=all"],
+    { encoding: "utf8", maxBuffer: MAX_OUTPUT },
+  );
+  if (status !== "") return undefined;
+  if ((await git(worktree, ["rev-parse", "HEAD^{tree}"])) !== checks.targetTree) return undefined;
+  const covered = plan.every((check) => checks.entries.some((entry) =>
+    entry.receipt.status === "passed" &&
+    entry.receipt.cwd === check.cwd &&
+    entry.receipt.commandHash === hashCheckCommand(check.command)));
+  if (!covered) return undefined;
+  if ((await setupBlobOf(worktree, anchor.base)) !== (await setupBlobOf(worktree, tip))) return undefined;
+  return lone;
+}
+
 async function sharedTermsPass(worktree: string, binder: string): Promise<boolean> {
   try {
     await exec(
@@ -172,24 +209,57 @@ export class HatchWaveRunner {
       .map((integration) => integration.item);
     let failure = failedItems.length > 0 && integrated.length === 0;
     const plan = dedupeChecks(checks);
-    if (!failure && plan.length > 0) {
+    const environmentSetupRef = `refs/heads/hatch/${anchor.binder}/integration`;
+    const processHooks = {
+      signal: ctx.signal,
+      onProcessStart: processContext
+        ? (pid: number) => processContext.manager.registerProcess(pid, {
+            cwd: integrationWorktree,
+            parentId: processContext.owner.id,
+            label: `wave-${anchor.wave} post-wave check`,
+            role: "host-check",
+          })
+        : undefined,
+      onProcessExit: processContext
+        ? (pid: number) => processContext.manager.forgetProcess(pid)
+        : undefined,
+    };
+    // Exactly one item landed, on the tree its merge checks ran: those receipts stand in for
+    // the post-wave floor. The declared preflight still runs here, and the shared terms below
+    // always run. The post-accept floor runs inside integrate and is never skipped (INV-10).
+    // An abort already raised takes the run below, which returns it as aborted.
+    const covering = !failure && plan.length > 0 && !ctx.signal?.aborted
+      ? await coveringMerge(integrationWorktree, anchor, tip, integrated, plan)
+      : undefined;
+    let notRerun: string | undefined;
+    if (covering?.checks) {
+      notRerun = `the post-wave floor was not rerun: ${covering.item}'s merge checks covered it on the same tree`;
+      const preflight = (await readEnvironmentConfig(integrationWorktree, environmentSetupRef))?.preflight;
+      if (preflight) {
+        const probe = await runEnvironmentPreflight({ worktree: integrationWorktree, ...processHooks }, preflight);
+        failure = probe.status !== "passed";
+        if (failure) {
+          notRerun += `, and the declared preflight ${probe.status === "failed" ? "failed" : `stopped as ${probe.status}`}`;
+        }
+      }
+      if (!failure) {
+        runProgress()({
+          kind: "checks-reused",
+          wave: anchor.wave,
+          item: covering.item,
+          site: "post-wave",
+          source: "merge-checks",
+          tree: covering.checks.targetTree,
+          checks: covering.checks.entries.length,
+        });
+      }
+    } else if (!failure && plan.length > 0) {
       const convergence = await runStableTreeChecks({
         worktree: integrationWorktree,
         checks: plan,
-        environmentSetupRef: `refs/heads/hatch/${anchor.binder}/integration`,
+        environmentSetupRef,
         site: "integration",
-        signal: ctx.signal,
-        onProcessStart: processContext
-          ? (pid) => processContext.manager.registerProcess(pid, {
-              cwd: integrationWorktree,
-              parentId: processContext.owner.id,
-              label: `wave-${anchor.wave} post-wave check`,
-              role: "host-check",
-            })
-          : undefined,
-        onProcessExit: processContext
-          ? (pid) => processContext.manager.forgetProcess(pid)
-          : undefined,
+        ...processHooks,
       });
       const committedTree = await git(integrationWorktree, ["rev-parse", "HEAD^{tree}"]);
       failure = convergence.status !== "stable" || convergence.targetTree !== committedTree;
@@ -212,9 +282,11 @@ export class HatchWaveRunner {
         tip,
         successTag,
         ...(failedItems.length > 0 ? { failedItems } : {}),
-        message: failedItems.length > 0
-          ? `Post-wave floor and shared-term checks passed on the merged items; success tag written. Kept out of the wave, each with its failed ref: ${failedItems.join(", ")}.`
-          : "Post-wave floor and shared-term checks passed; success tag written.",
+        message: notRerun
+          ? `Shared-term checks passed and ${notRerun}; success tag written.${failedItems.length > 0 ? ` Kept out of the wave, each with its failed ref: ${failedItems.join(", ")}.` : ""}`
+          : failedItems.length > 0
+            ? `Post-wave floor and shared-term checks passed on the merged items; success tag written. Kept out of the wave, each with its failed ref: ${failedItems.join(", ")}.`
+            : "Post-wave floor and shared-term checks passed; success tag written.",
       };
     }
 
@@ -268,7 +340,7 @@ export class HatchWaveRunner {
       // The items whose merges failed, so a reader can tell a wave where nothing landed
       // from one whose landed merges were undone.
       ...(failedItems.length > 0 ? { failedItems } : {}),
-      message: "Post-wave validation failed; integration and item completion refs were rolled back exactly.",
+      message: `Post-wave validation failed${notRerun ? ` (${notRerun})` : ""}; integration and item completion refs were rolled back exactly.`,
     };
   }
 }

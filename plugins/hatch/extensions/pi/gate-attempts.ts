@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, open, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import type { HatchReviewedDiff } from "./evidence.ts";
 import { effectiveGateVerdict, type HatchGateFinding, type HatchGateVerdict } from "./gate-runner.ts";
 import type { HatchVerificationResult } from "./verification-runner.ts";
 import { hostGitArgs } from "./worker-attestation.ts";
@@ -12,10 +13,12 @@ import { hostGitArgs } from "./worker-attestation.ts";
 // reads Pi's rows (its state() reads only `item_spec_sha256` and `verdict`). It is a
 // twin, not a shell-out, because the script's `record` needs a Git revision range for
 // its diff digest and Pi reviews staged candidate trees and merge trees that are not
-// commits. Build-time and merge-time verdicts of a gate share one count per item, gate
-// and item spec; only an effective `concerns` spends; a changed diff keeps the count.
+// commits; Pi takes the digest from the diff its evidence carried instead. Build-time
+// and merge-time verdicts of a gate share one count per item, gate and item spec; only
+// an effective `concerns` spends; a changed diff keeps the count.
 // The ledger never decides an item's outcome, refs do: losing the file refills a
-// budget, it cannot mark anything done. It is ordinary files, not tamper-proof.
+// budget, it cannot mark anything done. It is ordinary files, not tamper-proof, and no
+// row grants a skip: a reused merge review is decided from process memory alone.
 
 const exec = promisify(execFile);
 const SCHEMA = "hatch-gate-attempt-v1";
@@ -40,12 +43,16 @@ export interface HatchGateAttemptRecord {
   findings: { severity: "critical" | "major" | "minor"; code: string; path?: string; line?: number }[];
   recordedAt: string;
   // Set on a row the host wrote without a gate run: the build-time citation pre-check,
-  // or a failed check the worker proposed and the host reran.
-  source?: HatchHostCheckSource;
+  // a failed check the worker proposed and the host reran, or a merge that reused this
+  // run's build-time verdict because every reviewer input was equal.
+  source?: HatchGateRowSource;
+  // On a reused review only: the build verdict it reuses and the key that matched.
+  reuses?: { phase: "build"; evidenceHash: string; reviewKey: string };
 }
 
 export type HatchHostCheckSource = "host-citation-check" | "host-worker-check";
-const HOST_CHECK_SOURCES = new Set<unknown>(["host-citation-check", "host-worker-check"]);
+export type HatchGateRowSource = HatchHostCheckSource | "host-reused-review";
+const ROW_SOURCES = new Set<unknown>(["host-citation-check", "host-worker-check", "host-reused-review"]);
 
 export const GATE_ATTEMPT_CAPS = { acceptance: 2, safety: 3 } as const;
 
@@ -143,6 +150,13 @@ function countedIn(rows: readonly LedgerRow[], specDigest: string): number {
 const ROLES = new Set<unknown>(["acceptance-gate", "safety-gate", "visual-gate"]);
 const PHASES = new Set<unknown>(["build", "merge", "accept"]);
 
+function reusesOf(value: unknown): { reuses: NonNullable<HatchGateAttemptRecord["reuses"]> } | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const { phase, evidence_hash: evidenceHash, review_key: reviewKey } = value as Record<string, unknown>;
+  if (phase !== "build" || typeof evidenceHash !== "string" || typeof reviewKey !== "string") return undefined;
+  return { reuses: { phase, evidenceHash, reviewKey } };
+}
+
 // Rows written by the skill path carry no phase or role; they still count toward the
 // cap, but only Pi rows become attempt records.
 function toRecord(row: LedgerRow): HatchGateAttemptRecord | undefined {
@@ -162,8 +176,17 @@ function toRecord(row: LedgerRow): HatchGateAttemptRecord | undefined {
     evidenceHash: String(row.evidence_hash),
     findings: Array.isArray(row.findings) ? (row.findings as HatchGateAttemptRecord["findings"]) : [],
     recordedAt: String(row.recorded_at),
-    ...(HOST_CHECK_SOURCES.has(row.source) ? { source: row.source as HatchHostCheckSource } : {}),
+    ...sourceOf(row),
   };
+}
+
+// A reused-review row names its source only with a well-formed `reuses`; like any
+// other malformed optional field, a bad one is dropped, and the source with it.
+function sourceOf(row: LedgerRow): Pick<HatchGateAttemptRecord, "source" | "reuses"> {
+  if (!ROW_SOURCES.has(row.source)) return {};
+  if (row.source !== "host-reused-review") return { source: row.source as HatchGateRowSource };
+  const reuses = reusesOf(row.reuses);
+  return reuses ? { source: "host-reused-review", ...reuses } : {};
 }
 
 export async function readAttempts(
@@ -208,6 +231,8 @@ interface RowTarget {
   itemTip: string;
   reviewedTree: string;
   integrationTip?: string;
+  // The diff the row's evidence reviewed, from diff.base to reviewedTree.
+  diff: HatchReviewedDiff;
 }
 
 // One ledger row: the attempt number is read from the gate file at write time.
@@ -221,7 +246,8 @@ async function appendRow(
     hostVerdict?: true;
     evidenceHash: string;
     findings: readonly HatchGateFinding[];
-    source?: HatchHostCheckSource;
+    source?: HatchGateRowSource;
+    reuses?: HatchGateAttemptRecord["reuses"];
   },
 ): Promise<HatchGateAttemptRecord> {
   const gate = gateFileFor(entry.role);
@@ -249,19 +275,20 @@ async function appendRow(
     })),
     recordedAt: utcStamp(),
     ...(entry.source ? { source: entry.source } : {}),
+    ...(entry.reuses ? { reuses: entry.reuses } : {}),
   };
-  // A verification result carries the evidence hash, not the diff bytes the evidence
-  // reviewed (those live in the evidence manifest's payload.diff), so diff_sha256 here
-  // is the SHA-256 of the reviewed tree id. It changes exactly when the reviewed
-  // content changes; the script's state() does not read it.
+  // range and diff_sha256 name the diff the evidence carried (payload.git.diffBase to the
+  // reviewed tree, and payload.diff.sha256), as the script's rows name the diff it
+  // reviewed. Pi's diff bytes differ from the script's (no --no-textconv), so the two
+  // runtimes' digests of one range need not match; the script's state() reads neither.
   const row = {
     schema: SCHEMA,
     gate,
     attempt: record.attempt,
     verdict: record.verdict,
     counted: record.counted,
-    range: `${target.integrationTip ?? target.itemTip}..${target.reviewedTree}`,
-    diff_sha256: sha256(target.reviewedTree),
+    range: `${target.diff.base}..${target.reviewedTree}`,
+    diff_sha256: target.diff.sha256,
     item_spec_sha256: target.specDigest,
     item: target.item,
     binder_slug: target.binder,
@@ -276,6 +303,9 @@ async function appendRow(
     evidence_hash: record.evidenceHash,
     findings: record.findings,
     ...(record.source ? { source: record.source } : {}),
+    ...(record.reuses
+      ? { reuses: { phase: record.reuses.phase, evidence_hash: record.reuses.evidenceHash, review_key: record.reuses.reviewKey } }
+      : {}),
   };
   await mkdir(dirname(file), { recursive: true });
   const handle = await open(file, "a", 0o644);
@@ -289,16 +319,23 @@ async function appendRow(
 
 export async function recordVerification(
   repoRoot: string,
-  input: RowTarget & { verification: HatchVerificationResult },
+  input: Omit<RowTarget, "diff"> & { verification: HatchVerificationResult },
 ): Promise<HatchGateAttemptRecord[]> {
   const dir = await binderDir(repoRoot, input.binder);
+  const target: RowTarget = { ...input, diff: input.verification.diff };
   const gates = input.verification.gates;
   // A host-written verdict (a gate child returned none) is one row like any other
   // `blocked`, marked as the host's and never counted; the children before it are not
   // verdicts and write nothing.
-  const verdicts: { role: HatchGateRole; verdict: HatchGateVerdict; reported?: HatchGateVerdict; host?: boolean; findings: readonly HatchGateFinding[]; evidenceHash: string }[] = [];
-  if (gates.acceptance) verdicts.push({ role: "acceptance-gate", verdict: gates.acceptance.verdict, reported: gates.acceptance.reportedVerdict, host: gates.acceptance.verdictSource === "host", findings: gates.acceptance.findings, evidenceHash: gates.acceptance.evidenceHash });
-  if (gates.safety) verdicts.push({ role: "safety-gate", verdict: gates.safety.verdict, reported: gates.safety.reportedVerdict, host: gates.safety.verdictSource === "host", findings: gates.safety.findings, evidenceHash: gates.safety.evidenceHash });
+  // A reused review ran no gate: its rows name the merge evidence, are marked by source,
+  // and name the build verdict they reuse. They are passes, so they never count.
+  const reused = input.verification.reused;
+  const reuse = (role: "acceptance" | "safety", evidenceHash: string) => reused
+    ? { source: "host-reused-review" as const, reuses: { phase: reused.phase, evidenceHash, reviewKey: reused.reviewKeys[role] } }
+    : {};
+  const verdicts: { role: HatchGateRole; verdict: HatchGateVerdict; reported?: HatchGateVerdict; host?: boolean; findings: readonly HatchGateFinding[]; evidenceHash: string; source?: "host-reused-review"; reuses?: HatchGateAttemptRecord["reuses"] }[] = [];
+  if (gates.acceptance) verdicts.push({ role: "acceptance-gate", verdict: gates.acceptance.verdict, reported: gates.acceptance.reportedVerdict, host: gates.acceptance.verdictSource === "host", findings: gates.acceptance.findings, evidenceHash: reused ? input.verification.evidenceHash : gates.acceptance.evidenceHash, ...reuse("acceptance", gates.acceptance.evidenceHash) });
+  if (gates.safety) verdicts.push({ role: "safety-gate", verdict: gates.safety.verdict, reported: gates.safety.reportedVerdict, host: gates.safety.verdictSource === "host", findings: gates.safety.findings, evidenceHash: reused ? input.verification.evidenceHash : gates.safety.evidenceHash, ...reuse("safety", gates.safety.evidenceHash) });
   // A visual gate result carries a dispatch hash, not an evidence hash, so its row
   // names the verification's evidence hash.
   if (gates.visual) verdicts.push({ role: "visual-gate", verdict: gates.visual.verdict, reported: gates.visual.reportedVerdict, findings: gates.visual.findings, evidenceHash: input.verification.evidenceHash });
@@ -310,13 +347,14 @@ export async function recordVerification(
     const verdict = effectiveGateVerdict(entry.role, entry.verdict, entry.findings);
     const reported = entry.reported ?? entry.verdict;
     written.push(
-      await appendRow(dir, input, {
+      await appendRow(dir, target, {
         role: entry.role,
         verdict,
         ...(reported !== verdict && reported === "concerns" ? { reportedVerdict: "concerns" as const } : {}),
         ...(entry.host ? { hostVerdict: true as const } : {}),
         evidenceHash: entry.evidenceHash,
         findings: entry.findings,
+        ...(entry.source ? { source: entry.source, reuses: entry.reuses } : {}),
       }),
     );
   }

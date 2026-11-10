@@ -160,7 +160,7 @@ async function dirtyState(worktree: string | undefined): Promise<HatchItemGitSta
   return { staged, unstaged, untracked };
 }
 
-async function hasItemMarker(cwd: string, commit: string, item: string): Promise<boolean> {
+export async function hasItemMarker(cwd: string, commit: string, item: string): Promise<boolean> {
   const message = await git(cwd, ["show", "-s", "--format=%s%n%b", commit]);
   return (
     message.split("\n", 1)[0].includes(`[hatch:item-${item}]`) ||

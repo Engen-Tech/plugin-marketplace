@@ -16,6 +16,7 @@ import { DispatchLockManager } from "./dispatch-lock.ts";
 import { createHatchDispatchTool } from "./dispatch-tool.ts";
 import { claimExtensionInstance } from "./extension-instance.ts";
 import { registerGuardAdapters } from "./guard-adapter.ts";
+import { gitHaltRecordStore } from "./halt-writer.ts";
 import { HatchIntegrationRunner } from "./integration-runner.ts";
 import { PACKAGE_ROOT, requirePackagePath } from "./package-paths.ts";
 import {
@@ -64,7 +65,16 @@ export default async function hatchPi(extension: ExtensionAPI): Promise<void> {
   const finalizer = new HatchBuildFinalizer(dispatchLocks, verification);
   // Every build and delivery probes the gate models at its start, on the run's context.
   const probeGates = (ctx: ExtensionContext) => verification.probeGateModels(ctx);
-  const buildItems = new HatchBuildItemRunner(dispatchLocks, workers, finalizer, processes, undefined, probeGates);
+  // A build that halts failed writes its halt record in the transaction that writes failed.
+  const buildItems = new HatchBuildItemRunner(
+    dispatchLocks,
+    workers,
+    finalizer,
+    processes,
+    undefined,
+    probeGates,
+    gitHaltRecordStore(),
+  );
   const integrations = new HatchIntegrationRunner(dispatchLocks, verification);
   const waves = new HatchWaveRunner(dispatchLocks);
   const writers = new HatchWriterRunner(children);
@@ -79,6 +89,8 @@ export default async function hatchPi(extension: ExtensionAPI): Promise<void> {
     waves,
     companions,
     probeGates,
+    // A merge- or accept-time halt writes its record; one at merge rides the failed write.
+    gitHaltRecordStore(),
   );
   const runs = new HatchRunRegistry();
   const runHost = new HatchRunHost({ extension, registry: runs });

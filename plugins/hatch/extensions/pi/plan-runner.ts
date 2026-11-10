@@ -27,7 +27,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { environmentPreflight, type ReadTreeFile } from "./check-environment.ts";
@@ -95,6 +95,13 @@ export interface HatchPlanCommitResult {
   runs: HatchPlanScriptRun[];
   commit?: string;
   message: string;
+}
+
+// Read at call time, so a test can shorten it. Unset, invalid, or above the largest delay
+// a Node timer accepts (Node would fire it after 1 ms) keeps SCRIPT_TIMEOUT.
+function scriptTimeoutMs(): number {
+  const override = Number(process.env.HATCH_PLAN_UV_TIMEOUT_MS);
+  return Number.isInteger(override) && override > 0 && override <= 2_147_483_647 ? override : SCRIPT_TIMEOUT;
 }
 
 function output(run: HatchPlanScriptRun): string {
@@ -352,17 +359,28 @@ export class HatchPlanRunner {
     delete environment.PYTHONPATH;
     environment.PYTHONNOUSERSITE = "1";
     environment.PYTHONSAFEPATH = "1";
+    const timeout = scriptTimeoutMs();
     try {
       const { stdout, stderr } = await exec("uv", ["run", "--script", script, ...args], {
         cwd: ctx.cwd,
         encoding: "utf8",
         env: environment,
-        timeout: SCRIPT_TIMEOUT,
+        timeout,
         maxBuffer: MAX_OUTPUT,
       });
       return { action, code: 0, stdout, stderr };
     } catch (error) {
-      const failure = error as { code?: number; stdout?: string; stderr?: string; message?: string };
+      const failure = error as { code?: number; stdout?: string; stderr?: string; message?: string; killed?: boolean };
+      // A run that execFile killed for passing `timeout` has no answer and empty output, so
+      // returning it would read as a failed binder (or, for provenance, as no packs). It halts
+      // naming the command and the limit, then any output. `killed` is the only field that
+      // tells this apart from a child that died of SIGTERM itself or a maxBuffer overflow.
+      if (failure.killed === true) {
+        const printed = `${failure.stdout ?? ""}${failure.stderr ?? ""}`.trim();
+        const limit = timeout % 1000 === 0 ? `${timeout / 1000} s` : `${timeout} ms`;
+        const timedOut = `uv run --script ${basename(script)} did not finish in ${limit}`;
+        throw new Error(printed ? `${timedOut}:\n${printed}` : timedOut);
+      }
       return {
         action,
         code: typeof failure.code === "number" ? failure.code : 1,

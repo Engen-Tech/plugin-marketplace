@@ -5,7 +5,8 @@ import {
   type ChildModelTarget,
   type ChildRuntimeReport,
 } from "./child-runtime.ts";
-import { parseJsonEnvelope, promptForJsonEnvelope } from "./child-envelope.ts";
+import { promptForJsonEnvelope, readJsonEnvelope } from "./child-envelope.ts";
+import { readLastTurn, type ChildLastTurn } from "./child-last-turn.ts";
 import {
   attestWaveWorkerAuthority,
   attestWorkerAuthority,
@@ -13,6 +14,7 @@ import {
   type WorkerAuthorityAttestation,
   type WorkerAuthoritySnapshot,
 } from "./worker-attestation.ts";
+import { classifyChildFailure, correctiveTurnAllowed, type ChildOutcome, type Parsed } from "./child-outcome.ts";
 import { REPO_RULE_CITATION_SHAPE } from "./evidence.ts";
 import { requireRoleModel } from "./role-models.ts";
 import type { WaveHostLedger } from "./wave-host-ledger.ts";
@@ -64,9 +66,15 @@ export interface BuildWorkerInvocation {
   parentId?: string;
 }
 
-export type BuildWorkerModelInvoker = (
-  invocation: BuildWorkerInvocation,
-) => Promise<{ text: string; runtime: ChildRuntimeReport }>;
+// `lastTurn` is how the child's last turn ended, read before the session closed. An
+// injected invoker that cannot read a session leaves it out.
+export interface BuildWorkerResponse {
+  text: string;
+  runtime: ChildRuntimeReport;
+  lastTurn?: ChildLastTurn;
+}
+
+export type BuildWorkerModelInvoker = (invocation: BuildWorkerInvocation) => Promise<BuildWorkerResponse>;
 
 const MAX_WORKER_SUMMARY = 2000;
 const MAX_WORKER_CHECKS = 16;
@@ -104,12 +112,9 @@ export function workerEnvelopeViolation(
   expected: { binder: string; item: string; roleDefinitionHash: string; profileHash: string } | null,
 ): EnvelopeViolation | null {
   const fatal = (reason: string): EnvelopeViolation => ({ reason, fatal: true });
-  let value: unknown;
-  try {
-    value = parseWorkerEnvelopeJson(text);
-  } catch (error) {
-    return fatal(error instanceof Error ? error.message : String(error));
-  }
+  const json = readWorkerEnvelopeJson(text);
+  if (!json.ok) return fatal(json.problem);
+  const value = json.value;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return fatal("the result must be a single JSON object");
   }
@@ -201,10 +206,13 @@ export function checkProposalsViolation(checks: unknown[]): string | null {
   return null;
 }
 
+type WorkerExpectation = { binder: string; item: string; roleDefinitionHash: string; profileHash: string };
+
 export function promptWorkerForEnvelope(
   session: Parameters<typeof promptForJsonEnvelope>[0],
   userPrompt: string,
-  expected: { binder: string; item: string; roleDefinitionHash: string; profileHash: string },
+  expected: WorkerExpectation,
+  canRepair?: (text: string) => boolean,
 ): Promise<string> {
   return promptForJsonEnvelope(
     session,
@@ -216,12 +224,52 @@ export function promptWorkerForEnvelope(
         ? WORKER_ENVELOPE_REPAIR_PROMPT
         : `${WORKER_ENVELOPE_REPAIR_PROMPT} The result you sent was rejected because ${violation.reason}`;
     },
+    canRepair,
   );
 }
 
-async function invokeBuildWorker(
-  invocation: BuildWorkerInvocation,
-): Promise<{ text: string; runtime: ChildRuntimeReport }> {
+// The part of a Pi AgentSession a worker child is driven through. AgentSession satisfies it.
+export interface WorkerChildSession {
+  prompt(message: string): Promise<unknown>;
+  getLastAssistantText(): string | undefined;
+  readonly messages: readonly unknown[];
+  subscribe(listener: (event: { type: string }) => void): () => void;
+  getSessionStats(): { toolCalls: number; tokens: { total: number } };
+}
+
+// Prompt a worker child for its envelope and read how its last turn ended. Whether the
+// corrective turn is sent is CHILD_FAILURE_POLICY.worker's call: none after a provider
+// error, which would meet the same quota or outage, and none after an abort.
+// The last turn is read here, before the caller disposes the session, because the session
+// is the only record of a provider error.
+export async function promptWorkerChild(
+  session: WorkerChildSession,
+  userPrompt: string,
+  expected: WorkerExpectation,
+): Promise<{ text: string; lastTurn: ChildLastTurn }> {
+  let prompts = 0;
+  let providerRetries = 0;
+  const unsubscribe = session.subscribe((event) => {
+    if (event.type === "auto_retry_start") providerRetries += 1;
+  });
+  try {
+    const counted = {
+      prompt: (message: string) => {
+        prompts += 1;
+        return session.prompt(message);
+      },
+      getLastAssistantText: () => session.getLastAssistantText(),
+    };
+    const text = await promptWorkerForEnvelope(counted, userPrompt, expected, (reply) =>
+      correctiveTurnAllowed("worker", readLastTurn({ messages: session.messages, prompts, providerRetries }), reply));
+    const lastTurn = readLastTurn({ messages: session.messages, prompts, providerRetries, stats: session.getSessionStats() });
+    return { text, lastTurn };
+  } finally {
+    unsubscribe();
+  }
+}
+
+async function invokeBuildWorker(invocation: BuildWorkerInvocation): Promise<BuildWorkerResponse> {
   const { session, report } = await createWorkerChildSession(
     invocation.ctx,
     invocation.systemPrompt,
@@ -239,13 +287,13 @@ async function invokeBuildWorker(
   invocation.ctx.signal?.addEventListener("abort", abort, { once: true });
   if (invocation.ctx.signal?.aborted) abort();
   try {
-    const text = await promptWorkerForEnvelope(session, invocation.userPrompt, {
+    const { text, lastTurn } = await promptWorkerChild(session, invocation.userPrompt, {
       binder: invocation.binder,
       item: invocation.item,
       roleDefinitionHash: invocation.profile.role.definitionHash,
       profileHash: invocation.profile.profileHash,
     });
-    return { text, runtime: report };
+    return { text, runtime: report, lastTurn };
   } finally {
     invocation.ctx.signal?.removeEventListener("abort", abort);
     invocation.registry.delete(session);
@@ -253,25 +301,18 @@ async function invokeBuildWorker(
   }
 }
 
-function exactKeys(value: Record<string, unknown>, keys: string[]): void {
-  const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-    throw new Error("Malformed Hatch worker result: unexpected keys");
-  }
+function readWorkerEnvelopeJson(text: string): Parsed<unknown> {
+  return readJsonEnvelope(text, "build worker");
 }
 
-function parseWorkerEnvelopeJson(text: string): unknown {
-  return parseJsonEnvelope(text, "build worker");
-}
-
-export function parseWorkerResult(
+// The worker's envelope, or the rule it breaks. It never throws.
+export function readWorkerResult(
   text: string,
   binder: string,
   item: string,
   profile: BuildWorkerCapabilityProfile,
   runtime: ChildRuntimeReport,
-): Omit<HatchWorkerResult, "attestation"> {
+): Parsed<Omit<HatchWorkerResult, "attestation">> {
   const violation = workerEnvelopeViolation(text, {
     binder,
     item,
@@ -282,15 +323,28 @@ export function parseWorkerResult(
   // different rules, so a discarded build told its operator nothing about which
   // one to look at. A non-fatal violation survived the corrective turn and is
   // repaired here instead of discarding the work.
+  // An envelope the reader cannot find is itself a fatal violation, so `json.ok`
+  // fails only where `violation` already is fatal; the second test narrows the type.
+  const json = readWorkerEnvelopeJson(text);
   if (violation !== null && violation.fatal) {
-    throw new Error(`Malformed or stale Hatch worker result envelope: ${violation.reason}`);
+    return { ok: false, problem: `Malformed or stale Hatch worker result envelope: ${violation.reason}` };
   }
-  const result = parseWorkerEnvelopeJson(text) as Record<string, unknown>;
+  if (!json.ok) return { ok: false, problem: `Malformed or stale Hatch worker result envelope: ${json.problem}` };
+  const result = json.value as Record<string, unknown>;
   return {
-    ...(result as Omit<HatchWorkerResult, "runtime" | "attestation">),
-    summary: clampSummary(result.summary as string, MAX_WORKER_SUMMARY),
-    runtime,
-  } as Omit<HatchWorkerResult, "attestation">;
+    ok: true,
+    value: {
+      ...(result as Omit<HatchWorkerResult, "runtime" | "attestation">),
+      summary: clampSummary(result.summary as string, MAX_WORKER_SUMMARY),
+      runtime,
+    } as Omit<HatchWorkerResult, "attestation">,
+  };
+}
+
+const MAX_PROBLEM = 300;
+
+function clip(text: string): string {
+  return text.length > MAX_PROBLEM ? `${text.slice(0, MAX_PROBLEM - 1)}…` : text;
 }
 
 function workerSystemPrompt(profile: BuildWorkerCapabilityProfile): string {
@@ -350,6 +404,45 @@ const defaultAuthorityInspector: WorkerAuthorityInspector = {
   attestWithLedger: attestWaveWorkerAuthority,
 };
 
+export type AuthoritySurfaceScope = "item" | "shared";
+
+// Which attested surface a worker's change touches. Only the item worktree's own index
+// and its .hatch paths are the item's (decision D): a commit, a branch switch, a moved
+// ref, config, hooks, the worktree list, a sibling or a wave-mate is shared, and so is a
+// snapshot that stopped at a changed config. Typed so that a new snapshot field without
+// a scope fails to compile.
+export const AUTHORITY_SURFACE_SCOPE = {
+  worktree: "shared",
+  branch: "shared",
+  head: "shared",
+  index: "item",
+  refs: "shared",
+  config: "shared",
+  hooks: "shared",
+  worktrees: "shared",
+  protectedPaths: "item",
+  siblings: "shared",
+  mates: "shared",
+  unread: "shared",
+} as const satisfies Record<Exclude<keyof WorkerAuthoritySnapshot, "schema">, AuthoritySurfaceScope>;
+
+const AUTHORITY_ISSUE = "worker changed protected authority surface: ";
+
+/**
+ * "item" only when every issue names a surface the item owns. An issue whose text names
+ * no item-owned field, a wave-mate included, is shared, so unknown text never lets the
+ * run go on.
+ */
+export function authorityViolationScope(issues: readonly string[]): AuthoritySurfaceScope {
+  const owned = (issue: string): boolean => {
+    if (!issue.startsWith(AUTHORITY_ISSUE)) return false;
+    const field = issue.slice(AUTHORITY_ISSUE.length);
+    return Object.hasOwn(AUTHORITY_SURFACE_SCOPE, field) &&
+      AUTHORITY_SURFACE_SCOPE[field as keyof typeof AUTHORITY_SURFACE_SCOPE] === "item";
+  };
+  return issues.length > 0 && issues.every(owned) ? "item" : "shared";
+}
+
 export class HatchBuildWorkerRunner {
   readonly #registry: ChildRegistry;
   readonly #invoke: BuildWorkerModelInvoker;
@@ -381,7 +474,7 @@ export class HatchBuildWorkerRunner {
     onFirstMutation?: () => Promise<void> | void,
     waveMates: readonly string[] = [],
     ledger?: WaveHostLedger,
-  ): Promise<HatchWorkerResult> {
+  ): Promise<ChildOutcome<HatchWorkerResult>> {
     // Resolved before any work, so an unpinned call fails before the authority
     // snapshot. All three modes run on the same pinned target.
     const target = requireRoleModel(ctx, "build-worker");
@@ -399,8 +492,9 @@ export class HatchBuildWorkerRunner {
     const before = ledger
       ? await ledger.quiesce(() => this.#authority.snapshot(worktree, binder, waveMates))
       : await this.#authority.snapshot(worktree, binder, waveMates);
-    let response: { text: string; runtime: ChildRuntimeReport } | undefined;
+    let response: BuildWorkerResponse | undefined;
     let invocationError: unknown;
+    const started = Date.now();
     try {
       response = await this.#invoke({
         ctx,
@@ -439,14 +533,52 @@ export class HatchBuildWorkerRunner {
           before,
           await this.#authority.snapshot(worktree, binder, waveMates),
         );
-    if (!attestation.passed) {
+    // A change to a surface every item shares ends the run. A change only to the item's
+    // own index or .hatch halts the item, once cancellation and host faults have thrown.
+    const itemLocal = !attestation.passed && authorityViolationScope(attestation.issues) === "item";
+    if (!attestation.passed && !itemLocal) {
       throw new Error(`Hatch worker violated host authority: ${attestation.issues.join("; ")}`);
     }
     if (invocationError) throw invocationError;
     if (!response) throw new Error("Hatch build worker returned no response");
+    // Cancellation ends the run; it is never read as the model's failure. A last turn that
+    // ended `aborted` is cancellation too, signal or not (a child aborted with its registry).
+    if (ctx.signal?.aborted || response.lastTurn?.stopReason === "aborted") throw new Error(`Hatch build worker for item '${item}' was cancelled`);
+    if (itemLocal) {
+      // No corrective turn: the change is already made, and the reply cannot undo it.
+      return {
+        ok: false,
+        failure: {
+          kind: "authority-violation",
+          role: "build-worker",
+          problem: clip(attestation.issues.join("; ")),
+          model: `${response.runtime.provider}/${response.runtime.model}`,
+          prompts: response.lastTurn?.prompts ?? 1,
+          children: 1,
+          durationMs: Date.now() - started,
+          ...(response.lastTurn ? { lastTurn: response.lastTurn } : {}),
+        },
+      };
+    }
+    const parsed = readWorkerResult(response.text, binder, item, profile, response.runtime);
+    if (parsed.ok) return { ok: true, value: { ...parsed.value, attestation } };
+    // A model-caused failure is a value: the caller halts the item. A provider error is
+    // named by the provider's own text, never as a malformed reply.
+    const { lastTurn } = response;
+    const kind = classifyChildFailure(lastTurn, response.text);
+    const providerText = kind === "provider-quota" || kind === "provider-error" ? lastTurn?.errorMessage : undefined;
     return {
-      ...parseWorkerResult(response.text, binder, item, profile, response.runtime),
-      attestation,
+      ok: false,
+      failure: {
+        kind,
+        role: "build-worker",
+        problem: clip(providerText ?? parsed.problem),
+        model: `${response.runtime.provider}/${response.runtime.model}`,
+        prompts: lastTurn?.prompts ?? 1,
+        children: 1,
+        durationMs: Date.now() - started,
+        ...(lastTurn ? { lastTurn } : {}),
+      },
     };
   }
 }
