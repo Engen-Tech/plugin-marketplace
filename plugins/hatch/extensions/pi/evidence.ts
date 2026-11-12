@@ -392,26 +392,44 @@ function byIdentifier(left: { id: string }, right: { id: string }): number {
   return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
 }
 
-// Direct dependency edges only: the items this one names in `depends_on`, and the
-// items that name this one. Transitive reach is deliberately not expanded — the gate
-// judges an overlap between two items whose own declared changes join them.
+// Every item a `depends_on` path joins to this one, as validate_binder.py's `_reachable`
+// walks it: the items this one waits for, and those that wait for it. An item starts only
+// once every item it depends on is done, so either side builds on the other's landed change.
+// A carried item counts as done without its prerequisites in this binder, so the walk never
+// steps from a carried item to one that is not carried. `serialize` and a shared
+// `shared_resources` entry are not followed: they keep two builds out of one wave but do not
+// order two edits. The safety gate treats an overlap with any item listed here as planned.
 export function resolveItemRelations(
   items: BinderDocument["work_items"],
   itemId: string,
+  supersedes?: unknown,
 ): HatchEvidenceRelations {
+  const carried = stringList((supersedes as { carried?: unknown } | undefined)?.carried);
   const relation = (item: Record<string, unknown> & { id: string }): HatchEvidenceRelation => ({
     id: item.id,
     touches: stringList(item.touches),
     shared_resources: stringList(item.shared_resources),
   });
-  const prerequisites = stringList(items.find((item) => item.id === itemId)?.depends_on);
+  const reach = (next: (id: string) => string[]): Set<string> => {
+    const seen = new Set<string>();
+    const stack = next(itemId);
+    while (stack.length > 0) {
+      const id = stack.pop() as string;
+      if (id === itemId || seen.has(id)) continue;
+      seen.add(id);
+      stack.push(...next(id).filter((other) => !carried.includes(id) || carried.includes(other)));
+    }
+    return seen;
+  };
+  const prerequisites = reach((id) => stringList(items.find((item) => item.id === id)?.depends_on));
+  const dependents = reach((id) => items.filter((item) => stringList(item.depends_on).includes(id)).map((item) => item.id));
   return {
     prerequisites: items
-      .filter((item) => prerequisites.includes(item.id))
+      .filter((item) => prerequisites.has(item.id))
       .map(relation)
       .sort(byIdentifier),
     dependents: items
-      .filter((item) => stringList(item.depends_on).includes(itemId))
+      .filter((item) => dependents.has(item.id))
       .map(relation)
       .sort(byIdentifier),
   };
@@ -1202,7 +1220,7 @@ export async function buildHatchEvidence(
       document,
     },
     workItem,
-    relations: resolveItemRelations(document.work_items, workItem.id),
+    relations: resolveItemRelations(document.work_items, workItem.id, document.supersedes),
     git: {
       integrationRef,
       integrationTip,
@@ -1370,9 +1388,9 @@ export function createEvidenceReadTool(
             value = manifest.payload.binder.document;
             break;
           case "workItem":
-            // The gate prompt requires this action, so the edge direction travels with
+            // The gate prompt requires this action, so the path direction travels with
             // it: a gate that read the item cannot report a planned overlap between two
-            // items joined by a direct `depends_on` edge as an undeclared edit.
+            // items joined by a `depends_on` path as an undeclared edit.
             value = { ...manifest.payload.workItem, relations: manifest.payload.relations };
             break;
           case "diff": {

@@ -12,7 +12,7 @@ Surface a work item if any of the following holds:
 2. **Destructive op** — drop, delete, truncate, overwrite, migrate, force, or revert.
 3. **Sensitive zone** — matched by path convention plus an optional per-repo setting. No hardcoded wordlist.
 4. **Capability or resource escalation** — a new dependency, new IO, new infrastructure, or new integration.
-5. **Blast radius** — exceeds file or context thresholds, or a file is edited by more than one work item in this binder.
+5. **Blast radius** — exceeds file or context thresholds, or a file is edited by more than one work item in this binder. At plan time this flags every shared file; at build time the overlap passes only when a `depends_on` path joins the two items.
 6. **Genuine architectural novelty** — a new pattern entering the codebase. Not merely new-to-this-repo usage of an existing project pattern.
 7. **Explicit open question, conflict, or ambiguous scope** — anything the plan itself marks as unresolved.
 

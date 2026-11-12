@@ -2,6 +2,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   citationReviewState,
+  resolveItemRelations,
   verifyEvidenceIntegrity,
   type CitationReviewState,
   type EvidenceCitationDefect,
@@ -18,7 +19,9 @@ export interface BoundaryInspection {
   touchedPaths: string[];
   declaredTouches: string[];
   undeclaredTouchedPaths: string[];
-  overlappingWorkItems: Array<{ item: string; paths: string[] }>;
+  // dependencyPath: a `depends_on` path joins the item to this one, so the overlap is
+  // planned sequencing; false is an overlap the plan did not order.
+  overlappingWorkItems: Array<{ item: string; paths: string[]; dependencyPath: boolean }>;
   sensitivePathCues: string[];
   dependencyChangeCues: string[];
   destructiveLineCues: string[];
@@ -95,13 +98,16 @@ export function inspectBoundaries(manifest: HatchEvidenceManifest): BoundaryInsp
     (path) => !declaredTouches.some((declaration) => declarationMatches(path, declaration)),
   );
   const overlaps: BoundaryInspection["overlappingWorkItems"] = [];
-  for (const candidate of manifest.payload.binder.document.work_items) {
+  const workItems = manifest.payload.binder.document.work_items;
+  const { prerequisites, dependents } = resolveItemRelations(workItems, item.id, manifest.payload.binder.document.supersedes);
+  const joined = new Set([...prerequisites, ...dependents].map((relation) => relation.id));
+  for (const candidate of workItems) {
     if (candidate.id === item.id) continue;
     const declarations = stringArray(candidate.touches);
     const paths = touchedPaths.filter((path) =>
       declarations.some((declaration) => declarationMatches(path, declaration)),
     );
-    if (paths.length > 0) overlaps.push({ item: candidate.id, paths });
+    if (paths.length > 0) overlaps.push({ item: candidate.id, paths, dependencyPath: joined.has(candidate.id) });
   }
   const lines = addedLines(manifest.payload.diff.content);
   const destructiveLineCues = lines.filter((line) => DESTRUCTIVE_LINE.test(line));
