@@ -2,9 +2,9 @@ import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { accessSync, constants as fsConstants } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
+import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { readEnvironmentConfig, type VisualEnvConfig } from "./environment.ts";
 import {
@@ -127,6 +127,7 @@ export interface VisualEvidence {
 export type VisualCaptureOutcome =
   | { status: "captured"; evidencePath: string; evidence: VisualEvidence; candidateTree: string }
   | { status: "no-visual-env"; reason: string }
+  | { status: "design-unresolved"; remediation: string }
   | { status: "render-unhealthy"; target: "design" | "app"; result: "blocked"; remediation: string }
   | { status: "auth-required"; remediation: string; location?: string }
   | { status: "startup-crash"; exitCode: number | null; tail: string; remediation: string }
@@ -178,10 +179,13 @@ export interface CaptureVisualEvidenceOptions {
   worktree: string;
   // The pinned candidate commit OID. `visual_env` and the bound tree are read from here.
   candidateCommit: string;
-  // The item-under-test's design_reference route (the app path to bring up and capture).
+  // The item-under-test's design_reference: the app path and query, and a #fragment that
+  // selects the design state.
   route: string;
-  // The design reference to serve and capture against (an HTML file or a directory).
+  // The binder's design_facts.source (an HTML file or a directory), read in the worktree.
   designPath: string;
+  // The base the item was built on; the design must be the same object there.
+  designBase?: string;
   // The env-server lifecycle owner and its manager.
   context: EnvServerContext;
   // Where captures, scratch, and the evidence artifact are written. Must be outside the
@@ -289,6 +293,31 @@ async function resolveScratchDir(provided: string | undefined, worktree: string)
     return resolve(provided);
   }
   return await mkdtemp(join(tmpdir(), "hatch-visual-capture-"));
+}
+
+// The binder's design_facts.source, read in the candidate worktree the app runs from: a path
+// inside it, with no symlink on the way, tracked by the candidate tree as it was at the base.
+async function designInWorktree(worktree: string, source: string, tree: string, base?: string): Promise<string | VisualCaptureOutcome> {
+  const refuse = (why: string): VisualCaptureOutcome => ({
+    status: "design-unresolved",
+    remediation: `design_facts.source '${source}' ${why}. It must name a file or folder, relative to the repository root, that was committed before the item was built.`,
+  });
+  const root = resolve(worktree);
+  const target = resolve(root, source);
+  if (target === root || !isInside(root, target)) return refuse(target === root ? "names the worktree root" : "is outside the candidate worktree");
+  const parts = relative(root, target).split(sep);
+  try {
+    for (let depth = 1; depth <= parts.length; depth += 1) {
+      const entry = await lstat(join(root, ...parts.slice(0, depth)));
+      if (entry.isSymbolicLink()) return refuse("passes through a symlink");
+    }
+  } catch {
+    return refuse("does not exist in the candidate worktree");
+  }
+  const id = (rev: string) => runGit(root, ["rev-parse", "--verify", "--quiet", `${rev}:${parts.join("/")}`]).catch(() => "");
+  const at = await id(tree);
+  if (!at) return refuse("is not tracked in the candidate tree");
+  return !base || at === (await id(base)) ? target : refuse("differs from, or is missing at, the base the item was built on");
 }
 
 // The tracked-content tree hash of the worktree right now, computed against a scratch
@@ -410,6 +439,8 @@ export async function captureVisualEvidence(
   }
 
   const boundTree = (await runGit(worktree, ["rev-parse", `${candidateCommit}^{tree}`])).trim();
+  const designFile = await designInWorktree(worktree, designPath, boundTree, options.designBase);
+  if (typeof designFile !== "string") return designFile;
   const scratchDir = await resolveScratchDir(options.scratchDir, worktree);
   let keepScratch = false;
 
@@ -430,10 +461,13 @@ export async function captureVisualEvidence(
 
     let capture: { artifact: CaptureArtifact; diff: StructuredDiff } | { failure: VisualCaptureOutcome };
     try {
-      const design = await boundary.serveDesign({ designPath, scratchDir, signal });
+      const design = await boundary.serveDesign({ designPath: designFile, scratchDir, signal });
       try {
+        // The design_reference fragment selects the design state, on the design URL only.
+        const designUrl = new URL(design.url);
+        if (route.includes("#")) designUrl.hash = route.slice(route.indexOf("#"));
         const artifact = await boundary.captureView({
-          designUrl: design.url,
+          designUrl: designUrl.toString(),
           appUrl: handle.url,
           scratchDir,
           viewport: viewport ?? DEFAULT_VIEWPORT,

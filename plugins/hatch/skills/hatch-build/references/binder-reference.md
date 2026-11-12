@@ -10,7 +10,7 @@ The binder is hatch's spine — the single JSON artifact that drives planning, b
 | `motivation` | string | yes | One-sentence reason this binder exists |
 | `scope.included` | string[] | yes | Areas of the codebase in scope |
 | `scope.excluded` | string[] | no | Things explicitly left out (prevents scope creep) |
-| `design_facts.source` | string \| null | no | Path to the source design or prototype, or null |
+| `design_facts.source` | string \| null | no | Path to the source design or prototype, relative to the repository root and committed before the item checked against it is built (on the delivery's base or by an earlier item), or null |
 | `design_facts.stack` | string | no | Resolved tech stack, recorded once at plan time |
 | `token_manifest` | object \| null | no | Shared design-token map; present only when a token system exists |
 | `env_contract.command` | string | yes | The project's own test/dev env command |
@@ -48,7 +48,7 @@ When the repo declares a version manager, the `env_contract.command` or an oracl
 | `title` | string | yes | Short human label for the work item |
 | `estimate` | `S` \| `M` \| `L` | no | Size estimate |
 | `depends_on` | string[] | no | IDs of items that must land before this one starts |
-| `design_reference` | string | no | View or route ID from the design source, or the literal `none`. Non-empty (`minLength: 1`). Naming a real view requires either a `visual` oracle or a `visual_check_waiver`; `none` is matched byte for byte, so `None` and `NONE` read as view names, not the sentinel |
+| `design_reference` | string | no | The app route (path and query) the item renders, with an optional `#fragment` that selects the design state and goes to the design page only; or the literal `none`. Non-empty (`minLength: 1`). Naming a real view requires either a `visual` oracle or a `visual_check_waiver`; `none` is matched byte for byte, so `None` and `NONE` read as view names, not the sentinel |
 | `covers` | string[] | no | IDs of the work items whose design claim this item's visual gate checks. A `visual_check_waiver` naming this item is only accepted when the waived item's ID appears here, so coverage is agreed at both ends rather than claimed by the item that benefits from it |
 | `visual_check_waiver` | object | no | Records that this item names a design view another item opens for it. `reason` and `covered_by` are both required and non-empty. `validate_binder.py` holds the `covered_by` item to six conditions, each its own error: it resolves to a real work item; its oracle `type` is `visual`; its own `design_reference` names a real view (a gate hatch-build would skip covers nothing); it depends on the waived item directly or through the chain (a covering gate runs after the work it covers); its oracle carries a non-empty `assertions` list; and it lists this item in its own `covers`. The two `design_reference` values are never compared, so one gate covers several differently-named views as long as it names the items. A waiver on an item that names no view, or that already has a visual oracle, is rejected for doing no work |
 | `component_map` | array | no | **UI-relevant, optional — present only when the stack has that surface** |

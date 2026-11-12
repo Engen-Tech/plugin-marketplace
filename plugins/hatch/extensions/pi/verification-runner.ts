@@ -35,6 +35,7 @@ import { hatchModelsConfigPath, requireRoleModel, roleModelsOf } from "./role-mo
 import { safeProgress, type HatchRunProgress } from "./run-events.ts";
 import {
   captureVisualEvidence,
+  PlaywrightCliUnavailableError,
   type CaptureVisualEvidenceOptions,
   type VisualCaptureOutcome,
   type VisualEvidence,
@@ -317,6 +318,15 @@ function resolveDesignSource(document: Record<string, unknown>): string | undefi
   const trimmed = source.trim();
   if (!trimmed || trimmed.toLowerCase() === "none") return undefined;
   return trimmed;
+}
+
+// A thrown capture fault, cut to its first line, so the halt names the cause without a
+// command's whole output. The playwright-cli gate keeps its install steps.
+function captureFault(error: unknown): string {
+  if (error instanceof PlaywrightCliUnavailableError) return error.remediation;
+  const { stderr, message } = (error ?? {}) as { stderr?: unknown; message?: unknown };
+  const text = String((typeof stderr === "string" && stderr.trim()) || message || error).trim();
+  return `The capture stopped: ${text.split(/\r?\n/)[0]!.slice(0, 300)}`;
 }
 
 function requireScreenshotPath(target: { screenshot?: string | null }, role: string): string {
@@ -727,17 +737,19 @@ export class HatchVerificationRunner {
         candidateCommit: visualContext.treeish,
         route,
         designPath,
+        designBase: evidence.payload.git.diffBase,
         context: visualContext.processes,
         signal: ctx.signal,
       });
-    } catch {
-      return { status: "blocked", blockedReason: "visual-capture-failed" };
+    } catch (error) {
+      return { status: "blocked", blockedReason: "visual-capture-failed", remediation: captureFault(error) };
     }
     if (capture.status !== "captured") {
       return {
         status: "blocked",
-        blockedReason:
-          capture.status === "no-visual-env" ? "visual-no-env" : "visual-capture-failed",
+        blockedReason: capture.status === "no-visual-env" ? "visual-no-env"
+          : capture.status === "design-unresolved" ? "visual-no-design" : "visual-capture-failed",
+        ...("remediation" in capture ? { remediation: capture.remediation } : {}),
       };
     }
     // Judge the captured artifact under the same lifecycle owner. A thrown fault (a

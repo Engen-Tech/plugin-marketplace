@@ -26,9 +26,9 @@ This is the core frontend differentiator. **If a design-validation tool/skill is
 Invoke the configured design-validation skill/tool. It is stack-agnostic: it takes a design-file path, an app URL/route, and navigation instructions, and returns a structured discrepancy report. Pass the parameters extracted from the ticket in Phase 1, including the optional fields from `DESIGN_VALIDATION_PARAMS` when present:
 
 ```
-Design file: <DESIGN_FILE_PATH>
+Design file: <DESIGN_FILE_PATH>  (the design URL takes the `#fragment` of `design_reference`, which selects the design state)
 App base URL: <dev-server-url>  (the resolved dev-server URL, e.g. http://localhost:3000)
-App route: <APP_ROUTE>  (served at <dev-server-url><APP_ROUTE>)
+App route: <APP_ROUTE>  (path and query only, served at <dev-server-url><APP_ROUTE>; never the `#fragment`)
 Design navigation: <DESIGN_NAVIGATION>
 App navigation: <app-side steps to reach the view, from DESIGN_VALIDATION_PARAMS — pass when present; REQUIRED for slideout/modal/detail sub-views, else the tool only captures the route's initial render>
 Viewport: <from DESIGN_VALIDATION_PARAMS if specified, else the tool default>

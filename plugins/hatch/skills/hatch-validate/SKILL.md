@@ -25,9 +25,9 @@ When Pi provides `hatch_script`, use `serveDesignSelfTest` for the bounded self-
 
 The caller's prompt must include:
 
-- **Design HTML file path** — absolute or relative to the workspace root. Can be a directory; `serve_design.py` picks the best HTML file, preferring standalone non-print variants.
+- **Design HTML file path** — absolute or relative to the workspace root (the binder's `design_facts.source` is relative to the repository root and committed before the item checked against it is built). Can be a directory; `serve_design.py` picks the best HTML file, preferring standalone non-print variants.
 - **App base URL** (optional) — where the running app is served. Defaults to `http://localhost:3000` when omitted.
-- **App route** — URL path in the running app; appended to the app base URL.
+- **App route** — URL path and query in the running app; appended to the app base URL. Never the `#fragment` of `design_reference`: that selects the design state and goes to the design page only.
 - **Design navigation instructions** — explicit steps to reach the target view in the design prototype.
 - **App navigation instructions** (optional) — steps beyond loading the route, such as opening a modal or detail pane.
 - **Auth / login setup** (optional) — steps, storage state, cookie, token, or test-login mechanism needed for the target app route to render.

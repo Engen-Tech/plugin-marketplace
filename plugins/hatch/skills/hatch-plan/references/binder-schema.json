@@ -35,7 +35,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "source": { "type": ["string", "null"], "description": "path to the source design/prototype, or null" },
+        "source": { "type": ["string", "null"], "description": "path to the source design/prototype, relative to the repository root and committed before the item checked against it is built (on the delivery's base or by an earlier item), or null" },
         "stack": { "type": "string", "description": "resolved stack, recorded once" }
       }
     },
@@ -152,7 +152,7 @@
         },
         "estimate": { "enum": ["S", "M", "L"] },
         "depends_on": { "type": "array", "items": { "type": "string" }, "default": [] },
-        "design_reference": { "type": "string", "minLength": 1, "description": "view/route id, or the literal 'none'" },
+        "design_reference": { "type": "string", "minLength": 1, "description": "app route (path and query), with an optional #fragment that selects the design state and goes to the design page only; or the literal 'none'" },
         "component_map": { "type": "array" },
         "icon_map": { "type": "array" },
         "token_changes": { "type": "array" },

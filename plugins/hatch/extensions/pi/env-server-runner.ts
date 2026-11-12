@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { join } from "node:path";
@@ -303,6 +304,25 @@ function crashOutcome(
   };
 }
 
+// Linux only: Node delivers a child's exit event some time after the kernel ends it, so
+// read the kernel's view. It is trusted only when /proc shows this process's own pid
+// namespace and the task's parent is this process. Z counts only with one thread left,
+// because a leader whose main thread alone exited shows Z while other threads serve.
+// Any read error, or any other platform, reports not-exited and leaves the exit flag.
+function childExitedInKernel(pid: number): boolean {
+  if (process.platform !== "linux") return false;
+  try {
+    if (readFileSync("/proc/self/stat", "utf8").split(" ", 1)[0] !== String(process.pid)) return false;
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // proc(5) fields 3 (state), 4 (ppid) and 20 (num_threads), counted after the comm.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const exited = fields[0] === "Z" || fields[0] === "X";
+    return exited && fields[1] === String(process.pid) && fields[17] === "1";
+  } catch {
+    return false;
+  }
+}
+
 function settleClose(closed: Promise<void>): Promise<void> {
   return Promise.race([
     closed,
@@ -442,8 +462,9 @@ export async function startEnvServer(options: StartEnvServerOptions): Promise<En
       const probe = await probeTarget(targetUrl, life.signal, maxRedirectHops, requestTimeoutMs);
 
       if (probe.kind === "healthy") {
-        // Re-check liveness: a 2xx is accepted only while the spawned child is alive.
-        if (exit || spawnError) return await crash();
+        // Re-check liveness: a 2xx is accepted only while the spawned child is alive. On
+        // Linux this also asks the kernel, since the exit event can lag the child's death.
+        if (exit || spawnError || childExitedInKernel(pid)) return await crash();
         detachAbort();
         const handle: EnvServerHandle = {
           url: targetUrl,
