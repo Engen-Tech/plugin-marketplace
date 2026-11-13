@@ -154,9 +154,10 @@ def derive_state(binders: list[dict], git_facts: dict,
         return gitems
 
     # A successor binder (supersedes: {slug, carried}) repairs a partially
-    # delivered one. Its carried items were delivered by the predecessor, so
-    # their evidence is the predecessor's done refs under the same provenance
-    # rules; a live predecessor with a live successor is not open work.
+    # delivered one. Its carried items were delivered by the predecessor, or by a
+    # binder it carried them from, so their evidence is that binder's done refs
+    # under the same provenance rules; a live predecessor with a live successor
+    # is not open work.
     superseded_by: dict[str, str] = {}
     for slug, b in by_slug.items():
         sup = _supersedes(b)
@@ -176,15 +177,21 @@ def derive_state(binders: list[dict], git_facts: dict,
             pred, carried = sup
             pitems = trusted_items(pred, carried, warn=False)
             for iid in carried:
-                pi = pitems.get(iid, {})
+                pi, owner, hop, seen = pitems.get(iid, {}), pred, by_slug.get(pred), {slug, pred}
+                # The predecessor carried it too: the binder that delivered it holds the ref.
+                while (not gfb.get(owner, {}).get("items", {}).get(iid, {}).get("done")
+                       and (s := hop and _supersedes(hop)) and iid in s[1] and s[0] not in seen):
+                    owner, hop = s[0], by_slug.get(s[0])
+                    seen.add(owner)
+                    pi = trusted_items(owner, [iid], warn=False).get(iid, {})
                 if iid in item_ids and pi.get("done"):
                     gitems[iid] = {**gitems.get(iid, {}), "done": True,
                                    "done_in_default": pi.get("done_in_default"),
                                    "accepted": pi.get("accepted")}
-                    carried_from[iid] = pred
+                    carried_from[iid] = owner
                 elif iid in item_ids:
                     warnings.append(
-                        f"binder '{slug}' item '{iid}' is carried from '{pred}', but '{pred}' "
+                        f"binder '{slug}' item '{iid}' is carried from '{pred}', but '{owner}' "
                         f"has no trusted done ref for it — hatch-deliver {slug} "
                         f"halts at preflight until it does")
         gb = {**gb, "items": gitems}

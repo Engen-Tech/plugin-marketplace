@@ -77,7 +77,7 @@ The accept multi-ref write is not atomic; write-order is fixed (trailers stamped
 
 ## Successor binders
 
-A successor binder (`supersedes: {slug, carried}`, see docs/how-to/binder-repair.md) builds on its predecessor's delivered work. Its integration branch starts from `hatch/<predecessor>/integration`, not from the default branch, so the carried items are already present. The carried items' evidence stays under the predecessor's refs (`refs/hatch/<predecessor>/item-<id>/done`); keep those refs and the predecessor's integration branch until the successor lands, because `deliver_preflight.py` re-proves every carried item from them on each run.
+A successor binder (`supersedes: {slug, carried}`, see docs/how-to/binder-repair.md) builds on its predecessor's delivered work. Its integration branch starts from `hatch/<predecessor>/integration`, not from the default branch, so the carried items are already present. The carried items' evidence stays under the refs of the binder that delivered each one (`refs/hatch/<slug>/item-<id>/done`): the predecessor, or, for an item the predecessor itself carried, the binder it carried the item from. Keep those refs and those binders' integration branches until the successor lands, because `deliver_preflight.py` re-proves every carried item from them on each run.
 
 ## Env-injection contract
 

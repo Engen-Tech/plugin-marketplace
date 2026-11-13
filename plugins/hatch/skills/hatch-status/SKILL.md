@@ -35,10 +35,13 @@ All state is git-native and recomputed on every call — there is no stored curs
   that fails is ignored and named in a warning, and so is a ref for an item the binder does not
   declare. The delivery Stop guard reads the same verdicts, so a forged done never silences it.
 - **Successor binders.** A binder with `supersedes: {slug, carried}` repairs a partially delivered
-  one. Each carried item is `done` (or `accepted`) when its predecessor's done ref under
-  `refs/hatch/<predecessor>/` passes the same provenance rules, and it is shown as
-  delivered by the predecessor; a carried item without that proof is not done and draws a
-  warning. A live predecessor with a live successor is labelled superseded and is never offered
+  one. Each carried item is `done` (or `accepted`) when a done ref under
+  `refs/hatch/<slug>/` passes the same provenance rules, where `<slug>` is the predecessor or,
+  when the predecessor itself carried the item, the nearest binder up the chain of live binders
+  that holds a done ref for it; it is shown as delivered by that binder. The walk stops at the
+  first binder with a done ref present, so a ref that fails provenance is not passed over. A
+  carried item without that proof is not done and draws a warning. The walk reads live binders only, so where the
+  earlier binders are archived it stops at the predecessor. A live predecessor with a live successor is labelled superseded and is never offered
   as the next action — its remaining work is the successor's.
 - **Unreadable binders are errors, never skipped.** A binder file that is not JSON, or is JSON but
   not a binder object, is listed in `errors` by path, and the next action says to repair it.

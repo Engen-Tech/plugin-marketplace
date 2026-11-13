@@ -114,20 +114,20 @@
         "slug": {
           "type": "string",
           "pattern": "^[a-z0-9][a-z0-9-]*$",
-          "description": "the predecessor binder's slug; its refs/hatch/<slug>/ refs and integration branch prove the carried work"
+          "description": "the predecessor binder's slug; its refs/hatch/<slug>/ refs and integration branch prove the carried work, and for an item the predecessor itself carried, so do those of the binder that delivered it"
         },
         "carried": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
           "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-          "description": "ids of work items already delivered by the predecessor. Each must appear in this binder's work_items unchanged from the predecessor's plan and carry a done ref in the predecessor that passes provenance; deliver_preflight.py refuses the binder otherwise"
+          "description": "ids of work items already delivered or carried by the predecessor. Each must appear in this binder's work_items unchanged from the predecessor's plan and carry a done ref, in the predecessor or in the binder the predecessor carried it from, that passes provenance; deliver_preflight.py refuses the binder otherwise"
         },
         "dropped": {
           "type": "array",
           "uniqueItems": true,
           "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-          "description": "ids of predecessor items that are done but NOT carried: their merge is on the predecessor integration branch the successor starts from, so the successor must plan a work item that reverts or replaces that code. deliver_preflight.py halts on any predecessor done item that is neither carried nor dropped, and on a dropped id with no predecessor done ref"
+          "description": "ids of predecessor items that are done but NOT carried: their merge is on the predecessor integration branch the successor starts from, so the successor must plan a work item that reverts or replaces that code. deliver_preflight.py halts on any item the predecessor delivered or carried that is neither carried nor dropped, and on a dropped id with no done ref in the predecessor or the binder it carried it from"
         }
       }
     },

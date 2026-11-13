@@ -38,14 +38,16 @@ Top-level keys:
                         `supersedes`): {predecessor, predecessor_integration {name, tip},
                         carried {id: done-provenance record}, dropped {id: predecessor
                         done sha}, findings, ok}. Each carried
-                        item needs a done ref under the predecessor's slug passing the
-                        same checks as done_provenance on the predecessor's integration
-                        branch, and must equal the predecessor's committed work item; an
-                        existing successor integration branch must contain the
-                        predecessor's tip. Every predecessor done item must be carried or
+                        item needs a done ref under the slug of the binder that delivered
+                        it (the predecessor, or an older binder it carried the item from,
+                        named in the record's `delivered_by`), passing done_provenance's
+                        checks on that binder's integration branch, and must equal the
+                        predecessor's committed item; an existing successor integration
+                        branch must contain the predecessor's tip. Every predecessor done
+                        item, carried ones included, must be carried or
                         listed in `supersedes.dropped` (its merge is on the successor's
                         base; a successor item must revert or replace it), and every
-                        dropped id needs a predecessor done ref. Any failure sets `halt`.
+                        dropped id needs a done ref found the same way. Any failure sets `halt`.
                         Proven carried items count as done for the frontier.
   refs                — every refs/hatch/<slug>/item-*/{built,failed,done,accepted,evidence,halt}
                         that exists, mapped to its target sha. The canonical evidence
@@ -255,11 +257,12 @@ def _predecessor_plan(repo: Path, pred: str, tip: str) -> dict | None:
 def check_supersedes(repo: Path, binder: dict, integration_name: str,
                      integration_tip: str | None) -> tuple[dict | None, bool]:
     """A successor binder (top-level `supersedes`) is refused unless every carried item
-    is proven delivered by the predecessor: a done ref under the predecessor's slug that
-    passes the same provenance and first-parent checks as a resumed done ref, on the
-    predecessor's integration branch, for an item this binder copies unchanged from the
-    predecessor's committed plan. When the successor's own integration branch exists it
-    must already contain the predecessor's integration tip. Returns (report, halt)."""
+    is proven delivered by the predecessor, or by a binder the predecessor carried it
+    from: a done ref under that binder's slug that passes the same provenance and
+    first-parent checks as a resumed done ref, on that binder's integration branch, for
+    an item this binder copies unchanged from the predecessor's committed plan. When the
+    successor's own integration branch exists it must already contain the predecessor's
+    integration tip. Returns (report, halt)."""
     sup = binder.get("supersedes")
     if not isinstance(sup, dict):
         return None, False
@@ -282,13 +285,45 @@ def check_supersedes(repo: Path, binder: dict, integration_name: str,
         own_items = {it.get("id"): it for it in binder.get("work_items", []) if isinstance(it, dict)}
         if plan is None:
             findings.append(f"no committed binder for '{pred}' on {pred_integration}")
+
+        def delivered(iid: str) -> tuple[tuple[str, str, set[str]] | None, str]:
+            """(slug, done sha, first-parent chain) of the binder that delivered `iid` on
+            the predecessor's base. A predecessor that carried it itself is followed back
+            through its committed `supersedes`: each hop's integration tip must be on the
+            later hop's, and its committed plan must hold the same item."""
+            hop, tip, hop_plan, hop_chain, seen = pred, pred_tip, plan, chain, {binder.get("slug"), pred}
+            prev = pred_items.get(iid)
+            while (sha := ref_target(repo, f"refs/hatch/{hop}/item-{iid}/done")) is None:
+                hsup = (hop_plan or {}).get("supersedes")
+                nxt = hsup.get("slug") if isinstance(hsup, dict) and iid in (hsup.get("carried") or []) else None
+                if not isinstance(nxt, str):
+                    return None, f"no refs/hatch/{hop}/item-{iid}/done" + (f" (followed from '{pred}')" if hop != pred else "")
+                nxt_tip = ref_target(repo, f"hatch/{nxt}/integration")
+                if nxt in seen or len(seen) > 16 or nxt_tip is None or _git(
+                        repo, "merge-base", "--is-ancestor", nxt_tip, tip).returncode != 0:
+                    return None, (f"'{hop}' carried '{iid}' from '{nxt}', but hatch/{nxt}/integration "
+                                  f"is missing, not on hatch/{hop}/integration, or already followed")
+                hop_plan = _predecessor_plan(repo, nxt, nxt_tip)
+                cur = {it.get("id"): it for it in (hop_plan or {}).get("work_items", []) if isinstance(it, dict)}.get(iid)
+                if cur != prev:
+                    return None, (f"work item '{iid}' differs between the committed plans of '{hop}' "
+                                  f"and '{nxt}'; a carried item is copied unchanged")
+                hop, tip, prev, hop_chain = nxt, nxt_tip, cur, first_parent_chain(repo, f"hatch/{nxt}/integration")
+                seen.add(nxt)
+            return (hop, sha, hop_chain), ""
+
         for cid in carried_ids:
-            sha = ref_target(repo, f"refs/hatch/{pred}/item-{cid}/done")
-            if sha is None:
-                carried[cid] = {"target": None, "ok": False,
-                                "finding": f"no refs/hatch/{pred}/item-{cid}/done"}
+            found, finding = delivered(cid)
+            if found is None:
+                carried[cid] = {"target": None, "ok": False, "finding": finding}
                 continue
-            record = _done_record(repo, pred, cid, sha, chain)
+            hop, sha, hop_chain = found
+            record = _done_record(repo, hop, cid, sha, hop_chain)
+            if hop != pred:
+                record["delivered_by"] = hop
+                if not record["ok"]:
+                    record["finding"] = (f"refs/hatch/{hop}/item-{cid}/done fails provenance or is not "
+                                         f"first-parent reachable on hatch/{hop}/integration")
             if plan is not None and pred_items.get(cid) != own_items.get(cid):
                 record["ok"] = False
                 record["finding"] = (f"work item '{cid}' differs from the predecessor's "
@@ -300,12 +335,22 @@ def check_supersedes(repo: Path, binder: dict, integration_name: str,
         pred_done = {name.split("/")[-2][len("item-"):]: sha for name, sha in
                      list_prefixed_refs(repo, f"refs/hatch/{pred}/").items()
                      if name.endswith("/done") and name.split("/")[-2].startswith("item-")}
+        # What the predecessor carried is on its base too, so it is named like its own work.
+        psup = (plan or {}).get("supersedes")
+        for pid in (psup.get("carried") or []) if isinstance(psup, dict) else []:
+            if not isinstance(pid, str) or pid in pred_done:
+                continue
+            found, why = delivered(pid)
+            if found:
+                pred_done[pid] = found[1]
+            elif pid not in carried_ids and pid not in dropped_ids:
+                findings.append(f"'{pred}' carried '{pid}', so its code is on {pred_integration}, "
+                                f"and this binder neither carries nor drops it ({why})")
         for did in dropped_ids:
             if did in pred_done:
                 dropped[did] = pred_done[did]
             else:
-                findings.append(f"dropped id '{did}' has no refs/hatch/{pred}/"
-                                f"item-{did}/done; there is no delivered work to drop")
+                findings.append(f"dropped id '{did}' has no delivered work to drop: {delivered(did)[1]}")
         for did in sorted(set(pred_done) - set(carried_ids) - set(dropped_ids)):
             findings.append(f"predecessor item '{did}' is done and its merge "
                             f"({pred_done[did]}) is on {pred_integration}, which this binder "
