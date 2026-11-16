@@ -228,7 +228,7 @@ const VISUAL_BLOCKED_MESSAGES: Record<HatchVerificationBlockedReason, string> = 
   "visual-capture-failed":
     "Visual capture failed closed (dev-server startup, playwright-cli availability, or an unhealthy render). Inspect the capture remediation and rebuild; no ref moved.",
   "visual-gate-error":
-    "The visual gate could not return a verdict (dispatch error/timeout, or evidence that was unjudgeable). Rerun; the host decides whether to retry, never the gate. No ref moved.",
+    "The visual gate could not return a verdict (dispatch error/timeout, or evidence that was unjudgeable). For a provider error, wait for the provider or pin the visual-gate role to another model; otherwise rerun. The host decides whether to retry, never the gate. No ref moved.",
   "visual-no-context":
     "Visual acceptance requires the build or integration lifecycle context; the context-less verification path cannot bring an app up. Run this through buildItem or deliverBinder. No ref moved.",
 };
@@ -320,13 +320,19 @@ function resolveDesignSource(document: Record<string, unknown>): string | undefi
   return trimmed;
 }
 
-// A thrown capture fault, cut to its first line, so the halt names the cause without a
-// command's whole output. The playwright-cli gate keeps its install steps.
-function captureFault(error: unknown): string {
-  if (error instanceof PlaywrightCliUnavailableError) return error.remediation;
+// A thrown fault or a gate's error text, cut to its first line of at most 300 characters
+// with no control or format characters, so the halt names the cause without a command's
+// whole output.
+function faultLine(error: unknown): string {
   const { stderr, message } = (error ?? {}) as { stderr?: unknown; message?: unknown };
   const text = String((typeof stderr === "string" && stderr.trim()) || message || error).trim();
-  return `The capture stopped: ${text.split(/\r?\n/)[0]!.slice(0, 300)}`;
+  return text.split(/\r?\n/)[0]!.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, " ").trim().slice(0, 300);
+}
+
+// A thrown capture fault. The playwright-cli gate keeps its install steps.
+function captureFault(error: unknown): string {
+  if (error instanceof PlaywrightCliUnavailableError) return error.remediation;
+  return `The capture stopped: ${faultLine(error)}`;
 }
 
 function requireScreenshotPath(target: { screenshot?: string | null }, role: string): string {
@@ -754,7 +760,7 @@ export class HatchVerificationRunner {
     }
     // Judge the captured artifact under the same lifecycle owner. A thrown fault (a
     // malformed verdict, moved currency, or a missing screenshot) fails closed as a gate
-    // error rather than crashing.
+    // error rather than crashing; it and a dispatch failure keep their cause (F41).
     let outcome: VisualGateOutcome;
     try {
       outcome = await this.#judgeVisual(ctx, {
@@ -766,14 +772,14 @@ export class HatchVerificationRunner {
         },
         oracleAssertions: oracleAssertions(itemOracle),
       });
-    } catch {
-      return { status: "blocked", blockedReason: "visual-gate-error" };
+    } catch (error) {
+      return { status: "blocked", blockedReason: "visual-gate-error", remediation: `Cause: ${faultLine(error)}` };
     }
     if (outcome.status === "vision-unsupported") {
       return { status: "blocked", blockedReason: "visual-no-vision-model", remediation: outcome.remediation };
     }
     if (outcome.status === "dispatch-failed") {
-      return { status: "blocked", blockedReason: "visual-gate-error" };
+      return { status: "blocked", blockedReason: "visual-gate-error", remediation: `Cause (${outcome.reason}): ${faultLine(outcome.message)}` };
     }
     // A judged verdict: pass lifts the block, concerns retries under the acceptance cap,
     // blocked (unjudgeable evidence) fails closed as a gate error. The verdict is recorded

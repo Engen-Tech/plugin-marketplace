@@ -280,9 +280,19 @@ function finalCheckFailedMessage(
   plan: HatchCheckPlanEntry[],
 ): string {
   const id = convergence.check?.id ?? convergence.diagnosis?.checkId ?? "check-plan";
+  // A worker-proposed check names its owner, so the operator can tell a check the worker
+  // chose for the wrong environment (rerun or replan) from a binder check (change code).
+  const proposed = plan.find((check) => check.id === id)?.purpose === "floor";
   return (
     `Final check '${id}' failed in the item worktree: ${checkOutcome(convergence, plan)} ` +
-    "The item halts blocked, and no worker retry follows."
+    "The item halts blocked, and no worker retry follows." +
+    (proposed
+      ? ` Check '${id}' is one the worker proposed, not a binder check. The host ran it bare through /bin/sh -lc ` +
+        "(cmd.exe on Windows) with the host's environment and CI=1, not in the worker's bash. If it fails the same " +
+        "without this change, or needs a container, rerun the item or replan it rather than change the code: the " +
+        "worker's brief says such a check must start its container in its own command or not be listed, a rerun " +
+        "keeps this item's safety attempts, and a new plan starts them afresh."
+      : "")
   );
 }
 
@@ -318,8 +328,9 @@ export function workerCheckFailureOf(
       nextStep:
         `The host runs the command through the shell with cwd as its working directory, relative to the worktree ` +
         `root. A command that sets its own directory (--directory, --prefix, -C, cd) uses cwd ".". Fix the code, or ` +
-        `correct only how the check is invoked (its cwd or directory flag) so it runs what it ran before; never weaken ` +
-        `or replace what the check verifies. Run it exactly as you will propose it, and re-propose a check with id "${id}".`,
+        `correct only how the check is invoked (its cwd, directory flag, or the container it runs in) so it runs what ` +
+        `it ran before; never weaken or replace what the check verifies. Once a check has come back to you, keep its ` +
+        `id: run it exactly as you will propose it, and re-propose a check with id "${id}".`,
     }],
   };
 }

@@ -13,6 +13,7 @@ import {
   type ChildModelTarget,
   type ChildRuntimeReport,
 } from "./child-runtime.ts";
+import { readLastTurn } from "./child-last-turn.ts";
 import { canonicalJson } from "./evidence.ts";
 import {
   effectiveGateVerdict,
@@ -332,9 +333,10 @@ const VISUAL_VERDICT_REPAIR_PROMPT =
 // verdict (one corrective turn if the child ends on prose).
 export async function realVisualGateInvoke(
   invocation: VisualGateInvocation,
+  openSession: typeof createGateChildSession = createGateChildSession,
 ): Promise<{ text: string; runtime: ChildRuntimeReport }> {
   const groundingTool = createVisualGroundingTool(invocation.grounding);
-  const { session, report } = await createGateChildSession(
+  const { session, report } = await openSession(
     invocation.ctx,
     invocation.systemPrompt,
     [groundingTool],
@@ -355,10 +357,22 @@ export async function realVisualGateInvoke(
       data: image.data,
       mimeType: image.mimeType,
     }));
+    // A turn that ended in a provider error fails the dispatch with the provider's text,
+    // and gets no corrective turn: it would meet the same quota or outage. A cancelled turn
+    // gets none either.
+    const providerFailure = (prompts: number) => {
+      const turn = readLastTurn({ messages: session.messages, prompts, providerRetries: 0 });
+      if (turn.stopReason === "aborted") throw new Error(`the ${VISUAL_GATE_ROLE} child was cancelled`);
+      if (turn.stopReason !== "error") return;
+      const cause = turn.providerError === "quota" ? "a quota error" : "a provider error";
+      throw new Error(`the ${VISUAL_GATE_ROLE} child got ${cause} from ${report.provider}/${report.model}: ${turn.errorMessage ?? "no error text"}`);
+    };
     await session.prompt(invocation.userPrompt, { images });
+    providerFailure(1);
     let text = session.getLastAssistantText()?.trim() ?? "";
     if (!looksLikeVisualVerdict(text)) {
       await session.prompt(VISUAL_VERDICT_REPAIR_PROMPT);
+      providerFailure(2);
       text = session.getLastAssistantText()?.trim() ?? text;
     }
     return { text, runtime: report };

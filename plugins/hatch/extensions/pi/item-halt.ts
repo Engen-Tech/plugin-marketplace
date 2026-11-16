@@ -289,6 +289,16 @@ function haltCause(input: HaltCauseInput): HaltCause {
     return { kind: "provider-error", gate: blocked.role, findings: haltFindings(blocked.findings), nextStep: step("change-model") };
   }
   if (blocked) return { kind: "host-verdict", gate: blocked.role, findings: haltFindings(blocked.findings), nextStep: step("rerun-delivery") };
+  // A visual gate with no verdict records no gates.visual; its cause is in the block's
+  // remediation (F41). Only the host's own dispatch wording, written for a turn that ended
+  // in a provider error, picks a provider halt: never a model's text quoted in a fault.
+  const visual = input.verifications.find((entry) => entry?.blockedReason === "visual-gate-error" && !entry.gates.visual);
+  if (visual) {
+    const said = /^Cause \(error\): the visual-gate child got a (quota|provider) error from /.exec(visual.remediation ?? "")?.[1];
+    return said
+      ? { kind: "provider-error", gate: "visual-gate", findings: hostFinding(said === "quota" ? "quota-exhausted" : "provider-error"), nextStep: step("change-model") }
+      : { kind: "host-verdict", gate: "visual-gate", findings: hostFinding("visual-gate-error"), nextStep: step("rerun-delivery") };
+  }
   const concern = input.capGate ?? input.verifications.map(concernGate).find((role) => role !== undefined);
   if (concern && input.status === "failed") {
     const verification = input.verifications.find((entry) => entry?.gates[GATE_KEYS[concern]]) ?? input.verifications[0];
@@ -419,7 +429,7 @@ export function haltOfIntegration(
     };
   }
   const checkFailure = "checkFailure" in at ? at.checkFailure : result.checkFailure;
-  const cause = at.phase === "accept" && !result.checkFailure && !result.refusal && !blockedGate([result.verification, result.safetyVerification])
+  const cause = at.phase === "accept" && !result.checkFailure && !result.refusal && !blockedGate([result.verification, result.safetyVerification]) && result.verification?.blockedReason !== "visual-gate-error"
     ? { kind: "host-verdict" as const, gate: null, findings: hostFinding("accept-declined"), nextStep: "human-decision" as const }
     : haltCause({
         status: at.status,
