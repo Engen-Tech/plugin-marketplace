@@ -19,6 +19,12 @@ transcript — for three dirty-delivery states across the live binders
   valid `done` ref, and the archive file `.hatch/binders/archive/<slug>.json` is not
   committed anywhere it counts (HEAD, `refs/heads/hatch/<slug>/integration`, or
   the default branch). On disk or staged but uncommitted does not count.
+  In a successor (top-level `supersedes`), an item it carries counts as done
+  when the hatch-deliver supersedes chain (supersedes_chain.py, the walk
+  preflight uses) resolves it, one hop or more, to a done ref under the binder
+  that delivered it, and that ref passes the provenance rules below under that
+  binder's slug. A chain that does not resolve, a resolved ref that fails
+  provenance, or a module that cannot be loaded, leaves the item not done.
 
 A `done` ref counts only when it passes the provenance rules delivery applies
 on resume — commit markers over `<done>^1..<done>`, the accepted-state rules,
@@ -111,31 +117,78 @@ def _repo_root(cwd: str) -> str | None:
 
 
 STATUS_ENGINE_REL = Path("skills") / "hatch-status" / "scripts" / "hatch_next.py"
+CHAIN_REL = Path("skills") / "hatch-deliver" / "scripts" / "supersedes_chain.py"
 
 
-def _status_engine():
-    """The hatch-status engine, whose done_verdicts applies the same
-    provenance rules delivery uses on resume. Found beside this plugin's own
-    skills tree (walking up from this file, never a fixed depth), else under
-    CLAUDE_PLUGIN_ROOT. None when neither holds it — the guard then trusts done
-    refs as present, which is the fail-open direction for a Stop nudge."""
+def _plugin_module(rel: Path, name: str):
+    """A module from this plugin's own skills tree, found by walking up from
+    this file (never a fixed depth), else under CLAUDE_PLUGIN_ROOT. None when
+    neither holds it or it fails to load. Writes no bytecode: an installed
+    plugin is a git clone (pi's marketplace) that a __pycache__ dirties."""
     roots = [d for d in Path(__file__).resolve().parents]
     env = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if env:
         roots.append(Path(env))
     for root in roots:
-        script = root / STATUS_ENGINE_REL
+        script = root / rel
         if script.is_file():
+            dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
             try:
                 import importlib.util
-                spec = importlib.util.spec_from_file_location(
-                    "hatch_next_for_stop", script)
+                spec = importlib.util.spec_from_file_location(name, script)
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
                 return mod
             except Exception:  # noqa: BLE001
                 return None
+            finally:
+                sys.dont_write_bytecode = dwb
     return None
+
+
+def _status_engine():
+    """The hatch-status engine, whose done_verdicts applies the same
+    provenance rules delivery uses on resume. None when it cannot be found —
+    the guard then trusts done refs as present, which is the fail-open
+    direction for a Stop nudge."""
+    return _plugin_module(STATUS_ENGINE_REL, "hatch_next_for_stop")
+
+
+def _carried_resolved(root: str, doc: dict, slug: str, items: list[str]) -> bool:
+    """Is every one of `items` carried by this successor and resolved through
+    the supersedes chain to a done ref that passes provenance under the binder
+    that delivered it? False on anything else, including a missing module or
+    any error, so the binder reads exactly as it did before the chain was
+    followed."""
+    if not items:
+        return True
+    try:
+        sup = doc.get("supersedes")
+        carried = sup.get("carried") if isinstance(sup, dict) else None
+        pred = sup.get("slug") if isinstance(sup, dict) else None
+        if not isinstance(pred, str) or not isinstance(carried, list) \
+                or not all(i in carried for i in items):
+            return False
+        chain = _plugin_module(CHAIN_REL, "supersedes_chain_for_stop")
+        if chain is None:
+            return False
+        git = lambda *a: _git(root, *a)  # noqa: E731
+        by_slug: dict[str, list[str]] = {}
+        for i in items:
+            hit = chain.resolve_delivery(git, pred, i, slug)
+            if hit.done is None:
+                return False
+            by_slug.setdefault(hit.slug, []).append(i)
+        # Each resolved done ref must pass provenance under the binder that
+        # delivered it, as every own done ref does; a forged one is not done.
+        # One engine call per delivering binder, not one per item.
+        for s, ids in by_slug.items():
+            verdicts = _done_verdicts(root, s, ids)
+            if any((verdicts.get(i) or {}).get("suspect") for i in ids):
+                return False
+        return True
+    except Exception:  # noqa: BLE001 — fail open: not complete, as before
+        return False
 
 
 def _done_verdicts(root: str, slug: str, item_ids: list[str]) -> dict[str, dict]:
@@ -169,11 +222,10 @@ def _live_slugs(root: str) -> list[str]:
     return sorted(slugs)
 
 
-def _binder_item_ids(root: str, slug: str) -> list[str] | None:
-    """Work-item ids from the live binder — working tree first, else the HEAD
-    blob (a crash between the archive `git mv` and its commit removes the file
-    from disk while the archival is not yet real). None = unreadable/malformed
-    (fail open for this binder)."""
+def _binder_doc(root: str, slug: str) -> dict | None:
+    """The live binder — working tree first, else the HEAD blob (a crash
+    between the archive `git mv` and its commit removes the file from disk
+    while the archival is not yet real). None = unreadable/malformed."""
     live = Path(root) / ".hatch" / "binders" / f"{slug}.json"
     if live.is_file():
         try:
@@ -189,6 +241,12 @@ def _binder_item_ids(root: str, slug: str) -> list[str] | None:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return None
+    return data if isinstance(data, dict) else None
+
+
+def _binder_item_ids(data: dict | None) -> list[str] | None:
+    """Work-item ids from the binder. None = unreadable/malformed (fail open
+    for this binder)."""
     items = data.get("work_items") if isinstance(data, dict) else None
     if not isinstance(items, list):
         return None
@@ -400,7 +458,8 @@ def decide(payload: object) -> tuple[int, str]:
     for slug in _live_slugs(root):
         if common is not None and _lock_live(common, slug):
             continue  # a live dispatch owns this binder; its state is mid-flight
-        ids = _binder_item_ids(root, slug)
+        doc = _binder_doc(root, slug)
+        ids = _binder_item_ids(doc)
         if ids is None:
             continue  # unreadable/malformed binder — fail open for this slug
         states = _slug_ref_states(root, slug)
@@ -436,7 +495,9 @@ def decide(payload: object) -> tuple[int, str]:
             messages.append(SUSPECT_DONE_MSG.format(
                 slug=slug, ids=", ".join(suspect),
                 why=verdicts[suspect[0]]["suspect"][0]))
-        if ids and all(done_ok(i) for i in ids) \
+        # A successor's carried item is done under the binder that delivered it.
+        if ids and _carried_resolved(root, doc, slug,
+                                     [i for i in ids if not done_ok(i)]) \
                 and not _archive_committed(root, slug):
             findings.append((slug, "complete-unarchived", tuple(sorted(ids))))
             messages.append(COMPLETE_UNARCHIVED_MSG.format(slug=slug))
@@ -828,6 +889,95 @@ def _run_self_test() -> int:
         lock(repo, "wip", pid=2 ** 40)
         check("an owner.json with an out-of-range pid does not silence the guard",
               stop(repo), 2)
+
+        # Successors (C1-C6): an item a successor carries is done when the
+        # supersedes chain resolves it to a done ref under the binder that
+        # delivered it, so a successor with every item done or carried is
+        # complete-unarchived like any other binder.
+        def successor(repo: Path, slug: str, prev: str, own: list[str],
+                      carried: list[str]) -> None:
+            """Plan `slug` on a new integration branch off `prev`'s, carrying
+            `carried` from `prev`, retire `prev`'s live copy there, and deliver
+            `own` under `slug`. Leaves HEAD on the new integration branch."""
+            git(repo, "checkout", "-q", "-b", f"hatch/{slug}/integration",
+                f"hatch/{prev}/integration")
+            d = repo / ".hatch" / "binders"
+            (d / "archive").mkdir(exist_ok=True)
+            git(repo, "mv", f".hatch/binders/{prev}.json",
+                f".hatch/binders/archive/{prev}.json")
+            (d / f"{slug}.json").write_text(json.dumps(
+                {"slug": slug, "supersedes": {"slug": prev, "carried": carried},
+                 "work_items": [{"id": i} for i in carried + own]}),
+                encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", f"plan {slug}")
+            for item in own:
+                deliver(repo, slug, item)
+
+        def one_hop(td: str, name: str) -> Path:
+            repo = init_repo(td, name)
+            write_binder(repo, "s", ["a"])
+            deliver(repo, "s", "a")
+            successor(repo, "s-r2", "s", ["b"], ["a"])
+            return repo
+
+        # C1. one-hop successor, every item done or carried, unarchived -> block
+        repo = one_hop(td, "succ1")
+        reason = check("a one-hop successor whose items are done or carried "
+                       "blocks as complete-unarchived", stop(repo), 2)
+        flag("block reason names the successor and the archive fix",
+             "binder s-r2" in reason and "never archived" in reason)
+
+        # C2. two hops: s-r3 carries a (delivered by s) and b (by s-r2) -> block
+        repo = one_hop(td, "succ2")
+        successor(repo, "s-r3", "s-r2", ["c"], ["a", "b"])
+        reason = check("a two-hop successor whose items are done or carried "
+                       "blocks as complete-unarchived", stop(repo), 2)
+        flag("two-hop block reason names the second successor only",
+             "binder s-r3" in reason and "binder s-r2" not in reason)
+
+        # C3. broken chain: the origin integration branch is gone -> as before
+        repo = one_hop(td, "succ3")
+        git(repo, "branch", "-D", "hatch/s/integration")
+        check("a successor whose carried item does not resolve allows "
+              "(the chain is not read as done)", stop(repo), 0)
+
+        # C4. a live dispatch lock still skips a complete successor
+        repo = one_hop(td, "succ4")
+        lock(repo, "s-r2")
+        check("a live lock skips a complete successor", stop(repo), 0)
+
+        # C5. the origin's done ref is forged (points at the seed commit): the
+        # carried item fails provenance under the binder that delivered it, so
+        # it is not done and the successor is not complete.
+        repo = one_hop(td, "succ5")
+        seed = git(repo, "rev-list", "--max-parents=0", "HEAD").stdout.strip()
+        git(repo, "update-ref", "refs/hatch/s/item-a/done", seed)
+        reason = check("a successor whose carried item's done ref fails "
+                       "provenance is not complete-unarchived", stop(repo), 0)
+        flag("a forged carried done ref never reads as never archived",
+             "never archived" not in reason)
+
+        # C6. s-r3 carries a (delivered by s) and b (delivered by s-r2), so
+        # provenance runs once per delivering binder. b's done ref is forged
+        # under s-r2: the successor is not complete even though a, checked
+        # under s, is clean. Every group is checked, not only the first.
+        repo = one_hop(td, "succ6")
+        successor(repo, "s-r3", "s-r2", ["c"], ["a", "b"])
+        seed = git(repo, "rev-list", "--max-parents=0", "HEAD").stdout.strip()
+        git(repo, "update-ref", "refs/hatch/s-r2/item-b/done", seed)
+        reason = check("a successor carrying from two binders, one carried "
+                       "done ref forged, is not complete-unarchived",
+                       stop(repo), 0)
+        flag("a forged ref under the second delivering binder never reads "
+             "as never archived", "never archived" not in reason)
+        # ... and with both delivering binders' refs clean -> block
+        repo = one_hop(td, "succ6b")
+        successor(repo, "s-r3", "s-r2", ["c"], ["a", "b"])
+        reason = check("a successor carrying clean items from two binders "
+                       "blocks as complete-unarchived", stop(repo), 2)
+        flag("two-binder block reason names the successor and the archive fix",
+             "binder s-r3" in reason and "never archived" in reason)
 
 
         # The shared item-state table: every row's ref configuration in a real

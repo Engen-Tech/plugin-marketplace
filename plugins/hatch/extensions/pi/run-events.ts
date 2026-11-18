@@ -105,6 +105,8 @@ export type HatchRunEvent =
   // Before any build: these items' oracles need installed dependencies and the
   // integration branch declares no environment setup.
   | { kind: "environment-preflight"; items: string[]; suggestedSetup: string; message: string }
+  // Before any build: check_plan_inputs.py's findings that warn and never stop the run.
+  | { kind: "input-check"; lines: string[] }
   | { kind: "item-merged"; wave: number; item: string; accepted: boolean }
   | {
       kind: "wave-finished";

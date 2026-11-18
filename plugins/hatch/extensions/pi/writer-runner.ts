@@ -161,18 +161,20 @@ export interface WriterSession extends EnvelopePrompter {
 // At most four prompts: the request, an envelope repair, the correction, an
 // envelope repair. Whether a repair or the correction is sent is
 // CHILD_FAILURE_POLICY.writer's call for the kind the last turn reads as: a
-// provider error skips every repair and the correction, and so does an abort. The
+// provider error skips every repair and the correction, and so does an abort or an
+// aborted run `signal`. The
 // review runs only on an envelope the strict parse accepts, so it judges exactly
 // what the host will parse after the session closes.
 export async function promptWriterChild(
   session: WriterSession,
   invocation: Pick<WriterInvocation, "userPrompt" | "binder" | "profile" | "surfaceReview">,
   runtime: ChildRuntimeReport,
+  signal?: AbortSignal,
 ): Promise<string> {
   const expected = { binder: invocation.binder, profile: invocation.profile, runtime };
   // Read per call, so the table decides each turn as it stands.
   const canRepair = (reply: string) =>
-    correctiveTurnAllowed("writer", readLastTurn({ messages: session.messages, prompts: 0, providerRetries: 0 }), reply);
+    correctiveTurnAllowed("writer", readLastTurn({ messages: session.messages, prompts: 0, providerRetries: 0 }), reply, signal);
   const ask = (message: string) =>
     promptForJsonEnvelope(
       session,
@@ -193,7 +195,7 @@ export async function promptWriterChild(
   const correction = await invocation.surfaceReview(
     parseWriterResult(text, invocation.binder, invocation.profile, runtime),
   );
-  return correction === null ? text : ask(correction);
+  return correction === null || signal?.aborted ? text : ask(correction);
 }
 
 // `lastTurn` is how the child's last turn ended, read before the session closed. An
@@ -239,7 +241,7 @@ async function invokeWriter(invocation: WriterInvocation): Promise<WriterModelRe
       },
       getLastAssistantText: () => session.getLastAssistantText(),
     };
-    const text = await promptWriterChild(counted, invocation, report);
+    const text = await promptWriterChild(counted, invocation, report, invocation.ctx.signal);
     // Read before the session closes: the session is the only record of a provider error.
     const lastTurn = readLastTurn({ messages: session.messages, prompts, providerRetries, stats: session.getSessionStats() });
     return { text, runtime: report, lastTurn };

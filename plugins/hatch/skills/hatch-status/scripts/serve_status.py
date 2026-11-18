@@ -105,9 +105,14 @@ try:                        # Windows: msvcrt.locking is the counterpart
 except ImportError:
     msvcrt = None
 
-# Import the sibling engine regardless of CWD.
+# Import the sibling engine regardless of CWD, writing no bytecode: an installed
+# plugin is a git clone (pi's marketplace) that a __pycache__ dirties.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import hatch_next  # noqa: E402
+_dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+try:
+    import hatch_next  # noqa: E402
+finally:
+    sys.dont_write_bytecode = _dwb
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 _SCRIPT_PATH = Path(__file__).resolve()
@@ -4190,8 +4195,9 @@ def item_detail(it: dict, slug: str, status_by_id: dict | None = None) -> list[d
             chips.append({"id": dep, "word": meta["word"], "color": meta["color"],
                           "soft": meta["soft"], "badge": meta["badge"]})
         rows.append(_detail_row("waiting", "chips", chips=chips))
-    # a successor binder's carried item: done by the predecessor, whose refs hold
-    # its evidence — so the branch and ref rows name the predecessor's namespace
+    # a successor binder's carried item: done by the binder that delivered it (the
+    # predecessor, or one its supersedes chain leads back to), whose refs hold its
+    # evidence — so the branch and ref rows name that binder's namespace
     owner = it.get("carried_from")
     if owner:
         rows.append(_detail_row("carried", "text", text=owner, mono=True))
@@ -5442,8 +5448,9 @@ function itemDetail(it, slug, byId) {
       }),
     }));
   }
-  // a successor binder's carried item: done by the predecessor, whose refs hold
-  // its evidence — so the branch and ref rows name the predecessor's namespace
+  // a successor binder's carried item: done by the binder that delivered it (the
+  // predecessor, or one its supersedes chain leads back to), whose refs hold its
+  // evidence — so the branch and ref rows name that binder's namespace
   const owner = it.carried_from;
   if (owner) rows.push(detailRow('carried', 'text', { text: owner, mono: true }));
   add('estimate', it.estimate, 'text');
@@ -9730,7 +9737,7 @@ def _etag_self_test_checks(scratch: Path) -> list[tuple[str, bool]]:
 
     # a separate process, under a hash seed this one is not using: the tag has
     # to survive a hub restart or the browser's held tag never matches again
-    probe = ("import importlib.util,json,sys;"
+    probe = ("import importlib.util,json,sys;sys.dont_write_bytecode=True;"
              "spec=importlib.util.spec_from_file_location('probe',sys.argv[1]);"
              "mod=importlib.util.module_from_spec(spec);"
              "spec.loader.exec_module(mod);"

@@ -220,6 +220,7 @@ interface StopArgs {
   "earlier-run-headless": { readonly refs: number };
   "earlier-run-unanswered": {};
   "environment-preflight": { readonly finding: string };
+  "input-check": { readonly findings: string };
   "gate-probe-refused": { readonly refused: string };
   "successor-uncommitted": {};
   "successor-cannot-start": { readonly halt: string };
@@ -272,6 +273,10 @@ export const STOPS: { readonly [K in DeliveryStop]: StopEntry<Extract<NamedStop,
   "environment-preflight": {
     nextStep: "message",
     message: ({ finding }) => `Delivery stopped before any build: ${finding}`,
+  },
+  "input-check": {
+    nextStep: "message",
+    message: ({ findings }) => `Delivery stopped before any build:${findings}`,
   },
   "gate-probe-refused": {
     nextStep: "message",

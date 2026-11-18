@@ -131,6 +131,22 @@
         }
       }
     },
+    "preconditions": {
+      "type": "array",
+      "maxItems": 8,
+      "description": "outside state the delivery needs before any worker runs, such as an answer file, a deadline or recorded live evidence. Each command runs once at delivery preflight in a throwaway worktree of the base, with no installed dependencies, and a nonzero exit halts the run; plan mode only prints it. A precondition that no item names in waits_on applies to the whole binder. validate_binder.py checks that ids are unique and that every waits_on id is declared",
+      "items": {
+        "type": "object",
+        "required": ["id", "command", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "command": { "type": "string", "minLength": 1, "description": "a probe of outside state, not a test suite; runs with a 30 s limit" },
+          "reason": { "type": "string", "minLength": 1, "description": "why the delivery cannot start without it, in one plain sentence" },
+          "cwd": { "type": "string", "minLength": 1, "description": "worktree-relative directory the command runs in" }
+        }
+      }
+    },
     "work_items": {
       "type": "array",
       "minItems": 1,
@@ -152,6 +168,7 @@
         },
         "estimate": { "enum": ["S", "M", "L"] },
         "depends_on": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "waits_on": { "type": "array", "uniqueItems": true, "items": { "type": "string" }, "default": [], "description": "ids of binder preconditions this item needs; each must be declared in the top-level preconditions" },
         "design_reference": { "type": "string", "minLength": 1, "description": "app route (path and query), with an optional #fragment that selects the design state and goes to the design page only; or the literal 'none'" },
         "component_map": { "type": "array" },
         "icon_map": { "type": "array" },

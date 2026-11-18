@@ -11,7 +11,7 @@ nothing has to be provisioned before it runs:
   python3 validate_binder.py --binder <path>            # also fine — no deps to install
 """
 from __future__ import annotations
-import argparse, json, posixpath, re, sys
+import argparse, json, posixpath, re, shlex, sys
 from fnmatch import fnmatch
 from itertools import combinations
 from pathlib import Path
@@ -84,6 +84,8 @@ def _check(value, schema: dict, root: dict, path: list, errors: list[str]) -> No
     if isinstance(value, list):
         if "minItems" in schema and len(value) < schema["minItems"]:
             errors.append(f"schema: {loc}: array shorter than minItems {schema['minItems']}")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errors.append(f"schema: {loc}: array longer than maxItems {schema['maxItems']}")
         if schema.get("uniqueItems") is True:
             seen: list = []
             for item in value:
@@ -184,6 +186,17 @@ def validate_binder(binder: dict) -> list[str]:
         for ref in set(sup.get("carried", [])) & set(sup.get("dropped", [])):
             errors.append(f"supersedes: id '{ref}' is both carried and dropped")
 
+    # preconditions: ids unique, and every waits_on id names a declared one.
+    pc_ids: set[str] = set()
+    for pc in binder.get("preconditions", []):
+        if pc["id"] in pc_ids:
+            errors.append(f"preconditions: duplicate id '{pc['id']}'")
+        pc_ids.add(pc["id"])
+    for it in items:
+        for ref in it.get("waits_on", []):
+            if ref not in pc_ids:
+                errors.append(f"waits_on: item '{it['id']}' waits on undeclared precondition '{ref}'")
+
     # cycle detection (DFS over depends_on)
     graph = {it["id"]: list(it.get("depends_on", [])) for it in items}
     WHITE, GRAY, BLACK = 0, 1, 2
@@ -209,7 +222,7 @@ def validate_binder(binder: dict) -> list[str]:
     # (a visual oracle) or carry a recorded waiver naming the item that opens it for it.
     # Runs in the same pass as the cycle check above (not gated behind `if not errors`)
     # so a cyclic binder that also carries an unwaived design claim reports both —
-    # the coverage walk below (`_reachable`) has its own visited set and terminates
+    # the coverage walk below (`reachable`) has its own visited set and terminates
     # regardless of a cycle in `graph`.
     errors.extend(_design_reference_errors(items, graph))
 
@@ -281,7 +294,7 @@ def _design_reference_errors(items: list[dict], graph: dict[str, list[str]]) -> 
                     "has design_reference 'none' (or none at all) — hatch-build skips its "
                     "visual gate, so it cannot cover this waiver")
 
-            if item_id not in _reachable(covered_by, graph):
+            if item_id not in reachable(covered_by, graph):
                 errors.append(
                     f"design: item '{item_id}' visual_check_waiver.covered_by '{covered_by}' "
                     f"does not depend on '{item_id}' (directly or through the chain), so it "
@@ -372,7 +385,7 @@ def design_source_advisory(binder: dict) -> list[str]:
             "with nothing behind it"]
 
 
-def _paths_overlap(a_paths: list[str], b_paths: list[str]) -> list[str]:
+def paths_overlap(a_paths: list[str], b_paths: list[str]) -> list[str]:
     """Do two `touches` lists name any common file? Beyond literal equality this
     normalizes `./` and redundant separators, expands a glob entry against concrete
     entries (fnmatch), and treats a directory-prefix of another path as an overlap.
@@ -396,7 +409,7 @@ def _paths_overlap(a_paths: list[str], b_paths: list[str]) -> list[str]:
     return sorted(hits)
 
 
-def _reachable(start: str, graph: dict[str, list[str]]) -> set[str]:
+def reachable(start: str, graph: dict[str, list[str]]) -> set[str]:
     """All ids reachable from `start` by following depends_on edges (the transitive
     closure of "depends on"). Iterative with its own visited set, so a cyclic graph still
     terminates. Module-level and shared by the same-wave collision check (`_wave_collision`)
@@ -418,13 +431,13 @@ def _wave_collision(items: list[dict]) -> list[str]:
     without declaring serialize or a shared resource to order them. Items with a
     dependency path between them land in different waves, so they never collide."""
     deps = {it["id"]: list(it.get("depends_on", [])) for it in items}
-    trans = {i: _reachable(i, deps) for i in deps}
+    trans = {i: reachable(i, deps) for i in deps}
     by_id = {it["id"]: it for it in items}
     out: list[str] = []
     for a, b in combinations(list(deps), 2):
         if a in trans[b] or b in trans[a]:
             continue  # a dependency path sequences them into different waves
-        overlap = _paths_overlap(by_id[a].get("touches", []), by_id[b].get("touches", []))
+        overlap = paths_overlap(by_id[a].get("touches", []), by_id[b].get("touches", []))
         if not overlap:
             continue
         if by_id[a].get("serialize") or by_id[b].get("serialize"):
@@ -490,7 +503,7 @@ _ALWAYS_OK = re.compile(r"^(/usr)?(/bin)?/?(true|:)(\s|$)|^exit\s+0\s*$")
 _DEFANG_SPLIT = re.compile(r"\|\||\||;|\n")
 
 
-def _mask_quoted(command: str) -> str:
+def mask_quoted(command: str) -> str:
     """`command` with quoted and escaped spans blanked, same length, so a separator that is
     really an argument stops looking like one. `grep -E 'a|true b' f` must not split on the
     pipe inside those quotes — flagging that command vacuous would be a false positive, and
@@ -539,7 +552,7 @@ def _is_vacuous_command(command: str) -> bool:
     # hides the `true` behind it.
     # Split positions are found on the masked copy and applied to the original, so a
     # separator inside quotes never splits while the segment text stays real.
-    masked = _mask_quoted(stripped)
+    masked = mask_quoted(stripped)
     pieces, last = [], 0
     for sep in _DEFANG_SPLIT.finditer(masked):
         pieces.append((stripped[last:sep.start()], masked[last:sep.start()]))
@@ -580,6 +593,203 @@ def vacuous_oracle_warnings(binder: dict) -> list[str]:
             out.append(f"{it.get('id')}: oracle carries assertions but no command and no "
                        "opt_out — nothing runnable backs them, so the assertions are vacuous")
     return out
+
+
+# Global options git accepts before a subcommand (`-C dir`, `-c k=v`, `--no-pager`, ...).
+_GIT_GLOBALS = (r"(?:\s+(?:-C\s+(?:\"[^\"]*\"|'[^']*'|\S+)|-c\s+\S+|--no-pager|-P|"
+                r"--no-optional-locks|--literal-pathspecs|--(?:git-dir|work-tree)=\S+))*")
+_GIT_TREE_CMD = re.compile(r"\bgit(?P<globals>" + _GIT_GLOBALS + r")\s+(?P<sub>status|diff-index|diff)"
+                           r"\b(?P<args>[^|;&)`\n<>]*)")
+_GIT_C_DIR = re.compile(r"-C\s+(\"[^\"]*\"|'[^']*'|\S+)")
+# A machine-readable status: `--porcelain[=[v]1|2]`, `--short`, `-z`, or a short-flag
+# cluster holding `s` or `z` (`-s`, `-sb`, `-sz`).
+_STATUS_SHORT_FLAG = re.compile(r"^(?:--porcelain(?:=v?[12])?|--short|-[A-Za-z]*[sz][A-Za-z]*)$")
+_STDERR_REDIRECT = re.compile(r"\s2>>?\s*(?:&1|\S+)")
+# A grep pattern that matches any line, so the grep only asks "is the output non-empty".
+_ANY_LINE = {"", ".", "^", "$", ".*", "^.*", "^."}
+_LONG_CLEAN = re.compile(r"nothing to commit|working tree clean")
+
+
+def _pipe_stage(text: str) -> list[str] | None:
+    """The words of the first pipeline stage in `text` (after a leading `|`), quote-aware."""
+    quote, end = "", len(text)
+    for i, ch in enumerate(text):
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "|;&)\n":
+            end = i
+            break
+    try:
+        return shlex.split(text[:end])
+    except ValueError:
+        return None
+
+
+def _grep_pattern(words: list[str] | None) -> tuple[str | None, bool]:
+    """(pattern, inverted) for a `grep` stage, else (None, False)."""
+    if not words or posixpath.basename(words[0]) not in ("grep", "egrep", "fgrep"):
+        return None, False
+    inverted, pattern, rest = False, None, iter(words[1:])
+    for w in rest:
+        if w in ("-e", "--regexp"):
+            pattern = next(rest, "")
+        elif w.startswith("--regexp="):
+            pattern = w.split("=", 1)[1]
+        elif w == "--invert-match" or (w.startswith("-") and not w.startswith("--") and "v" in w):
+            inverted = True
+        elif w.startswith("-"):
+            continue
+        elif pattern is None:
+            pattern = w
+    return pattern, inverted
+
+
+def _asserts_clean_tree(command: str) -> tuple[str, list[str] | None] | None:
+    """The first check in `command` that asserts the tree matches HEAD or the index.
+
+    Returns (the matched text, its pathspecs, or None for the whole tree), else None.
+    Three shapes qualify:
+    - a machine-readable `git status` the command consumes: inside `$(...)`, `<(...)` or
+      backticks, redirected to a file, or piped into a command other than a grep for a
+      specific pattern (a grep for named files, such as a secret-file guard, passes on a
+      staged candidate unless the item stages such a file);
+    - a long-format `git status` piped into a grep for "nothing to commit" or "working
+      tree clean";
+    - a `git diff` or `git diff-index` against `HEAD`, `--cached` or `--staged` that exits
+      on a difference (`--exit-code`, `--quiet`) or whose output is consumed as above.
+    A status printed on its own is a diagnostic and is not matched; nor is
+    `git diff --exit-code [-- <paths>]`, which compares the worktree with the index."""
+    command = _STDERR_REDIRECT.sub(" ", command)
+    for m in _GIT_TREE_CMD.finditer(command):
+        try:
+            words = shlex.split(m.group("args"))
+        except ValueError:
+            words = m.group("args").split()
+        flags, paths = (words[:words.index("--")], words[words.index("--") + 1:]) \
+            if "--" in words else (words, [])
+        before, after = command[:m.start()], command[m.end():].lstrip()
+        opened = max(before.rfind("$("), before.rfind("<("))
+        in_subst = opened >= 0 and ")" not in before[opened:]
+        in_backticks = before.count("`") % 2 == 1
+        redirected = after.startswith(">") and not after.lstrip(">").lstrip().startswith("/dev/null")
+        piped = after.startswith("|") and not after.startswith("||")
+        pattern, inverted = _grep_pattern(_pipe_stage(after[1:])) if piped else (None, False)
+        targeted = pattern is not None and not inverted and pattern not in _ANY_LINE
+        consumed = (in_subst or in_backticks or redirected or piped) and not targeted
+        if m.group("sub") == "status":
+            short = any(_STATUS_SHORT_FLAG.match(w) for w in flags)
+            paths += [w for w in flags if not w.startswith("-")]
+            hit = consumed if short else (
+                piped and not inverted and bool(_LONG_CLEAN.search(pattern or "")))
+        else:
+            against = any(w in ("HEAD", "--cached", "--staged") for w in flags)
+            hit = against and (consumed or any(w in ("--exit-code", "--quiet") for w in flags))
+        if not hit:
+            continue
+        c_dirs = [d.strip("\"'") for d in _GIT_C_DIR.findall(m.group("globals"))]
+        root = posixpath.join(*c_dirs) if c_dirs else ""
+        specs = [posixpath.normpath(posixpath.join(root, p)) for p in paths]
+        whole = not specs or any(sp in (".", "") for sp in specs)
+        return m.group(0).strip(), None if whole else specs
+    return None
+
+
+def clean_status_oracle_warnings(binder: dict) -> list[str]:
+    """Advisory (non-fatal): name the oracles that assert a clean tree over paths the item
+    changes (F39).
+
+    The build runs an item's oracle on the staged, uncommitted candidate in the item
+    worktree: the Pi finalizer stages it (`git add -A`) before its final checks, and the
+    Claude Code and Codex build skill stages before every floor run. Every path the item
+    changed then differs from HEAD, so a check that the status is empty, or that the tree
+    matches HEAD or the index, cannot pass if it covers one of those paths. Overlap is
+    `paths_overlap` between the check's pathspecs and the item's `touches`: equal, a
+    directory prefix either way, or a glob match. A check with no pathspec covers the whole
+    tree and always warns; one with a pathspec warns when the item declares no `touches`,
+    since nothing shows it disjoint. A warning, not an error, like the vacuous lint above:
+    the text match is a heuristic."""
+    out: list[str] = []
+    for it in binder.get("work_items", []):
+        oracle = it.get("oracle")
+        if not isinstance(oracle, dict) or oracle.get("opt_out"):
+            continue
+        command = oracle.get("command")
+        found = _asserts_clean_tree(command) if isinstance(command, str) else None
+        if not found:
+            continue
+        text, specs = found
+        touches = [t for t in it.get("touches") or [] if isinstance(t, str)]
+        if specs is None:
+            scope = "the whole tree (no pathspec)"
+        elif not touches:
+            scope = f"{', '.join(specs)}, and the item declares no touches to show it disjoint"
+        else:
+            overlap = paths_overlap(specs, touches)
+            if not overlap:
+                continue
+            scope = f"{', '.join(overlap)}, which the item touches"
+        out.append(f"{it.get('id')}: oracle asserts `{text}` is clean over {scope} — the "
+                   "build runs the oracle on the staged, uncommitted candidate, so the check "
+                   "cannot pass if the item changes any path it covers. To prove regenerated "
+                   "files are unchanged, `git diff --exit-code -- <paths>` (worktree against "
+                   "index) passes on a staged tree; it cannot see a staged new file, so do not "
+                   "swap it in for a leak guard: scope the status away from the item's paths, "
+                   "or grep its output for the specific file names")
+    return out
+
+
+def precondition_order_warnings(binder: dict) -> list[str]:
+    """Advisory (non-fatal), B1: an item waits on a precondition and reaches, through
+    `depends_on`, another item of this binder that is not carried. Preflight checks the
+    precondition before that item builds, so if that item's change is what makes it true (a
+    deploy, a served tree), it can never hold in this delivery. A warning, not an error: the
+    graph cannot tell whether the dependency is what makes the precondition true."""
+    items = binder.get("work_items", [])
+    graph = {it.get("id"): list(it.get("depends_on", [])) for it in items}
+    carried = set((binder.get("supersedes") or {}).get("carried", []))
+    out: list[str] = []
+    for it in items:
+        upstream = sorted((reachable(it.get("id"), graph) & set(graph)) - carried - {it.get("id")})
+        if not upstream or it.get("id") in carried:
+            continue
+        for ref in it.get("waits_on", []):
+            out.append(f"{it.get('id')}: waits on precondition '{ref}' and depends on "
+                       f"{', '.join(upstream)} in this binder — preflight checks '{ref}' before "
+                       "those items build, so if their change makes it true it can never hold "
+                       "in this delivery. Split the work into two binders joined by `after` "
+                       "(plan:shape test 2, plan:prelanding)")
+    return out
+
+
+_PRECONDITION_WORD = re.compile(r"\bprecondition", re.IGNORECASE)
+
+
+def _contract_text(contract) -> list[str]:
+    """Every string in a contract: the string itself, or an object's keys and values,
+    walked through nested objects and lists."""
+    if isinstance(contract, str):
+        return [contract]
+    if isinstance(contract, dict):
+        return [t for k, v in contract.items() for t in [str(k), *_contract_text(v)]]
+    if isinstance(contract, list):
+        return [t for v in contract for t in _contract_text(v)]
+    return []
+
+
+def undeclared_precondition_warnings(binder: dict) -> list[str]:
+    """Advisory (non-fatal), B2: an item with no `waits_on` whose contract mentions a
+    precondition in prose. Planners already write such waits in contract text, where
+    nothing checks them before a worker runs. A word match, so a warning: it misses a wait
+    written without the word and fires on a contract that only mentions one. A carried
+    item is skipped: the planner cannot edit it."""
+    carried = set((binder.get("supersedes") or {}).get("carried", []))
+    return [f"{it.get('id')}: contract mentions a precondition but the item has no waits_on — "
+            "declare it in `preconditions` so preflight checks it before any worker runs"
+            for it in binder.get("work_items", [])
+            if not it.get("waits_on") and it.get("id") not in carried
+            and any(_PRECONDITION_WORD.search(t) for t in _contract_text(it.get("contract")))]
 
 
 def cross_binder_errors(binders: list[dict],
@@ -898,7 +1108,7 @@ def _run_self_test() -> int:
     multi_view_gate_drops_one = _multi_view_binder(
         "multi-view-gate-drops-one", ["typography", "item-card"])
 
-    # a cyclic depends_on graph still terminates when the coverage walk (_reachable) runs over
+    # a cyclic depends_on graph still terminates when the coverage walk (reachable) runs over
     # it, and the cycle error and the design: error both surface in the same pass.
     cyclic_with_design = {
         "slug": "cyclic-design", "title": "T", "summary": "S", "motivation": "x",
@@ -979,6 +1189,31 @@ def _run_self_test() -> int:
     succ_self = _succ_binder("s-r2", {"slug": "s-r2", "carried": ["a"]})
     succ_dup = _succ_binder("s-r2", {"slug": "s", "carried": ["a", "a"]})
 
+    # declared preconditions: a binder-level list of probes, and an item-level `waits_on`
+    # that names one. Ids are unique and every waits_on id is declared; at most 8 probes.
+    _pc = {"id": "live-evidence", "command": "test -f evidence.json", "reason": "needs live reads"}
+    _pc_plain = [{"id": "a", "title": "A", "summary": "s", "oracle": _u}]
+
+    def _pc_binder(preconditions, items=None):
+        return {"slug": "pc", "title": "T", "summary": "S", "motivation": "x",
+                "scope": {"included": ["x"]}, "preconditions": preconditions,
+                "work_items": items if items is not None else [
+                    {"id": "a", "title": "A", "summary": "s", "oracle": _u,
+                     "waits_on": ["live-evidence"]}]}
+    pc_ok = _pc_binder([_pc])
+    pc_cwd_ok = _pc_binder([_pc | {"cwd": "backend"}])
+    pc_binder_wide = _pc_binder([_pc], _pc_plain)
+    pc_dup = _pc_binder([_pc, _pc])
+    pc_unknown_wait = _pc_binder([_pc], [_pc_plain[0] | {"waits_on": ["ghost"]}])
+    pc_wait_no_list = _pc_binder([], [_pc_plain[0] | {"waits_on": ["live-evidence"]}])
+    pc_extra_key = _pc_binder([_pc | {"timeout": 5}])
+    pc_no_reason = _pc_binder([{"id": "live-evidence", "command": "true"}])
+    pc_empty_command = _pc_binder([_pc | {"command": ""}])
+    pc_bad_id = _pc_binder([_pc | {"id": "Live Evidence"}], _pc_plain)
+    pc_eight = _pc_binder([_pc | {"id": f"p{n}"} for n in range(8)], _pc_plain)
+    pc_nine = _pc_binder([_pc | {"id": f"p{n}"} for n in range(9)], _pc_plain)
+    pc_waits_string = _pc_binder([_pc], [_pc_plain[0] | {"waits_on": "live-evidence"}])
+
     cases = [
         ("valid example", valid, True),
         ("well-formed shared_terms", shared_terms_ok, True),
@@ -1043,6 +1278,19 @@ def _run_self_test() -> int:
         ("successor carried id that is not a work item", succ_dangling, False),
         ("binder superseding its own slug", succ_self, False),
         ("successor carried ids not unique", succ_dup, False),
+        ("precondition an item waits on", pc_ok, True),
+        ("precondition with a cwd", pc_cwd_ok, True),
+        ("binder-wide precondition no item names", pc_binder_wide, True),
+        ("duplicate precondition id", pc_dup, False),
+        ("waits_on names an undeclared precondition", pc_unknown_wait, False),
+        ("waits_on with an empty preconditions list", pc_wait_no_list, False),
+        ("precondition additional property rejected", pc_extra_key, False),
+        ("precondition missing reason", pc_no_reason, False),
+        ("precondition empty command", pc_empty_command, False),
+        ("precondition id bad pattern", pc_bad_id, False),
+        ("eight preconditions", pc_eight, True),
+        ("nine preconditions exceed maxItems", pc_nine, False),
+        ("waits_on that is not an array", pc_waits_string, False),
     ]
     failures = 0
     for name, binder, should_pass in cases:
@@ -1137,6 +1385,127 @@ def _run_self_test() -> int:
           and not validate_binder(bare_assertions))  # advisory: still a valid binder
     print(f"[{'PASS' if ok else 'FAIL'}] assertions with no command and no opt_out warn as "
           f"vacuous: {warns}")
+    failures += 0 if ok else 1
+
+    # clean-status lint (F39) — an oracle that asserts an empty `git status`, or an empty
+    # diff against HEAD or the index, cannot pass for an item that changes a path the check
+    # covers, because the oracle runs on the staged, uncommitted candidate. The cases come
+    # from mc-server-admin's binders: `install-api` (packs-install-backend-r3) is the oracle
+    # that halted; the authelia secret-file guard and the `frontend/src/api` status in
+    # packs-upload-code and packs-install-screens-r2 are working checks a first version of
+    # this lint flagged (review S1), so they are pinned quiet here.
+    def _st_binder(command, touches=("frontend/src/api/generated/packs/", "backend/app.py")):
+        b = _cmd_binder(command)
+        if touches is not None:
+            b["work_items"][0]["touches"] = list(touches)
+        return b
+    never_clean = [
+        'npm --prefix frontend run generate:api && git diff --exit-code -- frontend/src/api'
+        ' && test -z "$(git status --porcelain -- frontend/src/api)" && echo OK',
+        '[ -z "$(git status --short)" ]',
+        '[[ -z $(git status -s) ]]',
+        'test -z "$(git -C frontend status --porcelain=v1)"',
+        'git status --porcelain=v2 | wc -l | grep -qx 0',
+        '! git status --porcelain | grep -q .',
+        'test -z "`git status --porcelain`"',
+        'test -z "$(cd frontend && git status --porcelain)"',
+        'git status -sb | grep -q . && exit 1',
+        # matcher variants (review M1)
+        'test -z "$(git status --porcelain=1)"',
+        'git status -z | wc -c | grep -qx 0',
+        'test -z "$(git --no-pager status --porcelain)"',
+        'test -z "$(git -c core.quotepath=off status -s)"',
+        'test -z "$(git -C "a dir" status --porcelain)"',
+        'git status | grep -q "nothing to commit"',
+        "git status | grep -q 'working tree clean'",
+        'git status --porcelain > s.txt && test ! -s s.txt',
+        'diff <(git status --porcelain) /dev/null',
+        "test $(git status --porcelain | grep -v '^??' | wc -l) -eq 0",
+        'test -z "$(git -C backend status --porcelain -- app.py)"',
+        # a diff against HEAD or the index fails on the item's own staged change (review S5)
+        'git diff --exit-code HEAD',
+        'git diff --quiet HEAD',
+        'git diff --cached --exit-code',
+        'git diff-index --quiet HEAD',
+        'git diff --staged --quiet -- backend/app.py',
+        'test -z "$(git diff --name-only HEAD)"',
+    ]
+    status_ok = ['git diff --exit-code -- frontend/src/api', 'pytest -q && git status --short',
+                 "grep -q 'git status --porcelain' notes.md", 'test -z "$(git status)"',
+                 'git status --porcelain-ish | wc -l',
+                 # a pathspec outside the item's touches (packs-upload-code, packs-screens)
+                 'git diff --exit-code -- frontend/src/api && test -z "$(git status --porcelain'
+                 ' -- frontend/src/types)"',
+                 'git diff --exit-code HEAD -- docs/other.md',
+                 # a targeted grep over the status output: a secret-file guard (authelia)
+                 "! git status --porcelain --untracked-files=all | grep -qE "
+                 "'configuration\\.ya?ml|authelia-config|authelia-secrets'",
+                 "test \"$(git status --porcelain | grep -c '^??')\" -eq 0",
+                 'git status --porcelain >/dev/null', 'git diff --stat HEAD',
+                 "git diff --cached --name-only | grep -qE '\\.env$' && exit 1"]
+    st_fired = [c for c in never_clean
+                if len(clean_status_oracle_warnings(_st_binder(c))) == 1
+                and "staged" in clean_status_oracle_warnings(_st_binder(c))[0]
+                and "leak guard" in clean_status_oracle_warnings(_st_binder(c))[0]]
+    st_quiet = [c for c in status_ok if clean_status_oracle_warnings(_st_binder(c)) == []]
+    # A pathspec on an item that declares no touches cannot be shown disjoint, so it warns.
+    no_touches = clean_status_oracle_warnings(
+        _st_binder('test -z "$(git status --porcelain -- frontend/src/types)"', touches=None))
+    ok = (st_fired == never_clean and st_quiet == status_ok
+          and len(no_touches) == 1 and "no touches" in no_touches[0]
+          and not validate_binder(_st_binder(never_clean[0])))  # advisory: still valid
+    print(f"[{'PASS' if ok else 'FAIL'}] clean git-status oracle warning fires on "
+          f"{len(st_fired)}/{len(never_clean)} (missed "
+          f"{[c for c in never_clean if c not in st_fired]}) and stays silent on "
+          f"{len(st_quiet)}/{len(status_ok)} (fired on "
+          f"{[c for c in status_ok if c not in st_quiet]}); no-touches: {no_touches}")
+    failures += 0 if ok else 1
+
+    # B1 — an item waits on a precondition and depends_on another item of the same binder,
+    # so the probe runs at preflight before that item builds (packs-install-drill-r4: the
+    # record item waits on live evidence and depends on the tools item that serves it).
+    # Transitive edges count; a carried item was built in an earlier delivery and is quiet,
+    # as is a binder-wide precondition no item names.
+    def _b1_item(iid, **extra):
+        return {"id": iid, "title": iid, "summary": "s", "oracle": _u} | extra
+    b1 = _pc_binder([_pc], [_b1_item("tools"), _b1_item(
+        "record", waits_on=["live-evidence"], depends_on=["tools"])])
+    b1_deep = _pc_binder([_pc], [_b1_item("tools"), _b1_item("mid", depends_on=["tools"]),
+                                 _b1_item("record", waits_on=["live-evidence"],
+                                          depends_on=["mid"])])
+    b1_carried = json.loads(json.dumps(b1)) | {"supersedes": {"slug": "pc-r1",
+                                                              "carried": ["tools"]}}
+    b1_wide = _pc_binder([_pc], [_b1_item("tools"), _b1_item("record", depends_on=["tools"])])
+    w1, w1_deep = precondition_order_warnings(b1), precondition_order_warnings(b1_deep)
+    ok = (len(w1) == 1 and all(s in w1[0] for s in ("record", "live-evidence", "tools", "after"))
+          and len(w1_deep) == 1 and "mid" in w1_deep[0] and "tools" in w1_deep[0]
+          and precondition_order_warnings(b1_carried) == []
+          and precondition_order_warnings(b1_wide) == []
+          and precondition_order_warnings(pc_ok) == []
+          and not validate_binder(b1) and not validate_binder(b1_carried))  # advisory
+    print(f"[{'PASS' if ok else 'FAIL'}] precondition-before-dependency warning (B1): "
+          f"{w1} {w1_deep}")
+    failures += 0 if ok else 1
+
+    # B2 — a contract that names a precondition in prose, on an item with no `waits_on`. The
+    # three shapes are the msa contracts the design cites: a string, an object key
+    # (`install-job`) and a value inside a nested object.
+    def _b2(contract, **extra):
+        return _pc_binder([_pc], [_b1_item("a", contract=contract, **extra)])
+    b2_fire = [_b2("Precondition: window-1 reads exist before the drill"),
+               _b2({"precondition": "the C.4 owner answer is recorded"}),
+               _b2({"windows": {"notes": ["No-push window (precondition, 23 h)"]}})]
+    b2_quiet = [_b2("Precondition: window-1 reads exist", waits_on=["live-evidence"]),
+                _b2("no prerequisites"), _b2("a nonprecondition word"), _b2(None),
+                _pc_binder([_pc], [_b1_item("a", summary="precondition in the summary")]),
+                {**_b2("Precondition: a carried item"), "supersedes": {"slug": "p", "carried": ["a"]}}]
+    b2_warns = [undeclared_precondition_warnings(b) for b in b2_fire]
+    ok = (all(len(w) == 1 and "declare it in `preconditions`" in w[0] for w in b2_warns)
+          and all(undeclared_precondition_warnings(b) == [] for b in b2_quiet)
+          and not any(validate_binder(b) for b in b2_fire))  # advisory
+    print(f"[{'PASS' if ok else 'FAIL'}] undeclared-precondition warning (B2) fires on "
+          f"{sum(len(w) for w in b2_warns)}/{len(b2_fire)}, quiet on "
+          f"{sum(not undeclared_precondition_warnings(b) for b in b2_quiet)}/{len(b2_quiet)}")
     failures += 0 if ok else 1
 
     # waiver summary: one line per waiver stating reason + covered_by, one line per covering
@@ -1243,7 +1612,7 @@ def _run_self_test() -> int:
           f"and the same gate covering a real id is valid")
     failures += 0 if ok else 1
 
-    print(f"\n{len(cases) + 12 + len(cb_cases) - failures}/{len(cases) + 12 + len(cb_cases)} checks passed")
+    print(f"\n{len(cases) + 14 + len(cb_cases) - failures}/{len(cases) + 14 + len(cb_cases)} checks passed")
     return 1 if failures else 0
 
 
@@ -1286,6 +1655,12 @@ def main() -> int:
     for w in shared_terms_warnings(binder):
         print(f"  warning: {w}")
     for w in vacuous_oracle_warnings(binder):
+        print(f"  warning: {w}")
+    for w in clean_status_oracle_warnings(binder):
+        print(f"  warning: {w}")
+    for w in precondition_order_warnings(binder):
+        print(f"  warning: {w}")
+    for w in undeclared_precondition_warnings(binder):
         print(f"  warning: {w}")
     for w in design_source_advisory(binder):
         print(f"  warning: {w}")

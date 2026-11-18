@@ -773,8 +773,11 @@ export class HatchVerificationRunner {
         oracleAssertions: oracleAssertions(itemOracle),
       });
     } catch (error) {
+      if (ctx.signal?.aborted) throw new Error("Hatch visual gate was cancelled", { cause: error });
       return { status: "blocked", blockedReason: "visual-gate-error", remediation: `Cause: ${faultLine(error)}` };
     }
+    // A cancelled run's gate fails like a broken one; it is a cancel, not an item halt (F40).
+    if (ctx.signal?.aborted) throw new Error("Hatch visual gate was cancelled");
     if (outcome.status === "vision-unsupported") {
       return { status: "blocked", blockedReason: "visual-no-vision-model", remediation: outcome.remediation };
     }

@@ -153,6 +153,8 @@ interface BinderCardFacts {
   after: string[];
   sme: string[];
   workItems: Record<string, unknown>[];
+  // The predecessor's slug when this binder is a successor (quick repair).
+  supersedes?: string;
 }
 
 function headFileReader(root: string): ReadTreeFile {
@@ -248,6 +250,7 @@ function cardFacts(slug: string, raw: string): BinderCardFacts {
   const sme = Array.isArray(document.sme)
     ? document.sme.filter((value): value is string => typeof value === "string")
     : [];
+  const supersedes = (document.supersedes ?? {}) as Record<string, unknown>;
   const items = workItems.filter(
     (value): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value),
   );
@@ -259,6 +262,7 @@ function cardFacts(slug: string, raw: string): BinderCardFacts {
     after,
     sme,
     workItems: items,
+    ...(typeof supersedes.slug === "string" ? { supersedes: supersedes.slug } : {}),
   };
 }
 
@@ -304,6 +308,7 @@ function buildCard(
   validation: string,
   provenance: string,
   executionRequired: Record<string, number>,
+  inputChecks: string[],
   environment?: string,
 ): string {
   const set = facts.length > 1;
@@ -343,6 +348,7 @@ function buildCard(
         strictnessRows(set ? `${binder.slug}/${item.id}` : String(item.id), item, executionRequired),
       ),
     ),
+    ...inputChecks.flatMap((block) => ["", block]),
   );
   return lines.join("\n");
 }
@@ -460,9 +466,13 @@ export class HatchPlanRunner {
     // The bytes that validated are the bytes that must commit, so each binder is hashed across
     // its own validation and the hash is re-checked before the commit is created.
     const validated = new Map<string, string>();
+    const facts: BinderCardFacts[] = [];
+    const changeSummaries: string[] = [];
+    const inputChecks: string[] = [];
     for (const [index, slug] of slugs.entries()) {
       const path = paths[index];
-      const before = sha256(await readFile(join(root, path)));
+      const bytes = await readFile(join(root, path));
+      const before = sha256(bytes);
       const validation = await this.#script(ctx, "validateBinder", ["--binder", path]);
       runs.push(validation);
       if (validation.code !== 0) {
@@ -473,6 +483,27 @@ export class HatchPlanRunner {
       if (terms.code !== 0) {
         throw new Error(`Hatch binder '${slug}' failed its shared-term check:\n${output(terms)}`);
       }
+      const binderFacts = cardFacts(slug, bytes.toString("utf8"));
+      facts.push(binderFacts);
+      // A successor's card leads with what changed against its predecessor, made by the same
+      // script that builds a successor, on these bytes. One that cannot be made is shown and
+      // blocks nothing: the validator above is the gate.
+      if (binderFacts.supersedes) {
+        const change = await this.#script(ctx, "makeSuccessor", ["--summary", path, "--repo", root]);
+        runs.push(change);
+        changeSummaries.push(
+          change.code === 0
+            ? output(change)
+            : `Change summary for '${slug}' could not be made (exit ${change.code}):\n${output(change)}`,
+        );
+      }
+      // What the binder needs to start, checked statically; it runs nothing the binder wrote
+      // and, like the change summary, a check that cannot run is shown and blocks nothing.
+      const inputs = await this.#script(ctx, "checkPlanInputs", ["--binder", path, "--shell", "login", "--format", "text"]);
+      runs.push(inputs);
+      inputChecks.push(
+        inputs.code === 0 ? output(inputs) : `Input check for '${slug}' could not run (exit ${inputs.code}):\n${output(inputs)}`,
+      );
       if (sha256(await readFile(join(root, path))) !== before) {
         throw new Error(`Hatch binder '${slug}' changed while it was being validated; re-run the commit`);
       }
@@ -503,13 +534,9 @@ export class HatchPlanRunner {
       );
     }
 
-    const facts: BinderCardFacts[] = [];
-    for (const [index, slug] of slugs.entries()) {
-      facts.push(cardFacts(slug, await readFile(join(root, paths[index]), "utf8")));
-    }
     const sme = [...new Set(facts.flatMap((binder) => binder.sme))];
     const environmentLine = await environmentCardLine(root, facts);
-    const card = `${buildCard(facts, sme, escapeBlocks.join("\n\n"), output(provenance), executionRequired, environmentLine)}\n\n${
+    const card = `${changeSummaries.map((summary) => `${summary}\n\n`).join("")}${buildCard(facts, sme, escapeBlocks.join("\n\n"), output(provenance), executionRequired, inputChecks, environmentLine)}\n\n${
       roundtable.required.length
         ? `Review record staged: ${roundtable.required.join(", ")}`
         : "Review record: this repository's roundtable settings require none for a plan commit."

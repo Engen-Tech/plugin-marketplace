@@ -254,7 +254,11 @@ def _watch_line(cwd: str) -> str | None:
         d = str(script.resolve().parent)
         if d not in sys.path:
             sys.path.insert(0, d)
-        import hatch_next
+        dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+        try:  # no __pycache__ in the installed plugin's git clone
+            import hatch_next
+        finally:
+            sys.dont_write_bytecode = dwb
         return hatch_next.watch_line(cwd, banner=True, retries=2)
     except Exception:
         return None
@@ -637,6 +641,12 @@ def _reap_store_children(store: str, deadline: float = 10.0) -> None:
 
 def _run_self_test() -> int:
     import tempfile
+    # Mirrored trees (.codex-plugin/, plugins/hatch/, skills/) must stay
+    # byte-clean: the projection checker walks the disk, and a __pycache__
+    # dropped by an import mid-oracle reads as drift on a fresh checkout.
+    # Suppress bytecode for this process and for every child it spawns.
+    sys.dont_write_bytecode = True
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     # Keep every subprocess this test spawns — and the ensure children those
     # fire — off the real per-user watch store. Every temp dir here tolerates a
     # failed cleanup: on Windows a child this test spawned can still hold a handle

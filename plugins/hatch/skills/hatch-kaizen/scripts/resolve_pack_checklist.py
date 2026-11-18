@@ -41,8 +41,11 @@ from pathlib import Path
 
 # cwd-independent sibling import (no __init__.py in this scripts/ dir). validate_packs.py
 # is import-safe, so importing it never runs the validator.
+# The import writes no bytecode: an installed plugin is a git clone that a __pycache__ dirties.
 import os, sys  # noqa: E401 — keep the pinned one-liner intact
+_dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import validate_packs
+sys.dont_write_bytecode = _dwb
 
 
 class ResolveError(Exception):

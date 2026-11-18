@@ -157,7 +157,16 @@ def derive_state(binders: list[dict], git_facts: dict,
     # delivered one. Its carried items were delivered by the predecessor, or by a
     # binder it carried them from, so their evidence is that binder's done refs
     # under the same provenance rules; a live predecessor with a live successor
-    # is not open work.
+    # is not open work. A binder off the live set answers with the supersedes
+    # gather_git_facts read from its integration tip, and a step is taken only
+    # where that earlier binder's tip is on the later one's (`pred_on_tip`; absent
+    # in the pure form, read as on), as deliver_preflight requires.
+    def sup_of(s: str) -> tuple[str, list[str]] | None:
+        if s in by_slug:
+            return _supersedes(by_slug[s])
+        v = gfb.get(s, {}).get("supersedes")
+        return (v[0], v[1]) if v else None
+
     superseded_by: dict[str, str] = {}
     for slug, b in by_slug.items():
         sup = _supersedes(b)
@@ -177,11 +186,16 @@ def derive_state(binders: list[dict], git_facts: dict,
             pred, carried = sup
             pitems = trusted_items(pred, carried, warn=False)
             for iid in carried:
-                pi, owner, hop, seen = pitems.get(iid, {}), pred, by_slug.get(pred), {slug, pred}
+                pi, owner, seen, why = pitems.get(iid, {}), pred, {slug, pred}, ""
                 # The predecessor carried it too: the binder that delivered it holds the ref.
                 while (not gfb.get(owner, {}).get("items", {}).get(iid, {}).get("done")
-                       and (s := hop and _supersedes(hop)) and iid in s[1] and s[0] not in seen):
-                    owner, hop = s[0], by_slug.get(s[0])
+                       and (s := sup_of(owner)) and iid in s[1] and s[0] not in seen
+                       and len(seen) <= 16):
+                    if gfb.get(owner, {}).get("pred_on_tip", True) is not True:
+                        why = (f"'{owner}' carried it from '{s[0]}', and hatch/{s[0]}/integration "
+                               f"is missing, not on hatch/{owner}/integration, or unreadable")
+                        break
+                    owner = s[0]
                     seen.add(owner)
                     pi = trusted_items(owner, [iid], warn=False).get(iid, {})
                 if iid in item_ids and pi.get("done"):
@@ -191,9 +205,11 @@ def derive_state(binders: list[dict], git_facts: dict,
                     carried_from[iid] = owner
                 elif iid in item_ids:
                     warnings.append(
-                        f"binder '{slug}' item '{iid}' is carried from '{pred}', but '{owner}' "
-                        f"has no trusted done ref for it — hatch-deliver {slug} "
-                        f"halts at preflight until it does")
+                        f"binder '{slug}' item '{iid}' is carried from '{pred}', but "
+                        + (why or f"'{owner}'" + (" (followed through supersedes)"
+                                                  if owner != pred else "")
+                           + " has no trusted done ref for it")
+                        + f" — hatch-deliver {slug} halts at preflight on it")
         gb = {**gb, "items": gitems}
         status = _binder_status(item_ids, gb, frozenset(carried_from))
         status_by_slug[slug] = status
@@ -530,7 +546,11 @@ def _load_watch():
         d = str(Path(__file__).resolve().parent)
         if d not in sys.path:
             sys.path.insert(0, d)
-        import serve_status
+        dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+        try:  # no __pycache__ in the installed plugin's git clone
+            import serve_status
+        finally:
+            sys.dont_write_bytecode = dwb
         return serve_status
     except Exception:
         return None
@@ -887,6 +907,9 @@ def gather_git_facts(binders: list[dict], default_branch: str, runner=None) -> d
       3. the refs/hatch/ subset reachable from default_branch — replacing the
          old per-done-item `merge-base --is-ancestor` exit-code probe; git
          peels annotated tags here exactly as merge-base does
+    A successor's supersedes chain adds calls on top, per step it follows: one
+    `merge-base`, and for a binder off the live set one or two `git show` reads
+    of its committed plan.
     `runner` is the injection seam: a stand-in for subprocess.run, used to
     count calls (the call-count check) or fail one of the three on purpose
     (the resilience check). Any one query failing degrades only the facts it
@@ -912,14 +935,70 @@ def gather_git_facts(binders: list[dict], default_branch: str, runner=None) -> d
     merged_set = set(merged) if merged_ok else None
 
     facts = {"default_branch": default_branch, "binders": {}}
-    # a successor's carried items are proven by its predecessor's refs; gather
-    # them too when the predecessor is no longer a live binder
-    live = {b.get("slug") for b in binders}
+    # A successor's carried items are proven by the binder that delivered them: the
+    # predecessor, or a binder it carried them from, followed through each binder's
+    # supersedes as deliver_preflight's check_supersedes does. A binder that is not
+    # live is read from its integration tip (live or archive path) and its refs for
+    # those items are gathered too. Each step records whether the earlier binder's
+    # integration tip is an ancestor of the later one's: one git call per step.
+    run = runner or subprocess.run
+    live = {b.get("slug"): b for b in binders}
+    chain: dict[str, dict] = {}
     extra: dict[str, set[str]] = {}
+
+    def git(*args: str):
+        try:  # a committed plan that is not UTF-8 reads as unreadable, never raises
+            return run(["git", *args], capture_output=True, text=True, encoding="utf-8")
+        except (OSError, ValueError):
+            return None
+
+    def sup_of(slug: str) -> tuple[str, list[str]] | None:
+        if slug in live:
+            return _supersedes(live[slug])
+        if "supersedes" not in chain.setdefault(slug, {}):
+            sup = None
+            if branch_set and f"refs/heads/hatch/{slug}/integration" in branch_set:
+                for rel in (f".hatch/binders/{slug}.json", f".hatch/binders/archive/{slug}.json"):
+                    p = git("show", f"refs/heads/hatch/{slug}/integration:{rel}")
+                    if p is not None and p.returncode == 0:
+                        try:
+                            doc = json.loads(p.stdout)
+                        except json.JSONDecodeError:
+                            doc = None
+                        sup = _supersedes(doc) if isinstance(doc, dict) else None
+                        break
+            chain[slug]["supersedes"] = list(sup) if sup else None
+        v = chain[slug]["supersedes"]
+        return (v[0], v[1]) if v else None
+
+    def on_tip(earlier: str, later: str) -> bool | None:
+        if branch_set is None:
+            return None
+        refs = [f"refs/heads/hatch/{s}/integration" for s in (earlier, later)]
+        if not all(r in branch_set for r in refs):
+            return False
+        p = git("merge-base", "--is-ancestor", *refs)
+        return None if p is None or p.returncode not in (0, 1) else p.returncode == 0
+
     for b in binders:
         sup = _supersedes(b)
-        if sup and sup[0] not in live:
-            extra.setdefault(sup[0], set()).update(sup[1])
+        if not sup or sup[0] == b.get("slug"):
+            continue
+        hop, ids, seen = sup[0], set(sup[1]), {b.get("slug"), sup[0]}
+        while ids:
+            if hop not in live:
+                extra.setdefault(hop, set()).update(ids)
+            s = sup_of(hop)
+            nxt = ids & set(s[1]) if s else set()
+            if not nxt or s[0] in seen or len(seen) > 16:
+                break
+            facts_hop = chain.setdefault(hop, {})
+            if "pred_on_tip" not in facts_hop:
+                facts_hop["pred_on_tip"] = on_tip(s[0], hop)
+            if facts_hop["pred_on_tip"] is not True:
+                break
+            hop, ids = s[0], nxt
+            seen.add(hop)
     binders = list(binders) + [{"slug": p, "work_items": [{"id": i} for i in sorted(ids)]}
                                for p, ids in sorted(extra.items())]
     for b in binders:
@@ -948,7 +1027,8 @@ def gather_git_facts(binders: list[dict], default_branch: str, runner=None) -> d
                 "branch": (None if branch_set is None else
                           f"refs/heads/hatch/{slug}/item-{i}" in branch_set),
             }
-        facts["binders"][slug] = {"integration_exists": integration, "items": items}
+        facts["binders"][slug] = {"integration_exists": integration, "items": items,
+                                  **chain.get(slug, {})}
     return facts
 
 
@@ -977,7 +1057,8 @@ def _load_provenance():
     sibling skill is not installed beside this one."""
     global _PROVENANCE_MODULE
     if _PROVENANCE_MODULE is None:
-        try:
+        dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+        try:  # no __pycache__ in the installed plugin's git clone
             import importlib.util
             spec = importlib.util.spec_from_file_location(
                 "hatch_item_provenance", PROVENANCE_SCRIPT)
@@ -986,6 +1067,8 @@ def _load_provenance():
             _PROVENANCE_MODULE = mod
         except Exception:                                      # noqa: BLE001
             _PROVENANCE_MODULE = False
+        finally:
+            sys.dont_write_bytecode = dwb
     return _PROVENANCE_MODULE or None
 
 
@@ -1437,11 +1520,11 @@ def gather_recovery_facts(binders: list[dict], git_facts: dict, default_branch: 
 
     # provenance of every done ref the facts report
     gfb = git_facts.get("binders", {})
+    # every binder the facts cover: the live ones, and each binder a successor's
+    # supersedes chain reached for its carried items
     checked = {slug: set(ids) for slug, ids in live.items()}
-    for b in binders:
-        sup = _supersedes(b)
-        if sup and sup[0] != b["slug"]:
-            checked.setdefault(sup[0], set()).update(sup[1])
+    for slug, gb in gfb.items():
+        checked.setdefault(slug, set()).update(gb.get("items", {}))
     done_items = [(slug, iid) for slug, ids in checked.items() for iid in sorted(ids)
                   if gfb.get(slug, {}).get("items", {}).get(iid, {}).get("done")
                   and f"refs/hatch/{slug}/item-{iid}/done" in refs]
@@ -2621,6 +2704,7 @@ def _watch_self_test_checks() -> list[tuple[str, bool]]:
         cold_repo = sd / "cold"
         (cold_repo / ".git").mkdir(parents=True)
         code = ("import json, sys\n"
+                "sys.dont_write_bytecode = True\n"
                 "sys.path.insert(0, sys.argv[1])\n"
                 "import hatch_next\n"
                 "line = hatch_next.watch_line(sys.argv[2])\n"
@@ -2801,6 +2885,7 @@ def _watch_self_test_checks() -> list[tuple[str, bool]]:
     checks.append(("--watch: the opt-in line is plain ASCII",
                    WATCH_NOT_OPTED.isascii()))
     code = ("import sys\n"
+            "sys.dont_write_bytecode = True\n"
             "sys.path.insert(0, sys.argv[1])\n"
             "import hatch_next\n"
             "hatch_next._print_line(hatch_next.WATCH_BANNER.format("

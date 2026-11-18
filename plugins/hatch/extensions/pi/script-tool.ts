@@ -11,6 +11,7 @@ import { PACKAGE_ROOT } from "./package-paths.ts";
 import { resolveHatchScript } from "./script-catalog.ts";
 
 const PathValue = Type.String({ minLength: 1, maxLength: 4096 });
+const Slug = Type.String({ pattern: "^[a-z0-9][a-z0-9-]*$", maxLength: 200 });
 export const ScriptParameters = ActionUnion([
   Type.Object({ action: Type.Literal("detectStack"), root: Type.Optional(PathValue) }, { additionalProperties: false }),
   Type.Object(
@@ -65,6 +66,10 @@ export const ScriptParameters = ActionUnion([
       capture: PathValue,
       out: Type.Optional(PathValue),
     },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    { action: Type.Literal("makeSuccessor"), predecessor: Slug, changes: Type.Optional(PathValue), slug: Type.Optional(Slug) },
     { additionalProperties: false },
   ),
   Type.Object({ action: Type.Literal("serveDesignSelfTest") }, { additionalProperties: false }),
@@ -234,6 +239,12 @@ export function buildScriptInvocation(params: HatchScriptParameters, cwd: string
       const args = ["--capture", projectPath(cwd, params.capture, { mustExist: true })];
       if (params.out) args.push("--out", projectPath(cwd, params.out));
       return { ...base, script: resolveHatchScript("diffCapture"), args };
+    }
+    case "makeSuccessor": {
+      const args = ["--predecessor", params.predecessor, "--repo", cwd];
+      if (params.changes) args.push("--changes", projectPath(cwd, params.changes, { mustExist: true }));
+      if (params.slug) args.push("--slug", params.slug);
+      return { ...base, script: resolveHatchScript("makeSuccessor"), args };
     }
     case "serveDesignSelfTest":
       return { ...base, script: resolveHatchScript("serveDesign"), args: ["--self-test"] };

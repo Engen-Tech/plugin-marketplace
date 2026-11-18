@@ -35,6 +35,7 @@ When emitting a set, hatch-plan stores the cross-binder dependency as an `after`
 | `runtime_contract.runtimes[].version` | string | yes (in entry) | Required version or range, e.g. `24.15`, `3.13`, `>=24.15.0` |
 | `runtime_contract.runtimes[].manager` | string | no | Version manager that pins it, e.g. `nvm`, `mise`, `asdf`, `volta`, `pyenv` |
 | `runtime_contract.on_unavailable` | `halt` | no | Policy when the active runtime does not satisfy the declaration; the only value is `halt` |
+| `preconditions` | object[] | no | Outside state the delivery needs before any worker runs: `{id, command, reason, cwd?}`, at most 8, ids unique (see Preconditions) |
 | `work_items` | WorkItem[] | yes | Ordered list of work items (at least one) |
 
 ## The runtime contract
@@ -91,6 +92,18 @@ a listed item has an empty `touches` — the deliver-time check would then have 
 that item. These are structural checks only; the byte-identity enforcement over real file contents
 is `check_shared_terms.py`'s job on the assembled tree, not the validator's.
 
+## Preconditions
+
+A precondition is outside state the work needs and cannot make for itself: an owner's answer in a file, a deadline that has not passed, live evidence already recorded. Declare it once at the top level and name it in each item's `waits_on`; one that no item names covers the whole binder.
+
+```json
+"preconditions": [{"id": "owner-answer", "command": "test -s docs/answers/c4.md", "reason": "C.4 needs the owner's answer"}]
+```
+
+`command` is a cheap probe, not a test suite. Delivery preflight (`check_plan_inputs.py --slug <slug> --base <ref>`) reads the committed binder at the base and runs each precondition that a not-done item waits on, or that no item names, once in a throwaway worktree of the base with no installed dependencies: 30 s, `CI=1`, stdin closed, `GIT_*` removed, `cwd` relative to the worktree. With no item left to build, none runs. Exit 0 holds. Any other exit stops the whole run before any build, as `precondition-unmet`, or as `precondition-cannot-run` for exit 126, 127 or 9009, a timeout, a shell that cannot start or a missing `cwd`. A probe of a repository path sees only the bytes committed at the base; on a resume that is the integration branch, so an answer committed to the default branch after it was cut is not there. On a successor's first run the base is the predecessor's integration tip with the default branch merged in, the tree the run builds from, and a merge that conflicts stops the run as `precondition-cannot-run`. Plan mode (`--binder <path>`) only prints each command. On Pi, `deliverBinder` runs the check and `buildItem` does not. `validate_binder.py` rejects a duplicate id and an undeclared `waits_on` id, and warns on two shapes: an item that waits on a precondition and depends on another item of the same binder (if that item's change makes it true, it can never hold in this delivery; split with `after`), and an item with no `waits_on` whose contract says "precondition" (a carried item is skipped).
+
+Both modes also read each oracle and `env_contract` command statically for a tool the route's shell cannot find (`tool-missing`), or a path or `cwd` that is not at the base and not under the `touches` of the item or an item it depends on (`path-missing`, `cwd-missing`). These findings only warn and never stop delivery: a static reader of shell cannot be complete. It stops reading at a comment, a heredoc, a subshell or function body, control flow or a `command -v` guard, and it skips a path git ignores or one under a top directory the base does not have (`.venv/`, `node_modules/`, a build output). With no `touches` declared, a path finding says it cannot tell whether the item makes the path.
+
 ## Per-work-item fields
 
 | Field | Type | Required | Meaning |
@@ -100,6 +113,7 @@ is `check_shared_terms.py`'s job on the assembled tree, not the validator's.
 | `summary` | string | yes | Plain-language goal, one sentence: what this item does |
 | `estimate` | `S` \| `M` \| `L` | no | Size estimate |
 | `depends_on` | string[] | no | IDs of items that must land before this one starts |
+| `waits_on` | string[] | no | Ids of binder `preconditions` this item needs; each must be declared. Delivery preflight runs them before any worker (see Preconditions) |
 | `design_reference` | string | no | The app route (path and query) the item renders, with an optional `#fragment` that selects the design state and goes to the design page only; or the literal `none`. Non-empty (`minLength: 1`). Naming a real view requires either a `visual` oracle or a `visual_check_waiver`; `none` is matched byte for byte, so `None` and `NONE` read as view names, not the sentinel |
 | `covers` | string[] | no | IDs of the work items whose design claim this item's visual gate checks. A `visual_check_waiver` naming this item is only accepted when the waived item's ID appears here, so coverage is agreed at both ends rather than claimed by the item that benefits from it |
 | `visual_check_waiver` | object | no | Records that this item names a design view another item opens for it. `reason` and `covered_by` are both required and non-empty. `validate_binder.py` holds the `covered_by` item to six conditions, each its own error: it resolves to a real work item; its oracle `type` is `visual`; its own `design_reference` names a real view (a gate hatch-build would skip covers nothing); it depends on the waived item directly or through the chain (a covering gate runs after the work it covers); its oracle carries a non-empty `assertions` list; and it lists this item in its own `covers`. The two `design_reference` values are never compared, so one gate covers several differently-named views as long as it names the items. A waiver on an item that names no view, or that already has a visual oracle, is rejected for doing no work |
@@ -186,6 +200,13 @@ Do **not** add a root `package.json`, a `bin/` wrapper, or a hand-assembled `PAT
 When the project declares a runtime floor (see The runtime contract), a command may also route through the repo's own version manager — e.g. `mise exec -- <command>` — so the declared runtime is the one that resolves.
 
 **On Pi, merge checks run in a fresh worktree.** At merge time the Pi host reruns every floor and oracle command in a fresh worktree that holds no gitignored directory — no `node_modules`, no `.venv` — and provisions it only by the `setup` in `.hatch/environment.json` on the integration ref. So when any command needs installed packages (`npm test`, `npx tsc`, `poetry run pytest`), the project needs that file with a `setup` such as `npm ci`. The project commits it by its own commit, never inside the plan commit: a plan commit is the binder plus its review record and nothing else. Claude Code and Codex do not read this file.
+
+**At build time the oracle sees the item's change staged on an older commit.** When an item is built, its oracle runs on the item's changes staged with `git add -A` and not yet committed. On Pi the build finalizer stages the item worktree itself, and the parity probe and the proposed merge (`integrate`) run in a fresh worktree whose `HEAD` is the item's `HEAD` or the integration base, with the candidate or merged tree staged on top, so `git status` is not empty there either. On Claude Code and Codex the build skill stages the item before every floor and oracle run (`build:floor`). Only Claude Code and Codex merge re-validation, and Pi's recovery and post-merge sites, see a committed tree. An oracle must pass in both states. So:
+
+- Do not assert a clean `git status` over paths the item changes. `test -z "$(git status --porcelain -- <paths>)"`, `test "$(git status --short | wc -l)" -eq 0` and the like list every staged change against `HEAD`, so they cannot pass at build time and the item stops at its oracle. A status over paths the item does not change, or a grep of the status output for specific file names (a secret-file guard), still works. `validate_binder.py` warns on the shapes that cannot pass.
+- To prove that regenerated files match what the item commits, run the generator and then `git diff --exit-code -- <paths>`. It compares the worktree with the index: after staging they match unless the generator wrote something different. It cannot see a staged new file, so it does not replace a leak guard.
+- Do not use `git diff --exit-code HEAD`, `git diff --quiet HEAD` or `git diff --cached --exit-code` over the item's paths either. They compare with the last commit, so they fail on the item's own staged change. `validate_binder.py` warns on these too.
+- Prefer a check that leaves the tree as it found it. A command that rewrites tracked files changes the candidate: `run_oracle.py` reports `tree_changed` and the worker stages and reruns; the Pi host stages and reruns up to a fixed cap (three passes today) and halts `non-converging` only if the tree never settles, while the parity probe runs once and halts on any change; merge re-validation reports `dirty-after-oracle` if the merged tree moves.
 
 ## Optional and nullable fields
 

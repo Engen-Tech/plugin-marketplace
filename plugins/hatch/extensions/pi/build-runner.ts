@@ -7,11 +7,11 @@ import { HatchBuildFinalizer, type HatchBuildFinalizationResult } from "./build-
 import type { HatchCheckPlanEntry } from "./check-convergence.ts";
 import type { DispatchLockLease, DispatchLockManager } from "./dispatch-lock.ts";
 import { dropFloorCache, lookupFloorCache, recordFloorCache } from "./floor-cache.ts";
-import { itemSpecDigest, readAttempts, recordHostCheck, recordVerification, type HatchGateRole } from "./gate-attempts.ts";
+import { gateFileFor, itemSpecDigest, readAttempts, recordHostCheck, recordVerification, spentConcerns, type HatchGatePhase, type HatchGateRole } from "./gate-attempts.ts";
 import { effectiveGateVerdict, type HatchGateResult } from "./gate-runner.ts";
 import { deriveItemGitState, type HatchItemRecoveryState } from "./git-state.ts";
 import { KICKBACK_BUDGET, type ChildFailure, type ChildOutcome, type KickbackSource } from "./child-outcome.ts";
-import { noHaltRecordStore, type HaltRecordStore } from "./halt-writer.ts";
+import { noHaltRecordStore, updateRefsTransaction, type HaltRecordStore } from "./halt-writer.ts";
 import { haltOfBuild, recordItemHalt, workerFailureReason } from "./item-halt.ts";
 import {
   hatchProvenance,
@@ -85,6 +85,8 @@ export interface HatchBuildItemResult {
    * round spent. One round can carry concerns from more gates than the one it spent.
    */
   capGate?: HatchGateRole;
+  /** With `capGate` on a recovery that was not reviewed again: the phase of the review whose verdict stands. */
+  capPhase?: HatchGatePhase;
   /**
    * Set when the build halted and its halt record could not be kept: why. A `failed` ref
    * was written all the same, alone; any other halt is unchanged. The delivery reports
@@ -586,6 +588,24 @@ export class HatchBuildItemRunner {
         const beforeWorker = await deriveItemGitState(worktree, binder, item);
         const recoverCommitted = beforeWorker.state === "committed-unmarked";
         const recoverMerged = beforeWorker.state === "merged-unmarked";
+        const tree = recoverCommitted || recoverMerged ? await git(repoRoot, ["rev-parse", `refs/heads/${branch}^{tree}`]) : "";
+        // A first recovery round with no findings on files a gate whose attempts are used up
+        // judged with a counted concern would only ask it again (F43, ruling (b)): only Accept
+        // re-judges them. No worker, check or gate runs; `failed` is written at the tip with
+        // its record, ref-last as the finalizer writes it. The files may sit in any item commit.
+        const tip = beforeWorker.itemTip ?? "";
+        const inherited = attempts === 1 && feedback.length === 0 && recoverCommitted ? spentConcerns(persisted, { tree, commits:
+          (await git(repoRoot, ["log", "--format=%H %T", `${integrationRef}..${tip}`])).split("\n").filter((line) => line.endsWith(` ${tree}`)).map((line) => line.split(" ")[0]) },
+        await git(repoRoot, ["rev-parse", "--verify", integrationRef]).catch(() => null)).at(-1) : undefined;
+        if (inherited) {
+          const gate = inherited.role.replace("-gate", "");
+          const result: HatchBuildItemResult = { schema: "hatch-build-item-v1", binder, item, status: "failed", recoveryState: state.state, attempts, worktree, commit: tip, capGate: inherited.role, capPhase: inherited.phase,
+            message: `Item '${item}' was not reviewed again: its tip ${tip.slice(0, 7)} holds the files the ${gate} gate judged with concerns at attempt ${inherited.attempt} of ${persisted[gateFileFor(inherited.role)].cap} ` +
+              `(${inherited.phase}, ${inherited.findings.map((finding) => finding.code).join(", ")}). Those concerns stand, so ${tip.slice(0, 7)} is marked failed. ` +
+              "Commit a fix, choose Send back to the worker once if the prompt offers it, or choose Accept to have these exact files reviewed again as your decision." };
+          await updateRefsTransaction(repoRoot, [`verify refs/heads/${branch} ${tip}`, `create refs/hatch/${binder}/item-${item}/failed ${tip}`, ...await this.#failedHaltLines(repoRoot, trace, () => result)(tip)]);
+          return result;
+        }
         // The first round of a recovery only needs a worker for its floor list, so a stored
         // list for this spec stands in for it, on this item tree or after a hand fix that
         // floor-cache.ts judges still fits it. A round with feedback edits,
@@ -595,7 +615,7 @@ export class HatchBuildItemRunner {
               binder,
               item,
               specDigest,
-              tree: await git(repoRoot, ["rev-parse", `refs/heads/${branch}^{tree}`]),
+              tree,
               // Only a committed recovery can follow a hand fix: a landed tree already merged.
               handFix: recoverCommitted,
             })

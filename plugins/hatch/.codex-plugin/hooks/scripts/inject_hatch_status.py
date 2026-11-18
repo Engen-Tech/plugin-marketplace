@@ -287,7 +287,11 @@ def _watch_line(cwd: str) -> str | None:
         d = str(script.resolve().parent)
         if d not in sys.path:
             sys.path.insert(0, d)
-        import hatch_next
+        dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+        try:  # no __pycache__ in the installed plugin's git clone
+            import hatch_next
+        finally:
+            sys.dont_write_bytecode = dwb
         return hatch_next.watch_line(cwd, banner=True, retries=2)
     except Exception:
         return None

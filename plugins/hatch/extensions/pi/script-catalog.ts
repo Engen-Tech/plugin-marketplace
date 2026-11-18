@@ -6,6 +6,7 @@ export const HATCH_SCRIPT_PATHS = {
   checkGateReport: "skills/hatch-verify/scripts/check_gate_report.py",
   checkItemProvenance: "skills/hatch-deliver/scripts/check_item_provenance.py",
   checkPackProvenance: "skills/hatch-plan/scripts/check_pack_provenance.py",
+  checkPlanInputs: "skills/hatch-plan/scripts/check_plan_inputs.py",
   checkSharedTerms: "skills/hatch-plan/scripts/check_shared_terms.py",
   deliverPreflight: "skills/hatch-deliver/scripts/deliver_preflight.py",
   detectStack: "skills/hatch-plan/scripts/detect_stack.py",
@@ -13,6 +14,7 @@ export const HATCH_SCRIPT_PATHS = {
   haltRecord: "skills/hatch-status/scripts/halt_record.py",
   gateAttempts: "skills/hatch-verify/scripts/gate_attempts.py",
   itemContext: "skills/hatch-build/scripts/item_context.py",
+  makeSuccessor: "skills/hatch-plan/scripts/make_successor.py",
   hatchNext: "skills/hatch-status/scripts/hatch_next.py",
   mergeItem: "skills/hatch-deliver/scripts/merge_item.py",
   mutationSweep: "skills/hatch-build/scripts/mutation_sweep.py",
@@ -21,6 +23,8 @@ export const HATCH_SCRIPT_PATHS = {
   scanSecrets: "skills/hatch-build/scripts/scan_secrets.py",
   serveDesign: "skills/hatch-validate/scripts/serve_design.py",
   serveStatus: "skills/hatch-status/scripts/serve_status.py",
+  // Imported by deliver_preflight.py and item_context.py; no script action runs it.
+  supersedesChain: "skills/hatch-deliver/scripts/supersedes_chain.py",
   validateBinder: "skills/hatch-plan/scripts/validate_binder.py",
   validatePacks: "skills/hatch-kaizen/scripts/validate_packs.py",
 } as const;

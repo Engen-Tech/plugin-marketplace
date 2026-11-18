@@ -448,7 +448,7 @@ export class HatchIntegrationRunner {
     floorChecks: HatchCheckPlanEntry[] = [],
     processContext?: { manager: HatchProcessManager; owner: BinderLifecycleOwner },
     acceptance?: {
-      authorize(findings: HatchGateFinding[]): Promise<{ reason: string } | undefined>;
+      authorize(findings: HatchGateFinding[]): Promise<{ reason: string; accepted?: string[] } | undefined>;
     },
   ): Promise<HatchIntegrationResult> {
     if (!(await this.#locks.owns(lease))) {
@@ -594,7 +594,7 @@ export class HatchIntegrationRunner {
       );
       await this.#checkpoint("gates-complete");
       let safetyVerification: HatchVerificationResult | undefined;
-      let waiver: { reason: string; findings: HatchGateFinding[] } | undefined;
+      let waiver: { reason: string; findings: HatchGateFinding[]; accepted?: string[] } | undefined;
       if (acceptance) {
         let findings: HatchGateFinding[] = [];
         if (verification.status === "concerns") {
@@ -698,7 +698,7 @@ export class HatchIntegrationRunner {
             message: "Human acceptance was cancelled or supplied no bounded reason.",
           };
         }
-        waiver = { reason, findings };
+        waiver = { reason, findings, accepted: authorization?.accepted };
       } else if (verification.status !== "pass" && verification.status !== "skipped") {
         return {
           schema: "hatch-integration-item-v1",
@@ -720,6 +720,7 @@ export class HatchIntegrationRunner {
                   `Hatch-Accepted: ${finding.code}${finding.path ? `@${finding.path}${finding.line ? `:${finding.line}` : ""}` : ""}`,
                 )
               : ["Hatch-Accepted: fresh-review-passed"]),
+            ...(waiver.accepted ?? []).map((value) => `Hatch-Accepted: ${value}`),
             `Hatch-Accept-Reason: ${waiver.reason}`,
           ]
         : [];

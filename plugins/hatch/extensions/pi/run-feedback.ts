@@ -172,6 +172,8 @@ export function describeRunEvent(event: HatchRunEvent): string {
     }
     case "environment-preflight":
       return `environment preflight: ${list(event.items)} need installed dependencies and no setup is declared; suggested setup: \`${event.suggestedSetup}\``;
+    case "input-check":
+      return event.lines.map((line) => `input check: ${line}`).join("\n");
     case "item-merged":
       return `${event.item} merged${event.accepted ? " (accepted)" : ""}`;
     case "wave-finished":

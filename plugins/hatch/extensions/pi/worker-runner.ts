@@ -239,13 +239,15 @@ export interface WorkerChildSession {
 
 // Prompt a worker child for its envelope and read how its last turn ended. Whether the
 // corrective turn is sent is CHILD_FAILURE_POLICY.worker's call: none after a provider
-// error, which would meet the same quota or outage, and none after an abort.
+// error, which would meet the same quota or outage, and none after an abort or once the
+// run's `signal` is aborted.
 // The last turn is read here, before the caller disposes the session, because the session
 // is the only record of a provider error.
 export async function promptWorkerChild(
   session: WorkerChildSession,
   userPrompt: string,
   expected: WorkerExpectation,
+  signal?: AbortSignal,
 ): Promise<{ text: string; lastTurn: ChildLastTurn }> {
   let prompts = 0;
   let providerRetries = 0;
@@ -261,7 +263,7 @@ export async function promptWorkerChild(
       getLastAssistantText: () => session.getLastAssistantText(),
     };
     const text = await promptWorkerForEnvelope(counted, userPrompt, expected, (reply) =>
-      correctiveTurnAllowed("worker", readLastTurn({ messages: session.messages, prompts, providerRetries }), reply));
+      correctiveTurnAllowed("worker", readLastTurn({ messages: session.messages, prompts, providerRetries }), reply, signal));
     const lastTurn = readLastTurn({ messages: session.messages, prompts, providerRetries, stats: session.getSessionStats() });
     return { text, lastTurn };
   } finally {
@@ -292,7 +294,7 @@ async function invokeBuildWorker(invocation: BuildWorkerInvocation): Promise<Bui
       item: invocation.item,
       roleDefinitionHash: invocation.profile.role.definitionHash,
       profileHash: invocation.profile.profileHash,
-    });
+    }, invocation.ctx.signal);
     return { text, runtime: report, lastTurn };
   } finally {
     invocation.ctx.signal?.removeEventListener("abort", abort);

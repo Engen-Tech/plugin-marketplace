@@ -99,6 +99,19 @@ export function gateFileFor(role: HatchGateRole): GateFile {
   return role === "safety-gate" ? "safety" : "acceptance";
 }
 
+/** Every counted concern of a gate whose cap is spent, on these bytes, oldest first (F43): a
+ * build row that reviewed `tree`, or a merge or accept row on one of `commits` (commits that
+ * hold `tree`), judged onto `integrationTip` when one is given (a moved tip voids those, Q16). */
+export function spentConcerns(
+  attempts: { acceptance: GateAttemptState; safety: GateAttemptState; records: readonly HatchGateAttemptRecord[] },
+  bytes: { tree: string; commits: readonly string[] },
+  integrationTip?: string | null,
+): HatchGateAttemptRecord[] {
+  return attempts.records.filter((row) => row.counted && attempts[gateFileFor(row.role)].exhausted &&
+    (row.phase === "build" ? row.reviewedTree === bytes.tree : bytes.commits.includes(row.itemTip) &&
+      (integrationTip === undefined || !row.integrationTip || row.integrationTip === integrationTip)));
+}
+
 export function safeName(kind: string, value: string): string {
   if (!SAFE_NAME.test(value) || value.includes("..")) {
     throw new Error(`Hatch gate-attempt ledger: ${kind} ${JSON.stringify(value)} is not a plain name (letters, digits, '.', '_', '-')`);

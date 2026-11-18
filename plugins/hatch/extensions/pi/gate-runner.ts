@@ -533,7 +533,8 @@ export interface GateChildSession {
 
 // Prompt a gate child for its verdict and read how its last turn ended. The
 // corrective turn is skipped once the provider has errored: it would meet the same
-// quota or outage. The last turn is read here, before the caller disposes the
+// quota or outage. Once the run's `signal` is aborted no second prompt is sent at all,
+// neither the repair nor the evidence nudge. The last turn is read here, before the caller disposes the
 // session, because the session is the only record of a provider error.
 export async function promptGateChild(
   session: GateChildSession,
@@ -541,6 +542,7 @@ export async function promptGateChild(
   evidenceGaps: () => string[],
   expected: Parameters<typeof parseGateVerdict>[1] | null,
   citationNudge: (text: string) => string | null = () => null,
+  signal?: AbortSignal,
 ): Promise<{ text: string; lastTurn: ChildLastTurn }> {
   let prompts = 0;
   let providerRetries = 0;
@@ -558,10 +560,10 @@ export async function promptGateChild(
     const text = await promptGateForGroundedVerdict(
       counted,
       userPrompt,
-      evidenceGaps,
+      () => (signal?.aborted ? [] : evidenceGaps()),
       expected,
-      citationNudge,
-      (reply) => correctiveTurnAllowed("gate", readLastTurn({ messages: session.messages, prompts, providerRetries }), reply),
+      (reply) => (signal?.aborted ? null : citationNudge(reply)),
+      (reply) => correctiveTurnAllowed("gate", readLastTurn({ messages: session.messages, prompts, providerRetries }), reply, signal),
     );
     const lastTurn = readLastTurn({
       messages: session.messages,
@@ -600,6 +602,7 @@ export async function invokeGateModel(
       () => evidenceReadGaps(invocation.profile),
       invocation.expected ?? null,
       (answer) => citationVerdictNudge(invocation.profile, answer),
+      invocation.ctx.signal,
     );
     return { text, runtime: report, lastTurn };
   } finally {

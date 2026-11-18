@@ -37,11 +37,14 @@ All state is git-native and recomputed on every call — there is no stored curs
 - **Successor binders.** A binder with `supersedes: {slug, carried}` repairs a partially delivered
   one. Each carried item is `done` (or `accepted`) when a done ref under
   `refs/hatch/<slug>/` passes the same provenance rules, where `<slug>` is the predecessor or,
-  when the predecessor itself carried the item, the nearest binder up the chain of live binders
-  that holds a done ref for it; it is shown as delivered by that binder. The walk stops at the
-  first binder with a done ref present, so a ref that fails provenance is not passed over. A
-  carried item without that proof is not done and draws a warning. The walk reads live binders only, so where the
-  earlier binders are archived it stops at the predecessor. A live predecessor with a live successor is labelled superseded and is never offered
+  when the predecessor itself carried the item, the nearest binder up the chain that holds a done
+  ref for it; it is shown as delivered by that binder. A binder that is no longer live is read
+  from its integration tip, so an archived first repair is followed too. A step is taken only
+  where the earlier binder's integration tip is on the later one's, as `deliver_preflight.py`
+  requires. The walk stops at the first binder with a done ref present, so a ref that fails
+  provenance is not passed over. A carried item without that proof is not done and draws a
+  warning that names why (no trusted done ref, or a step whose integration branch is missing,
+  not on the later one's, or unreadable). A live predecessor with a live successor is labelled superseded and is never offered
   as the next action — its remaining work is the successor's.
 - **Unreadable binders are errors, never skipped.** A binder file that is not JSON, or is JSON but
   not a binder object, is listed in `errors` by path, and the next action says to repair it.

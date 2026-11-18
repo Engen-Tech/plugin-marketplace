@@ -43,10 +43,12 @@ import { readEnvironmentConfig } from "./environment.ts";
 import { lookupFloorCache } from "./floor-cache.ts";
 import {
   clearBinderAttempts,
+  GATE_ATTEMPT_CAPS,
   gateFileFor,
   itemSpecDigest,
   readAttempts,
   recordVerification,
+  spentConcerns,
   type GateAttemptState,
   type HatchGateAttemptRecord,
   type HatchGatePhase,
@@ -148,6 +150,9 @@ interface PreflightPacket {
   done_provenance?: Record<string, { ok?: boolean; checker_output?: string; first_parent_reachable?: boolean }>;
   halt?: boolean;
 }
+
+// One finding of check_plan_inputs.py's hatch-plan-inputs-v1 report, as far as Pi reads it.
+type InputFinding = { kind: string; halts: boolean; items: string[]; subject: string; detail: string; command?: string | null; output?: string };
 
 export interface HatchDeliveryWave {
   wave: number;
@@ -598,7 +603,7 @@ function failedBuildHalt(build: HatchBuildItemResult): { reason: string; gate?: 
     const words = build.worker?.summary ?? build.message;
     return { reason: noChangeHaltReason(build.item, "build", role, build.commit ?? "", words) };
   }
-  return { reason: buildHaltReason(build), ...(role ? { gate: { role, phase: "build", verification } } : {}) };
+  return { reason: buildHaltReason(build), ...(role ? { gate: { role, phase: build.capPhase ?? "build", verification } } : {}) };
 }
 
 /**
@@ -726,10 +731,10 @@ interface SendBackOffer extends FindingsReview {
  * The ledger's own count decides that the cap is spent; an unreadable ledger file leaves
  * the count unknown and caps every gate on its first concern, so the choice's text would
  * not hold. A halt this run saw names its gate and review (`seen`); a no-change halt, a
- * check failure and a host verdict name none. A halt from an earlier run has no cause in
- * Git, so the newest review of the failed tip's own bytes decides: a merge or accept row
- * names the tip, a build row (whose item tip is the parent of what it staged) reviewed
- * its tree.
+ * check failure and a host verdict name none. A halt from an earlier run, or one that names
+ * a gate but no review (a recovery that was not reviewed again), has no cause to read, so the newest review that counted a concern of a spent gate on the failed tip's own
+ * bytes decides (`spentConcerns`, the key the Fix and rerun refusal reads): a later review
+ * that counted nothing, such as an Accept that did not land, does not hide it.
  */
 export function sendBackOffer(
   attempts: ItemAttemptsRead,
@@ -738,7 +743,7 @@ export function sendBackOffer(
   failedTip: { commit: string; tree: string },
 ): SendBackOffer | undefined {
   if (!("records" in attempts) || attempts.acceptance.error || attempts.safety.error) return undefined;
-  if (seen) {
+  if (seen && (!halt || halt.verification)) {
     const gate = halt?.verification?.gates[GATE_KEYS[halt.role]];
     if (!halt || !gate || !attempts[gateFileFor(halt.role)].exhausted) return undefined;
     const state = attempts[gateFileFor(halt.role)];
@@ -753,14 +758,8 @@ export function sendBackOffer(
       merge: halt.merge,
     };
   }
-  const reviews = attempts.records.filter((record) =>
-    record.phase === "build" ? record.reviewedTree === failedTip.tree : record.itemTip === failedTip.commit,
-  );
-  // A review can count a concern from both gates; the one whose cap is spent halted it.
-  const newest = attemptGroups(reviews).at(-1);
-  const row = newest?.find((record) => record.counted && attempts[gateFileFor(record.role)].exhausted) ??
-    newest?.find((record) => record.counted);
-  if (!row || !attempts[gateFileFor(row.role)].exhausted) return undefined;
+  const row = attemptGroups(spentConcerns(attempts, { tree: failedTip.tree, commits: [failedTip.commit] })).at(-1)?.[0];
+  if (!row) return undefined;
   const state = attempts[gateFileFor(row.role)];
   return {
     role: row.role,
@@ -884,8 +883,8 @@ function distinctCodesLine(records: readonly HatchGateAttemptRecord[], role: Hat
  * `halt` is the gate whose cap halted the item, passed from where the halt happened; a halt
  * with no gate (a failed check, a worker that changed nothing, an earlier run) gets the
  * plain heading. `sendBack`, when set, adds the send-back choice after Fix and rerun;
- * `sendBackWithheld` says instead why it is not offered. The reason and the attempt list
- * share the halt-reason budget.
+ * `sendBackWithheld` says instead why it is not offered. `fixRefused` says why the last
+ * Fix and rerun did not run. The reason and the attempt list share the halt-reason budget.
  */
 export function failedPrompt(
   binder: string,
@@ -895,6 +894,7 @@ export function failedPrompt(
   halt?: HaltGate,
   sendBack?: SendBackOffer,
   sendBackWithheld?: string,
+  fixRefused?: string,
 ): string {
   const branch = `hatch/${binder}/item-${item}`;
   const ledger = attempts && "records" in attempts ? attempts : undefined;
@@ -929,6 +929,7 @@ export function failedPrompt(
   }
   return [
     head,
+    fixRefused,
     history,
     [
       "What each choice does:",
@@ -938,7 +939,7 @@ export function failedPrompt(
       ...(sendBack ? [sendBackLine(sendBack)] : []),
       ...(sendBackWithheld ? [`  ${SEND_BACK_CHOICE} is not offered: ${sendBackWithheld}`] : []),
       accept,
-      `  Defer and stop delivery: stops the run and keeps the failed ref. To fix it by hand, commit the fix on ${branch} with [hatch:item-${item}] in the subject, then run the delivery again; hatch treats the moved tip as your fix and re-validates it without asking.`,
+      `  Defer and stop delivery: stops the run and keeps the failed ref. To fix it by hand, commit the fix on ${branch} with [hatch:item-${item}] in the subject, then run the delivery again; hatch treats the moved tip as your fix and re-validates it without asking, unless a gate whose attempts are used up judged its committed files with concerns: then the item halts here again.`,
     ].join("\n"),
   ].filter(Boolean).join("\n\n");
 }
@@ -1429,6 +1430,34 @@ export class HatchDeliveryRunner {
       return packet as PreflightPacket;
     } catch {
       throw new Error("Hatch successor preflight did not print a JSON packet");
+    }
+  }
+
+  /**
+   * check_plan_inputs.py on the committed binder at `base`, spawned as #preflight is. A run
+   * that fails or prints no report throws: its `halt` cannot be read, so none is assumed.
+   */
+  async #inputCheck(repoRoot: string, binder: string, base: string): Promise<{ halt?: unknown; findings: InputFinding[] }> {
+    const environment: NodeJS.ProcessEnv = { ...process.env, PYTHONNOUSERSITE: "1", PYTHONSAFEPATH: "1" };
+    delete environment.PYTHONHOME;
+    delete environment.PYTHONPATH;
+    const script = resolveHatchScript("checkPlanInputs");
+    const args = ["--slug", binder, "--base", base, "--repo", repoRoot, "--shell", "login", "--environment-config", "--format", "json"];
+    let stdout: string;
+    try {
+      ({ stdout } = await exec("uv", ["run", "--script", script, ...args], {
+        cwd: repoRoot, encoding: "utf8", env: environment, maxBuffer: MAX_OUTPUT, timeout: 600_000,
+      }));
+    } catch (error) {
+      const failure = error as { stderr?: string; stdout?: string; message?: string };
+      throw new Error(`Hatch input check failed to run: ${(failure.stderr || failure.stdout || failure.message || "").trim()}`);
+    }
+    try {
+      const report = JSON.parse(stdout) as { halt?: unknown; findings?: unknown };
+      if (!Array.isArray(report?.findings)) throw new Error("no findings");
+      return report as { halt?: unknown; findings: InputFinding[] };
+    } catch {
+      throw new Error("Hatch input check did not print a JSON report");
     }
   }
 
@@ -2611,6 +2640,21 @@ export class HatchDeliveryRunner {
         needsGate = !integrationExists || (await deriveItemGitState(repoRoot, binder, item.id)).state !== "done";
         if (needsGate) break;
       }
+      // The committed binder's inputs, checked once per run: an unmet declared precondition or
+      // a failing environment `preflight` stops it; a static finding about a command only warns.
+      if (planned && needsGate) {
+        const inputs = await this.#inputCheck(repoRoot, binder, integrationExists ? integrationRef : "HEAD");
+        const text = (f: InputFinding) =>
+          `${f.subject} (${f.kind})${f.items.length && f.items.join() !== f.subject ? `, items: ${f.items.join(", ")}` : ""}: ${f.detail}`;
+        const warnings = inputs.findings.filter((f) => !f.halts).map(text);
+        if (warnings.length > 0) emit({ kind: "input-check", lines: warnings });
+        if (inputs.halt === true) {
+          const tail = (f: InputFinding) => clipText(f.output?.trim().split("\n").at(-1) ?? "", 300);
+          const findings = inputs.findings.filter((f) => f.halts).map((f) => `\n- ${text(f)}${f.command ? `\n  command: ${f.command}` : ""}${
+            tail(f) ? `\n  output: ${tail(f)}` : ""}`).join("");
+          return report(stopResult(binder, { stop: "input-check", findings }, { integrationWorktree: "", waves: [] }));
+        }
+      }
       const refused = needsGate ? await this.#probeGates(ctx) : undefined;
       if (refused) {
         return report(stopResult(binder, { stop: "gate-probe-refused", refused }, { integrationWorktree: "", waves: [] }));
@@ -2762,6 +2806,9 @@ export class HatchDeliveryRunner {
       // Items whose send-back brief could not be built in this run, with the reason the
       // prompt gives instead of the choice.
       const sendBackRefused = new Map<string, string>();
+      // Items whose Fix and rerun this run refused, with the reason the next prompt shows once,
+      // naming Send back only when that prompt offers it.
+      const fixRefused = new Map<string, (sendBack: boolean) => string>();
       // The checks a sent-back build's worker proposed. Its item merges in a later wave,
       // recovered without a worker, so the merge pass takes them from here, as it takes a
       // merge kickback's, instead of starting a worker to discover them again.
@@ -2770,6 +2817,14 @@ export class HatchDeliveryRunner {
       // the tip the halted build started from.
       const integrationTip = () =>
         readGit(repoRoot, ["rev-parse", "--verify", `refs/heads/hatch/${binder}/integration`]).catch(() => null);
+      // The item's commits past integration that hold `tree`. A merge or accept row names the commit it judged, and a
+      // marked commit keeping those files moves `failed` past it, so the spent-cap key reads them all (F43).
+      const holding = async (tip: string, tree: string) => (await git(repoRoot, ["log", "--format=%H %T", `refs/heads/hatch/${binder}/integration..${tip}`]))
+        .split("\n").filter((line) => line.endsWith(` ${tree}`)).map((line) => line.split(" ")[0]);
+      // A tip on files a spent gate judged with concerns, halted without a review (F43): a gate-cap record at that row's attempt.
+      const spentCapHalt = async (item: string, tip: string, spent: { role: HatchGateRole; attempt: number; phase: HatchGatePhase }, reason: string, recoveryState: HatchBuildItemResult["recoveryState"]) =>
+        haltOfBuild({ schema: "hatch-build-item-v1", binder, item, status: "failed", recoveryState, attempts: 0, commit: tip, capGate: spent.role, capPhase: spent.phase, message: reason,
+          gateAttempts: { acceptance: 0, safety: 0, [gateFileFor(spent.role)]: spent.attempt }, specDigest: await this.#specDigest(repoRoot, binder, item).catch(() => undefined) }, { integrationTip: await integrationTip() });
       // Every item halt of this run is mapped through here. `keep` says what happens to its
       // record: `map` keeps none (the record is kept elsewhere, or the site writes none),
       // `write` writes it alone, and `lines` returns the update-ref lines for the caller's
@@ -3162,6 +3217,23 @@ export class HatchDeliveryRunner {
           const supersededState = states.get(superseded.id);
           const stale = supersededState?.refs.failed;
           if (!stale || !supersededState?.itemTip) throw new Error("Hatch superseded failed item has no failed ref or item tip");
+          fixRefused.delete(superseded.id); // A refused Fix's text names the tip this commit moved past.
+          // A marked commit keeping files a spent gate judged with concerns, beside uncommitted changes, is no fix
+          // (Q17), whatever the integration tip did (Q18). The clean shape halts in the build runner's first recovery round (build-runner.ts, `spentConcerns`).
+          const tip = supersededState.itemTip;
+          const tree = await git(repoRoot, ["rev-parse", `${tip}^{tree}`]);
+          const commits = await holding(tip, tree);
+          const read = await this.#itemAttempts(repoRoot, binder, superseded.id);
+          const spent = "records" in read && Object.values(supersededState.dirty).some(Boolean) ? spentConcerns(read, { tree, commits }).at(-1) : undefined;
+          if (spent) {
+            const reason = `Item '${superseded.id}' was not reviewed again: its tip ${shortSha(tip)} holds files the ${GATE_NAMES[spent.role]} gate judged with concerns at attempt ${spent.attempt} of ${GATE_ATTEMPT_CAPS[gateFileFor(spent.role)]}. Those concerns stand, so ${shortSha(tip)} is marked failed. Commit a fix on hatch/${binder}/item-${superseded.id} with [hatch:item-${superseded.id}] in the subject, or choose Accept exact current findings, which reviews these exact files again as your recorded decision.`;
+            const { record, event, lines } = await recordHalt({ ...(await spentCapHalt(superseded.id, tip, spent, reason, "failed-superseded")), reason }, "lines");
+            await updateRefsTransaction(repoRoot, [`update refs/hatch/${binder}/item-${superseded.id}/failed ${tip} ${stale}`, ...(lines.length ? lines : [haltDeleteLine(binder, superseded.id)])]);
+            setHalt(superseded.id, reason, { role: spent.role, phase: spent.phase });
+            halts.push(record);
+            emit(event);
+            continue;
+          }
           // The halt record leaves with `failed`: the hand fix moved the human past it.
           await updateRefsTransaction(repoRoot, [
             `delete refs/hatch/${binder}/item-${superseded.id}/failed ${stale}`,
@@ -3194,10 +3266,8 @@ export class HatchDeliveryRunner {
           }
           const failedTip = states.get(failed.id)?.itemTip;
           if (!failedTip) throw new Error("Hatch failed item has no item tip");
-          let sendBack = sendBackOffer(attempts, haltReasons.has(failed.id), haltGate, {
-            commit: failedTip,
-            tree: await git(repoRoot, ["rev-parse", `${failedTip}^{tree}`]),
-          });
+          const failedTree = await git(repoRoot, ["rev-parse", `${failedTip}^{tree}`]);
+          let sendBack = sendBackOffer(attempts, haltReasons.has(failed.id), haltGate, { commit: failedTip, tree: failedTree });
           // The worker would build on uncommitted edits it did not make, so the choice waits
           // for a clean worktree, and a brief that could not be built is not offered again.
           const worktree = states.get(failed.id)?.worktree;
@@ -3222,13 +3292,48 @@ export class HatchDeliveryRunner {
               haltGate,
               sendBack,
               withheld,
+              fixRefused.get(failed.id)?.(Boolean(sendBack)),
             ),
             ["Fix and rerun", ...(sendBack ? [SEND_BACK_CHOICE] : []), "Accept exact current findings", "Defer and stop delivery"],
           );
           const answer = failedPromptOutcome(choice);
+          fixRefused.delete(failed.id);
           if (answer === "fix") {
             const itemTip = states.get(failed.id)?.itemTip;
             if (!itemTip) throw new Error("Hatch failed item has no item tip");
+            // A gate whose cap is spent judged these files with concerns. The same files, read
+            // now, would only be asked again until the gate passes, so the rerun waits for a
+            // fix (F43). The key is the newest counted row of a spent gate across every review
+            // of these bytes, so a later uncounted review (an Accept that did not land) does
+            // not hide it. An unreadable ledger cannot say, so it refuses too, whatever the
+            // integration tip. Uncommitted changes are never a fix (Q17, reversing Q14), so only
+            // committed files count. A moved integration tip voids only the rows judged against the old tip
+            // (merge and accept); a build row judged the item's files alone and still stands
+            // (Q16). Beside uncommitted changes it voids none: they never land by a rerun (Q18).
+            // A branch that cannot be read reruns into the stop that says so.
+            const unreadable = "records" in attempts ? (attempts.acceptance.error ?? attempts.safety.error) : attempts.error;
+            const dirt = worktree ? await uncommittedPaths(worktree).catch(() => []) : [];
+            const tip = dirt.length ? undefined : await integrationTip();
+            const capped = "records" in attempts ? spentConcerns(attempts, { tree: failedTree, commits: await holding(itemTip, failedTree) }, tip).at(-1) : undefined;
+            const branch = `hatch/${binder}/item-${failed.id}`;
+            if (
+              (unreadable || capped) &&
+              (await git(repoRoot, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{tree}`]).catch(() => "")) === failedTree
+            ) {
+              fixRefused.set(
+                failed.id,
+                (offer) => `Fix and rerun did not run: no fix was committed. ${branch} still holds the files of ${itemTip.slice(0, 7)}, ` +
+                  (unreadable || !capped
+                    ? `and the attempt ledger could not be read (${unreadable}), so hatch cannot tell whether a gate whose attempts are used up judged these files with concerns. ` +
+                      "Repair the ledger file named above: when no gate whose attempts are used up judged these files, Fix and rerun then runs. "
+                    : `which the ${GATE_NAMES[capped.role]} gate judged with concerns; its ${GATE_ATTEMPT_CAPS[gateFileFor(capped.role)]} ${gateFileFor(capped.role)} attempts are used up, so those concerns stand. `) +
+                  (dirt.length ? `The item worktree ${worktree} has uncommitted changes (${dirt.slice(0, 5).join(", ")}${dirt.length > 5 ? ` and ${dirt.length - 5} more` : ""}); they are not a fix. Commit them on ${branch} with [hatch:item-${failed.id}] in the subject, or discard them. ` : "") +
+                  `Commit a fix on ${branch} with [hatch:item-${failed.id}] in the subject, then choose Fix and rerun; ` +
+                  (offer ? `or choose ${SEND_BACK_CHOICE}; ` : "") +
+                  "or choose Accept exact current findings, which reviews these exact files again as your recorded decision.",
+              );
+              continue;
+            }
             // A rerun is the human's decision, so a build-time halt recorded earlier in
             // this run no longer keeps the item out of the frontier.
             deferred.delete(failed.id);
@@ -3336,6 +3441,8 @@ export class HatchDeliveryRunner {
           if ((await deriveItemGitState(repoRoot, binder, failed.id)).state !== "failed") {
             throw new Error("Hatch failed item changed during human-accept floor discovery");
           }
+          // A spent gate's counted verdict on these exact files, which a passing fresh review overrides only by this Accept (F43).
+          const prior = "records" in attempts ? spentConcerns(attempts, { tree: failedTree, commits: await holding(failedTip, failedTree) }, await integrationTip()).at(-1) : undefined;
           const anchor = await this.#waves.start(binder, waveNumber, integrationWorktree, lease);
           const integrated = await this.#integrations.integrate(
             ctx,
@@ -3353,16 +3460,21 @@ export class HatchDeliveryRunner {
                       `[${finding.severity}] ${finding.code}${finding.path ? ` — ${finding.path}${finding.line ? `:${finding.line}` : ""}` : ""}: ${finding.message}`,
                     ).join("\n")
                   : "Fresh acceptance and safety review now pass; record why this failed checkpoint is being accepted.";
+                // Safety must pass to reach here; an acceptance cap disagrees only when no acceptance finding remains.
+                const over = prior && (prior.role === "safety-gate" || findings.length === 0) ? prior : undefined;
+                const head = !over ? "" : `The ${GATE_NAMES[over.role]} gate judged these exact files (${shortSha(failedTip)}) with concerns at attempt ${over.attempt} of ${GATE_ATTEMPT_CAPS[gateFileFor(over.role)]}: ` +
+                  `${over.findings.map((finding) => finding.code).join(", ")}. The fresh ${GATE_NAMES[over.role]} review passed them and disagrees with that verdict; landing them is your call, and the merge commit records it.\n\n`;
                 const confirmed = await ctx.ui.confirm(
                   `Accept exact findings for '${failed.id}'?`,
-                  details,
+                  head + details,
                 );
                 if (!confirmed) return undefined;
                 const reason = await ctx.ui.input(
                   "Human acceptance reason",
                   "Why is accepting this exact gap appropriate?",
                 );
-                return reason?.trim() ? { reason } : undefined;
+                const accepted = over?.findings.map((finding) => `spent-cap-overridden ${over.role} ${over.attempt}/${GATE_ATTEMPT_CAPS[gateFileFor(over.role)]} ${finding.code}${finding.path ? `@${finding.path}${finding.line ? `:${finding.line}` : ""}` : ""}`);
+                return reason?.trim() ? { reason, accepted } : undefined;
               }),
             },
           );
@@ -3565,6 +3677,22 @@ export class HatchDeliveryRunner {
             setHalt(item.id, reason);
             continue;
           }
+          // A built tip a spent gate judged with a counted concern (a crash before the kickback
+          // wrote `failed`) is not reviewed again at merge (F43, ruling (b)): only Accept re-judges it.
+          const read = await this.#itemAttempts(repoRoot, binder, item.id);
+          const tip = state.itemTip ?? "";
+          const spent = "records" in read ? spentConcerns(read, { tree: await git(repoRoot, ["rev-parse", `${tip}^{tree}`]), commits: [tip] }, await integrationTip()).at(-1) : undefined;
+          if (spent) {
+            const reason = `Item '${item.id}' was not reviewed again: its tip ${shortSha(tip)} holds the files the ${GATE_NAMES[spent.role]} gate judged with concerns at attempt ${spent.attempt} of ${GATE_ATTEMPT_CAPS[gateFileFor(spent.role)]} ` +
+              `(${spent.phase}, ${spent.findings.map((finding) => finding.code).join(", ")}). Those concerns stand, so ${shortSha(tip)} is marked failed. Commit a fix, choose Send back to the worker once if the prompt offers it, or choose Accept to have these exact files reviewed again as your decision.`;
+            const { record, event, lines } = await recordHalt({ ...(await spentCapHalt(item.id, tip, spent, reason, "built")), phase: "merge", reason, wave: waveNumber }, "lines");
+            await this.#markIntegrationFailed(repoRoot, binder, item.id, tip, lines);
+            setHalt(item.id, reason, { role: spent.role, phase: spent.phase });
+            halts.push(record);
+            emit(event);
+            integrationFailed = true;
+            continue;
+          }
           let checks: HatchCheckPlanEntry[] = itemChecks.get(item.id) ?? [];
           if (checks.length === 0) {
             checks = (await this.#reusedFloorChecks(repoRoot, binder, item.id, announceFloorReuse, waveNumber)) ?? [];
@@ -3759,7 +3887,7 @@ export class HatchDeliveryRunner {
         landedThisRun.push(...landed);
         // A merge-time failure is not a stop by itself: the next pass finds the item
         // failed and asks the human (or, with no host to ask, blocks naming it).
-        // Every pass progresses: a batch with nothing to merge has just deferred every
+        // Every merge pass progresses: a batch with nothing to merge has just deferred every
         // item, and each mergeable item either lands, is deferred, or is marked failed.
         waveNumber += 1;
       }

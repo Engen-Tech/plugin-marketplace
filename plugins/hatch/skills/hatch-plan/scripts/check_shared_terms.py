@@ -8,9 +8,14 @@ A binder may declare canonical strings that several work items must render
 byte-identically (see validate_binder.py for the plan-time schema check). This
 script is the deliver-time enforcement point. An item counts as landed only when
 its git done ref — refs/hatch/<slug>/item-<id>/done, probed under the scan root —
-resolves (for an item a successor binder carries, the ref under the `supersedes` slug); an item with no done ref is not yet landed, so every entry listing it is
-reported [PENDING] and skipped, never failed (a non-git scan root, or git being
-unavailable, leaves every item pending). For landed items the script reads the
+resolves and is an ancestor of the scan root's HEAD (for an item a successor binder carries, the ref under the slug of the binder
+that delivered it, found by walking the `supersedes` chain back through
+hatch-deliver's supersedes_chain.py); an item with no done ref on that history is not
+yet landed (the default branch at plan time has not merged the delivery), so
+every entry listing it is reported [PENDING] and skipped, never failed (a non-git scan
+root, git being unavailable, or a chain that does not resolve leaves the item pending). The
+[PENDING] line names why: no done ref, a done ref not on the scanned tree's history, or a
+supersedes chain that does not resolve. For landed items the script reads the
 touched files each actually produced and fails if a declared term drifted.
 
 Zero dependencies (pure stdlib; the done-ref probe shells out to git, which is
@@ -29,23 +34,88 @@ from __future__ import annotations
 import argparse, json, subprocess, sys
 from pathlib import Path
 
+# The supersedes-chain walk hatch-deliver's preflight uses, imported by path (no
+# __init__.py in hatch-deliver/scripts). Without it (a partial install) a carried item is
+# probed one hop back only, as before, and a twice-carried item stays PENDING. The import
+# writes no bytecode: an installed plugin is a git clone that a __pycache__ dirties.
+_CHAIN_DIR = str((Path(__file__).resolve().parent / ".." / ".." / "hatch-deliver" / "scripts").resolve())
+if _CHAIN_DIR not in sys.path:
+    sys.path.insert(0, _CHAIN_DIR)
+_dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+try:
+    import supersedes_chain  # noqa: E402
+except ImportError:
+    supersedes_chain = None
+finally:
+    sys.dont_write_bytecode = _dwb
 
-def _landed(slug: str, item_id: str, root: Path) -> bool:
-    """True iff refs/hatch/<slug>/item-<item_id>/done resolves in the repo at `root`.
 
-    Any failure — the ref absent, `root` not a git repository, git unavailable —
+def _on_head(rev: str, root: Path) -> bool:
+    """True iff `rev` resolves and is an ancestor of HEAD in the repo at `root`.
+
+    Any failure — the rev absent, `root` not a git repository, git unavailable —
     means not landed. Callers turn that into PENDING, never a crash."""
     try:
         return subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet",
-             f"refs/hatch/{slug}/item-{item_id}/done"],
+            ["git", "merge-base", "--is-ancestor", rev, "HEAD"],
             cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
         ).returncode == 0
     except (OSError, subprocess.TimeoutExpired):  # git missing, root unusable, or hung
         return False
 
 
+NO_REF = "no done ref"
+OFF_HISTORY = "done ref not on this tree's history"
+
+
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    """One git call in `root` that never raises. Git missing, a hang, or output that is
+    not UTF-8 (a committed plan, say) reads as a failed call whose stderr names the error:
+    the item stays pending."""
+    try:
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True,
+                              encoding="utf-8", timeout=30)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(args, 1, "", str(e))
+
+
+def _ref_why(rev: str, root: Path) -> str | None:
+    """None iff `rev` is on the history of `root`'s HEAD; else why the item is pending."""
+    if _on_head(rev, root):
+        return None
+    return OFF_HISTORY if _git(root, "rev-parse", "--verify", "--quiet", rev).returncode == 0 \
+        else NO_REF
+
+
+def _landed(slug: str, item_id: str, root: Path) -> bool:
+    """True iff refs/hatch/<slug>/item-<item_id>/done is on the history of `root`'s HEAD.
+
+    A done ref off that history (a delivery not merged into the scanned tree, such as the
+    default branch at plan time) is not landed there: its files are not on the tree."""
+    return _on_head(f"refs/hatch/{slug}/item-{item_id}/done", root)
+
+
+def _carried_why(predecessor: str, item_id: str, slug: str, root: Path) -> str | None:
+    """None iff the binder in the supersedes chain that delivered `item_id` has its done ref
+    on the history of `root`'s HEAD; else why the item is pending.
+
+    The predecessor's own ref is probed first (one hop, as before); past it the walk in
+    supersedes_chain.py follows each binder's committed `supersedes` back. A chain that
+    does not resolve, or a missing module, means not landed."""
+    why = _ref_why(f"refs/hatch/{predecessor}/item-{item_id}/done", root)
+    if why is None or supersedes_chain is None:
+        return why
+    got = supersedes_chain.resolve_delivery(lambda *a: _git(root, *a), predecessor, item_id, slug)
+    if got.done is None:
+        return f"supersedes chain unresolved ({got.reason})"
+    return None if _on_head(got.done, root) else OFF_HISTORY
+
+
 def evaluate_binder(binder: dict, root: Path) -> list[tuple[str, str, list[str], str]]:
+    return [r[:4] for r in _evaluate(binder, root)]
+
+
+def _evaluate(binder: dict, root: Path) -> list[tuple[str, str, list[str], str, dict]]:
     """Return one result per `shared_terms` entry: (id, status, items, canonical).
 
     status is one of:
@@ -54,29 +124,37 @@ def evaluate_binder(binder: dict, root: Path) -> list[tuple[str, str, list[str],
       "PENDING" — at least one listed item is not yet landed — its git done ref
                   (refs/hatch/<slug>/item-<id>/done) does not resolve under `root` —
                   so the entry is skipped, never failed; `items` names the pending
-                  items. A non-git root or missing git leaves every item pending.
+                  items. A done ref off the history of `root`'s HEAD is not landed
+                  there. A non-git root or missing git leaves every item pending.
       "FAIL"    — every listed item landed, but the `items` (offenders) lack the
                   term in every existing touched file (an offender with no touched
                   file left on the tree cannot render the term at all).
 
-    An absent or empty `shared_terms` yields an empty list (a clean no-op pass)."""
+    An absent or empty `shared_terms` yields an empty list (a clean no-op pass).
+    `_evaluate` adds a fifth element: for PENDING, each pending item's reason."""
     slug = binder.get("slug", "")
-    # A successor binder's carried items landed under the predecessor's slug; their done
-    # refs live there (deliver_preflight.py proves them before a successor run starts).
+    # A successor binder's carried items landed under an earlier binder in the supersedes
+    # chain; their done refs live there (deliver_preflight.py proves them before a
+    # successor run starts).
     sup = binder.get("supersedes") if isinstance(binder.get("supersedes"), dict) else {}
     carried = set(sup.get("carried") or [])
-    ref_slug = {iid: sup.get("slug", slug) for iid in carried}
+    pred = sup.get("slug") if isinstance(sup.get("slug"), str) else slug
+
+    def why(iid: str) -> str | None:
+        if iid in carried:
+            return _carried_why(pred, iid, slug, root)
+        return _ref_why(f"refs/hatch/{slug}/item-{iid}/done", root)
     items_by_id = {it["id"]: it for it in binder.get("work_items", []) if isinstance(it, dict)}
-    results: list[tuple[str, str, list[str], str]] = []
+    results: list[tuple[str, str, list[str], str, dict]] = []
     for entry in binder.get("shared_terms", []) or []:
         eid = entry.get("id", "<no-id>")
         canonical = entry.get("canonical", "")
         listed = entry.get("items", [])
 
         # An entry is only judged once every listed item has landed (done ref set).
-        pending = [iid for iid in listed if not _landed(ref_slug.get(iid, slug), iid, root)]
-        if pending:
-            results.append((eid, "PENDING", pending, canonical))
+        reasons = {iid: r for iid in listed if (r := why(iid)) is not None}
+        if reasons:
+            results.append((eid, "PENDING", list(reasons), canonical, reasons))
             continue
 
         # Gather, per listed item, the touched files that actually exist under root.
@@ -89,7 +167,7 @@ def evaluate_binder(binder: dict, root: Path) -> list[tuple[str, str, list[str],
         needle = canonical.encode("utf-8")
         offenders = [iid for iid, files in per_item_existing.items()
                      if not any(needle in f.read_bytes() for f in files)]
-        results.append((eid, "FAIL" if offenders else "OK", offenders, canonical))
+        results.append((eid, "FAIL" if offenders else "OK", offenders, canonical, {}))
     return results
 
 
@@ -99,7 +177,7 @@ def check(binder: dict, root: Path) -> tuple[int, list[str]]:
     exit_code is 1 iff any entry is a violation. Pending and satisfied entries pass."""
     lines: list[str] = []
     violations = 0
-    for eid, status, offenders, canonical in evaluate_binder(binder, root):
+    for eid, status, offenders, canonical, reasons in _evaluate(binder, root):
         if status == "FAIL":
             violations += 1
             who = ", ".join(offenders)
@@ -107,9 +185,12 @@ def check(binder: dict, root: Path) -> tuple[int, list[str]]:
                 f"[FAIL] {eid}: item(s) {who} do not render the canonical term {canonical!r} "
                 "byte-identically in any touched file")
         elif status == "PENDING":
-            who = ", ".join(offenders)
-            lines.append(
-                f"[PENDING] {eid}: item(s) {who} not yet landed — no done ref; skipped")
+            by_why: dict[str, list[str]] = {}
+            for iid, r in reasons.items():
+                by_why.setdefault(r, []).append(iid)
+            said = "; ".join(f"item(s) {', '.join(ids)} not yet landed — {r}"
+                             for r, ids in by_why.items())
+            lines.append(f"[PENDING] {eid}: {said}; skipped")
         else:
             lines.append(f"[PASS] {eid}: every listed item renders the canonical term")
     return (1 if violations else 0, lines)
@@ -149,10 +230,14 @@ def _run_self_test() -> int:
     def init_repo(root: Path, landed: list[str]) -> None:
         """git init the fixture root and write a done ref for each landed item id."""
         git(root, "init", "-q")
-        # Any object satisfies show-ref --verify; a blob avoids needing a commit.
-        blob = git(root, "hash-object", "-w", "--stdin", stdin="")
-        for iid in landed:
-            git(root, "update-ref", f"refs/hatch/t/item-{iid}/done", blob)
+        # A done ref counts only on HEAD's history: one empty-tree commit is both.
+        tree = git(root, "hash-object", "-w", "-t", "tree", "--stdin", stdin="")
+        head = git(root, "commit-tree", tree, "-m", "fixture")
+        git(root, "update-ref", "HEAD", head)
+        off = git(root, "commit-tree", tree, "-m", "a delivery HEAD has not merged")
+        for iid in landed:  # "~id": the done ref stands on a commit off HEAD's history
+            git(root, "update-ref", f"refs/hatch/t/item-{iid.lstrip('~')}/done",
+                off if iid.startswith("~") else head)
 
     # Each case: (name, binder, tree, landed, want_exit, must_mention).
     # landed is a list of item ids whose done refs are written into a fixture git
@@ -260,6 +345,19 @@ def _run_self_test() -> int:
         {"validator.py": f"msg = '{CANON}'"},  # engine landed but left nothing behind
         ["validator", "engine"],
         1, ("[FAIL]", "engine"),
+    ))
+
+    # 10. a done ref that is not on HEAD's history -> pending, and the line says so
+    cases.append((
+        "done ref off HEAD's history is pending and names why",
+        binder(
+            [item("validator", ["validator.py"]), item("engine", ["engine.py"])],
+            [{"id": "shadow", "canonical": CANON, "items": ["validator", "engine"]}],
+        ),
+        {"validator.py": f"msg = '{CANON}'"},
+        ["validator", "~engine"],
+        0, ("[PENDING] shadow: item(s) engine not yet landed — done ref not on this "
+            "tree's history; skipped",),
     ))
 
     failures = 0

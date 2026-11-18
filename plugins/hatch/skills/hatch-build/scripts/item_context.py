@@ -18,7 +18,11 @@ Top-level keys:
   oracle_expect    — the oracle's `expect`, or null.
   integration_tip  — the current tip of hatch/<slug>/integration, or null.
   dependencies     — {dep_id: {done_ref, target}} for every id in `depends_on`, so
-                     hatch-build's Gate 3 is answered from the packet.
+                     hatch-build's Gate 3 is answered from the packet. A dependency the
+                     binder carries (`supersedes.carried`) resolves through
+                     hatch-deliver's supersedes_chain.py to the done ref of the binder
+                     that delivered it, adding `delivered_by`; when that chain does not
+                     resolve, `target` stays null and `finding` says why.
   sme              — [{id, source, checklist}] — every id in the binder's `sme` list,
                      with its COMPOSED Review checklist (resolve_pack_checklist.py),
                      project overlay `.hatch/sme/<id>.md` winning over the built-in
@@ -54,11 +58,31 @@ ITEM_CONTEXT = Path(__file__).resolve()
 BUILTIN_SME_DIR = (SCRIPT_DIR / ".." / "references" / "sme").resolve()
 
 # cwd-independent sibling import (no __init__.py in hatch-kaizen/scripts). Import-safe —
-# importing resolve_pack_checklist never runs it.
+# importing resolve_pack_checklist never runs it. Both sibling imports write no bytecode:
+# an installed plugin is a git clone (pi's marketplace) that a __pycache__ dirties.
 _RPC_DIR = str((SCRIPT_DIR / ".." / ".." / "hatch-kaizen" / "scripts").resolve())
 if _RPC_DIR not in sys.path:
     sys.path.insert(0, _RPC_DIR)
-import resolve_pack_checklist as rpc  # noqa: E402
+_dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+try:
+    import resolve_pack_checklist as rpc  # noqa: E402
+finally:
+    sys.dont_write_bytecode = _dwb
+
+# The supersedes-chain walk hatch-deliver's preflight uses, imported the same way. When it
+# cannot be imported (a partial install), a carried dependency keeps the old null target
+# and the packet says nothing new: Gate 3 then halts on it, which is the safe side, and a
+# message on stdout would corrupt the JSON packet.
+_CHAIN_DIR = str((SCRIPT_DIR / ".." / ".." / "hatch-deliver" / "scripts").resolve())
+if _CHAIN_DIR not in sys.path:
+    sys.path.insert(0, _CHAIN_DIR)
+_dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+try:
+    import supersedes_chain  # noqa: E402
+except ImportError:
+    supersedes_chain = None
+finally:
+    sys.dont_write_bytecode = _dwb
 
 
 class PackResolutionError(Exception):
@@ -125,10 +149,23 @@ def build_packet(binder_path: Path, item_id: str, repo: Path) -> dict:
     integration_name = f"hatch/{slug}/integration" if slug else None
     integration_tip = ref_target(repo, integration_name) if integration_name else None
 
+    sup = binder.get("supersedes") if isinstance(binder.get("supersedes"), dict) else {}
+    carried = {c for c in sup.get("carried") or [] if isinstance(c, str)}
     dependencies: dict[str, dict] = {}
     for dep_id in item.get("depends_on") or []:
         done_ref = f"refs/hatch/{slug}/item-{dep_id}/done"
-        dependencies[dep_id] = {"done_ref": done_ref, "target": ref_target(repo, done_ref)}
+        dep = dependencies[dep_id] = {"done_ref": done_ref, "target": ref_target(repo, done_ref)}
+        # A carried dependency was delivered by an earlier binder in the supersedes chain,
+        # so its done ref stands under that binder's slug, not this one's.
+        if dep["target"] is None and dep_id in carried and supersedes_chain is not None \
+                and isinstance(sup.get("slug"), str):
+            found = supersedes_chain.resolve_delivery(
+                lambda *a: _git(repo, *a), sup["slug"], dep_id, slug)
+            if found.done is None:
+                dep["finding"] = found.reason
+            else:
+                dep.update(done_ref=f"refs/hatch/{found.slug}/item-{dep_id}/done",
+                           target=found.done, delivered_by=found.slug)
 
     sme = resolve_sme(repo, binder.get("sme") or [])
 

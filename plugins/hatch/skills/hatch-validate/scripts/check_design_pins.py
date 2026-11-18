@@ -54,7 +54,11 @@ from pathlib import Path
 # prerequisites phase, rather than moved into the serve phase: this is the one
 # phase that is already nothing but hard gates.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from serve_design import resolve_design_file  # noqa: E402
+_dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+try:  # no __pycache__ in the installed plugin's git clone
+    from serve_design import resolve_design_file  # noqa: E402
+finally:
+    sys.dont_write_bytecode = _dwb
 
 PIN_FILE_NAME = ".hatch/design-pins.json"
 DRIFT_MESSAGE = "design capture does not match its pin in .hatch/design-pins.json"

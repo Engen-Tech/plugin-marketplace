@@ -370,7 +370,8 @@ export async function realVisualGateInvoke(
     await session.prompt(invocation.userPrompt, { images });
     providerFailure(1);
     let text = session.getLastAssistantText()?.trim() ?? "";
-    if (!looksLikeVisualVerdict(text)) {
+    // A cancel between turns aborts no running turn, so it refuses the repair here (F40).
+    if (!looksLikeVisualVerdict(text) && !invocation.signal?.aborted) {
       await session.prompt(VISUAL_VERDICT_REPAIR_PROMPT);
       providerFailure(2);
       text = session.getLastAssistantText()?.trim() ?? text;

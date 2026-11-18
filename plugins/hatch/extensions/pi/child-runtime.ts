@@ -335,6 +335,14 @@ async function createChild(
     tools: customTools.map((tool) => tool.name),
     customTools,
   });
+  // Pi aborts only a running turn, so a cancel that lands before a turn starts stops
+  // nothing. Each turn re-reads the run's signal as it starts; agent_start is awaited
+  // before the first request, so an aborted run sends none (F40). Pi 1.4.0 ends that turn
+  // `error` ("This operation was aborted"), so readers check the signal before stopReason.
+  const signal = ctx.signal;
+  if (signal) session.subscribe((event) => {
+    if (event.type === "agent_start" && signal.aborted) void session.abort();
+  });
   // Pi clamps the requested level to what the model supports; record both.
   report.requestedThinkingLevel = requestedThinkingLevel;
   report.thinkingLevel = session.thinkingLevel;
@@ -425,6 +433,8 @@ export async function runGateResponseProbe(
       });
       // A provider error at the probe is named, so the gate can turn it into a
       // blocked verdict; any other wrong answer stays a plain preflight failure.
+      // A cancelled run's turn also ends `error`, so the signal is read first (F40).
+      if (ctx.signal?.aborted) throw new Error(`Hatch gate provider preflight for '${report.provider}/${report.model}' was cancelled`);
       if (lastTurn.stopReason === "error") throw new GateProviderUnavailableError(report, lastTurn);
       throw new Error(
         `Hatch gate provider preflight returned an unexpected response for '${report.provider}/${report.model}' (${describeLastTurn(lastTurn)})`,
@@ -469,7 +479,7 @@ export class GateProviderPreflight {
   // so a later run probes again: a quota that ran out between runs is never hidden. Each
   // key holds the context of its latest success until clear() at shutdown.
   readonly #successful = new Map<string, { report: ChildRuntimeReport; ctx: ExtensionContext }>();
-  readonly #pending = new Map<string, Promise<ChildRuntimeReport>>();
+  readonly #pending = new Map<string, { probe: Promise<ChildRuntimeReport>; ctx: ExtensionContext }>();
   readonly #probe: GatePreflightProbe;
   #generation = 0;
 
@@ -515,17 +525,25 @@ export class GateProviderPreflight {
     // A run may join another run's in-flight probe. That probe is fresh, and its success is
     // stored only under the context that started it, so the joining run's gates probe again.
     const pending = this.#pending.get(key);
-    if (pending) return { ...forRole(ctx, await pending, target), cached: true };
+    if (pending) {
+      try {
+        return { ...forRole(ctx, await pending.probe, target), cached: true };
+      } catch (error) {
+        // Another run's cancel ends the probe it started; that cancel is not this run's,
+        // so a run whose own signal is live probes once more with it (F40).
+        if (ctx.signal?.aborted || !pending.ctx.signal?.aborted) throw error;
+      }
+    }
 
     const generation = this.#generation;
     const probe = this.#probe(ctx, registry, target);
-    this.#pending.set(key, probe);
+    this.#pending.set(key, { probe, ctx });
     try {
       const report = await probe;
       if (generation === this.#generation) this.#successful.set(key, { report, ctx });
       return { ...forRole(ctx, report, target), cached: false };
     } finally {
-      this.#pending.delete(key);
+      if (this.#pending.get(key)?.probe === probe) this.#pending.delete(key);
     }
   }
 

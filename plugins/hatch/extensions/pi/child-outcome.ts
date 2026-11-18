@@ -107,14 +107,17 @@ export const CHILD_FAILURE_POLICY = {
 } as const satisfies Record<"worker" | "gate" | "writer", Record<ChildFailureKind, FailurePolicy | null>>;
 
 // Whether a child whose reply is not yet usable gets its one corrective turn. A turn that
-// ended `aborted` is cancellation, outside the table: it gets none, and the caller throws.
+// ended `aborted`, or a run whose signal is aborted, is cancellation, outside the table:
+// it gets none, and the caller throws. The signal is read too because a cancel that lands
+// between turns aborts no running turn, so the last turn still reads as it ended (F40).
 // Every other turn gets what the table gives the kind `classifyChildFailure` reads from it.
 export function correctiveTurnAllowed(
   family: "worker" | "gate" | "writer",
   turn: ChildLastTurn | undefined,
   text: string,
+  signal?: AbortSignal,
 ): boolean {
-  if (turn?.stopReason === "aborted") return false;
+  if (signal?.aborted || turn?.stopReason === "aborted") return false;
   return CHILD_FAILURE_POLICY[family][classifyChildFailure(turn, text)].correctiveTurn;
 }
 

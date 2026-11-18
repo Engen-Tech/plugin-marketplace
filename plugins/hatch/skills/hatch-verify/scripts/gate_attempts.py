@@ -76,11 +76,18 @@ class UsageError(Exception):
 
 
 def _load_report_checker():
-    """Reuse check_gate_report.diff_digest so both scripts bind to the same bytes."""
+    """Reuse check_gate_report.diff_digest so both scripts bind to the same bytes.
+
+    The load writes no bytecode: an installed plugin is a git clone (pi's marketplace)
+    that a __pycache__ dirties."""
     path = Path(__file__).resolve().with_name("check_gate_report.py")
     spec = importlib.util.spec_from_file_location("hatch_check_gate_report", path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = dwb
     return module
 
 

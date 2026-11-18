@@ -350,7 +350,7 @@ export function haltOfBuild(
     binder: build.binder,
     item: build.item,
     status: build.status,
-    phase: "build",
+    phase: build.capPhase && build.capPhase !== "build" ? "merge" : "build", // the spent row's phase (F43)
     ...cause,
     attempt: counted !== undefined && counted >= 1 ? counted : null,
     requiredCheckId: droppedCheckId ?? build.requiredCheckIds?.at(-1) ?? null,

@@ -109,6 +109,17 @@ ITEM_CONTEXT = (SCRIPT_DIR / ".." / ".." / "hatch-build" / "scripts" / "item_con
 
 ENV_ORACLE_TYPES = {"integration", "e2e", "visual"}
 
+# The supersedes-chain walk lives beside this script so item_context.py shares it.
+# cwd-independent sibling import; importing supersedes_chain runs nothing. It writes no
+# bytecode: an installed plugin is a git clone (pi's marketplace) that a __pycache__ dirties.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+_dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+try:
+    import supersedes_chain  # noqa: E402
+finally:
+    sys.dont_write_bytecode = _dwb
+
 
 GIT_TIMEOUT = 30       # seconds; every git call here is local and should be instant
 SCRIPT_TIMEOUT = 300   # seconds; the validator and the provenance checker
@@ -242,16 +253,7 @@ def compute_done_provenance(repo: Path, slug: str, refs: dict[str, str],
 def _predecessor_plan(repo: Path, pred: str, tip: str) -> dict | None:
     """The predecessor's committed binder as its own integration tip holds it — live, or
     already moved to the archive path by the sanctioned retirement."""
-    for rel in (f".hatch/binders/{pred}.json",
-                f".hatch/binders/archive/{pred}.json"):
-        proc = _git(repo, "show", f"{tip}:{rel}")
-        if proc.returncode == 0:
-            try:
-                doc = json.loads(proc.stdout)
-            except json.JSONDecodeError:
-                return None
-            return doc if isinstance(doc, dict) else None
-    return None
+    return supersedes_chain.committed_plan(lambda *a: _git(repo, *a), pred, tip)
 
 
 def check_supersedes(repo: Path, binder: dict, integration_name: str,
@@ -288,29 +290,13 @@ def check_supersedes(repo: Path, binder: dict, integration_name: str,
 
         def delivered(iid: str) -> tuple[tuple[str, str, set[str]] | None, str]:
             """(slug, done sha, first-parent chain) of the binder that delivered `iid` on
-            the predecessor's base. A predecessor that carried it itself is followed back
-            through its committed `supersedes`: each hop's integration tip must be on the
-            later hop's, and its committed plan must hold the same item."""
-            hop, tip, hop_plan, hop_chain, seen = pred, pred_tip, plan, chain, {binder.get("slug"), pred}
-            prev = pred_items.get(iid)
-            while (sha := ref_target(repo, f"refs/hatch/{hop}/item-{iid}/done")) is None:
-                hsup = (hop_plan or {}).get("supersedes")
-                nxt = hsup.get("slug") if isinstance(hsup, dict) and iid in (hsup.get("carried") or []) else None
-                if not isinstance(nxt, str):
-                    return None, f"no refs/hatch/{hop}/item-{iid}/done" + (f" (followed from '{pred}')" if hop != pred else "")
-                nxt_tip = ref_target(repo, f"hatch/{nxt}/integration")
-                if nxt in seen or len(seen) > 16 or nxt_tip is None or _git(
-                        repo, "merge-base", "--is-ancestor", nxt_tip, tip).returncode != 0:
-                    return None, (f"'{hop}' carried '{iid}' from '{nxt}', but hatch/{nxt}/integration "
-                                  f"is missing, not on hatch/{hop}/integration, or already followed")
-                hop_plan = _predecessor_plan(repo, nxt, nxt_tip)
-                cur = {it.get("id"): it for it in (hop_plan or {}).get("work_items", []) if isinstance(it, dict)}.get(iid)
-                if cur != prev:
-                    return None, (f"work item '{iid}' differs between the committed plans of '{hop}' "
-                                  f"and '{nxt}'; a carried item is copied unchanged")
-                hop, tip, prev, hop_chain = nxt, nxt_tip, cur, first_parent_chain(repo, f"hatch/{nxt}/integration")
-                seen.add(nxt)
-            return (hop, sha, hop_chain), ""
+            the predecessor's base, by the shared walk in supersedes_chain.py."""
+            hop, sha, why = supersedes_chain.resolve_delivery(
+                lambda *a: _git(repo, *a), pred, iid, binder.get("slug"))
+            if sha is None:
+                return None, why
+            return (hop, sha, chain if hop == pred else
+                    first_parent_chain(repo, f"hatch/{hop}/integration")), ""
 
         for cid in carried_ids:
             found, finding = delivered(cid)
