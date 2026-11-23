@@ -1270,11 +1270,14 @@ def _run_self_test() -> int:  # noqa: C901 — one hermetic harness, many named 
 
             def stop_cli(sig: signal.Signals, disposition=None, runner: Path | None = None,
                          again: signal.Signals | None = None,
-                         gap: float = 0.0) -> tuple[int | None, bool, bool]:
+                         gap: float = 0.0,
+                         await_marker: bool = False) -> tuple[int | None, bool, bool]:
                 """Start close-wave on a check that would write a marker in 2 s, signal
                 merge_item alone once the check runs, then `again` after `gap` seconds,
                 and report (exit, whether the command's group is gone, whether the marker
-                appeared)."""
+                appeared). `await_marker` waits up to 30 s for the marker instead of a
+                fixed 2.5 s, for a case that expects it: a starved guest can take longer
+                than 2.5 s to write it."""
                 case = next(cases)
                 pid_file = stop_dir / f"{case}.pid"
                 marker = stop_dir / f"{case}.marker"
@@ -1308,7 +1311,9 @@ def _run_self_test() -> int:  # noqa: C901 — one hermetic harness, many named 
                     except subprocess.TimeoutExpired:
                         cli_proc.kill()
                         code = None
-                time.sleep(2.5)
+                settle = time.monotonic() + (30 if await_marker else 2.5)
+                while time.monotonic() < settle and not (await_marker and marker.exists()):
+                    time.sleep(0.05)
                 try:
                     os.killpg(group, 0)
                     gone = False
@@ -1378,7 +1383,7 @@ def _run_self_test() -> int:  # noqa: C901 — one hermetic harness, many named 
 
             # Negative control: nothing can catch SIGKILL, so the command outlives
             # merge_item, which shows the probes above can see a survivor.
-            code, gone, written = stop_cli(signal.SIGKILL)
+            code, gone, written = stop_cli(signal.SIGKILL, await_marker=True)
             check("control: a command outliving a SIGKILLed merge_item is visible to "
                   "the probes", code == -signal.SIGKILL and written,
                   f"exit={code} gone={gone} marker={written}")

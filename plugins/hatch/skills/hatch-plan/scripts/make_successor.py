@@ -280,10 +280,26 @@ def _row(iid: str, was: dict, now: dict) -> list[str]:
         for key, label in (("cwd", "cwd"), ("expect", "marker"), ("type", "oracle type")):
             if wo.get(key) != no.get(key):
                 head.append(f"    {label} was: {_shown(wo.get(key))}; now: {_shown(no.get(key))}")
-    for key in ("visual_check_waiver", "design_reference", "contract", "surface"):
+    for key in sorted((set(was) | set(now)) - {"id", "oracle"}):  # every field, so none hides a change
         if was.get(key) != now.get(key):
             head.append(f"    {key} was: {_shown(was.get(key))}; now: {_shown(now.get(key))}")
     return head
+
+
+def _field_rows(key: str, was: object, now: object) -> list[str]:
+    """A changed binder field before and after; a list of entries with ids, entry by entry."""
+    def by_id(v: object) -> dict | None:
+        if v is None:
+            v = []
+        ok = isinstance(v, list) and all(isinstance(e, dict) and isinstance(e.get("id"), str) for e in v)
+        return {e["id"]: e for e in v} if ok and len({e["id"] for e in v}) == len(v) else None
+    wi, ni = by_id(was), by_id(now)
+    if wi is None or ni is None:
+        return [f"  {key} was: {_shown(was)}; now: {_shown(now)}"]
+    return ([f"  {key} dropped: {_shown(wi[i])}" for i in wi if i not in ni]
+            + [f"  {key} added: {_shown(ni[i])}" for i in ni if i not in wi]
+            + [f"  {key} {_shown(i)} was: {_shown(wi[i])}; now: {_shown(ni[i])}"
+               for i in wi if i in ni and wi[i] != ni[i]])
 
 
 def summary(repo: Path, doc: dict, report: dict | None = None) -> str:
@@ -318,6 +334,7 @@ def summary(repo: Path, doc: dict, report: dict | None = None) -> str:
     if dropped := [i for i in old if i not in cur]:
         lines.append(f"Not copied from {pred}: {named(dropped)}")
     lines.append(f"Binder fields changed: {named(fields)}")
+    lines += [r for k in fields for r in _field_rows(k, plan.get(k), doc.get(k))]
     ledger = ledger_dir(repo, new)
     tries = (f"Tries: {new} already has a ledger at {ledger}, so its counts go on. " if ledger.exists() else
              f"Tries: every item not carried starts its acceptance and safety tries afresh under {new}; ")
@@ -387,7 +404,7 @@ def _run_self_test() -> int:
         return doc
 
     def fixture(name: str, done: tuple[str, ...] = ("alpha",), integration: bool = True,
-                **beta: object) -> Path:
+                preconditions: list | None = None, **beta: object) -> Path:
         """Binder `s` (alpha, then beta) committed on main; alpha merged with its marker and
         given a done ref on hatch/s/integration; beta halted there."""
         r = tmp / name
@@ -399,6 +416,8 @@ def _run_self_test() -> int:
         doc = {"slug": "s", "title": "t", "summary": "s", "motivation": "m",
                "scope": {"included": ["x"]},
                "work_items": [item("alpha"), item("beta", depends_on=["alpha"], **beta)]}
+        if preconditions:
+            doc["preconditions"] = preconditions
         (r / ".hatch" / "binders").mkdir(parents=True)
         (r / ".hatch" / "binders" / "s.json").write_text(json.dumps(doc, indent=2) + "\n",
                                                          encoding="utf-8")
@@ -564,6 +583,19 @@ def _run_self_test() -> int:
         check("a missing command against an empty one says absent and empty",
               "    command was: (absent)" in rows and "    command now: (empty)" in rows,
               "\n".join(rows))
+        rows = _row("b", {"oracle": oracle, "waits_on": ["answers"]}, {"oracle": oracle})
+        check("a dropped waits_on shows what it was",
+              '    waits_on was: ["answers"]; now: null' in rows, "\n".join(rows))
+        rows = _row("b", {"oracle": oracle, "waits_on": ["answers", "deadline"]},
+                    {"oracle": oracle, "waits_on": ["answers", "evidence"]})
+        check("a changed waits_on shows both lists",
+              '    waits_on was: ["answers", "deadline"]; now: ["answers", "evidence"]' in rows,
+              "\n".join(rows))
+        rows = _row("b", {"oracle": oracle, "depends_on": ["a"], "touches": ["x.py"]},
+                    {"oracle": oracle, "depends_on": [], "touches": ["x.py", "y.py"]})
+        check("every other changed item field shows its value before and after",
+              '    depends_on was: ["a"]; now: []' in rows
+              and '    touches was: ["x.py"]; now: ["x.py", "y.py"]' in rows, "\n".join(rows))
 
         # --- Windows code page: the summary is UTF-8, and no draft outlives a failure --------
         r = fixture("cp1252")
@@ -733,6 +765,27 @@ def _run_self_test() -> int:
               and "Claimed carried, not proven: alpha, beta" in out
               and "Changed: alpha (oracle)" in out and '    removed or reworded: "alpha two"' in out,
               f"exit {code}\n{out}")
+        pre = [{"id": "answers", "command": "test -f answers.json", "reason": "the answers"},
+               {"id": "deadline", "command": "true", "reason": "the date"},
+               {"id": "evidence", "command": "test -f live.log", "reason": "the evidence"}]
+        hand = dict(hand, slug="s-r7", supersedes={"slug": "s", "carried": ["alpha"]},
+                    work_items=[item("alpha"), item("beta", depends_on=["alpha"])],
+                    preconditions=[pre[0], dict(pre[2], command="test -s live.log")])
+        hand_path.write_text(json.dumps(hand, indent=2), encoding="utf-8")
+        code, out = run("--summary", str(hand_path), "--repo", str(fixture("pre", preconditions=pre)))
+        check("--summary shows a dropped and a changed precondition, and not a kept one",
+              code == 0 and "Binder fields changed: preconditions\n" in out
+              and '  preconditions dropped: {"id": "deadline", "command": "true", "reason": "the date"}' in out
+              and '  preconditions "evidence" was: {"id": "evidence", "command": "test -f live.log", '
+                  '"reason": "the evidence"}; now: {"id": "evidence", "command": "test -s live.log", '
+                  '"reason": "the evidence"}' in out
+              and 'preconditions "answers"' not in out, f"exit {code}\n{out}")
+        hand = dict(hand, slug="s-r8", preconditions="not a list")
+        hand_path.write_text(json.dumps(hand, indent=2), encoding="utf-8")
+        code, out = run("--summary", str(hand_path), "--repo", str(fixture("pre-bad", preconditions=pre)))
+        check("a precondition list of another shape shows whole before and after",
+              code == 0 and '  preconditions was: [{"id": "answers"' in out
+              and '"reason": "the evidence"}]; now: "not a list"' in out, f"exit {code}\n{out}")
         code, out = run("--summary", str(r / ".hatch/binders/s.json"), "--repo", str(r))
         check("--summary on a binder without supersedes is refused", code == 3, f"exit {code}\n{out}")
     finally:

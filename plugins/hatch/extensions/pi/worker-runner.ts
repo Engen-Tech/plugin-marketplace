@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { dirname } from "node:path";
 import {
   ChildRegistry,
   createWorkerChildSession,
@@ -358,7 +359,10 @@ function workerSystemPrompt(profile: BuildWorkerCapabilityProfile): string {
             `### ${instruction.path} (blob ${instruction.blob}, sha256 ${instruction.sha256})\n\n${instruction.content}`,
         )
         .join("\n\n");
-  return `${profile.role.prompt}
+  // The skill body names its bundled scripts as <skill-dir>/...; the worker has no
+  // hatch_script tool, so the brief carries the installed directory itself.
+  const skillDir = dirname(profile.role.sourcePath);
+  return `${profile.role.prompt.replaceAll("<skill-dir>", () => skillDir)}
 
 ## Committed project instructions
 
@@ -371,6 +375,8 @@ ${projectInstructions}
 You are an isolated implementation worker in exactly one assigned Git worktree. You have only ${profile.toolNames.join(", ")}. Read project instructions and relevant code before editing. Bash is trusted high authority, not a sandbox: keep every command and mutation inside the assigned worktree.
 
 The host owns staging, secret scanning, acceptance commands, gates, commits, tags, merges, and Hatch refs. Do not run git add, git commit, git tag, git merge, git reset, git checkout, git switch, git worktree, or git update-ref. Do not edit .hatch/binders or .hatch/roundtable. Implement and self-check the requested item, but leave all candidate changes uncommitted for the host.
+
+The hatch-build skill above is installed at \`${skillDir}\`, outside the worktree; its relative links resolve there. Read and run its bundled scripts only from that directory, through bash, never from a copy elsewhere on disk. Quote that path in a command when it holds a space. The host already runs run_oracle.py (as the oracle check), scan_secrets.py, halt_record.py, validate_binder.py and check_plan_inputs.py; do not run those.
 
 When a \`HATCH-SME-OVERRIDE\` rationale cites a repo rule, write the citation as \`${REPO_RULE_CITATION_SHAPE}\` with a colon directly after the path, for example \`repo-rule: AGENTS.md:Error handling\`; the host reads no other form and sends any other back as an undeclared override.
 
