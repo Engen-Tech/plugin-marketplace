@@ -2,7 +2,7 @@
   "name": "steward-orchestration",
   "displayName": "Steward Orchestration",
   "description": "Primary and secondary session roles for multi-session initiatives on Claude Code, with a shared registry of who directs whom.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": {
     "name": "Engen Inc.",
     "url": "https://engen.tech"
