@@ -75,7 +75,7 @@ The operator decided on 2026-10-12: "Opus max must never be used." "max will alw
 - The Claude Code profile keeps the name `reviewer-opus-max`. Renaming would break saved briefs, and Claude Code has no profile aliases.
 - The top reviewer and `steward-delegation:deep-reasoner-opus-xhigh` now share model and effort. The top reviewer stays a separate profile for its role: a gap-review prompt, used on the operator's request or when a deep-reasoner pass is not enough.
 - Fable 5.1 stays unpinned. A request for Fable by name still runs the top reviewer with a per-call Fable model at the level the operator names (`xhigh` if none).
-- Codex is unchanged: its top reviewer is `gpt-6-astra`, not Opus.
+- Codex has its own [top-reviewer profile](../../codex/skills/delegating/SKILL.md#choose-a-role).
 
 This supersedes the 2026-10-11 section below, which stays as history.
 

@@ -13,13 +13,13 @@ The main agent gathers requirements, chooses the role, gives a self-contained br
 
 |Role|Model|Effort|Fallback|Use for|
 |-|-|-|-|-|
-|coder|`gpt-6.1-sol`|high|none|Implementation with a clear spec and a verifiable check|
-|deep-reasoner|`gpt-6-astra`|xhigh|`gpt-6.1-sol` xhigh|Architecture, ambiguous design, security, subtle correctness|
-|reviewer|`gpt-6.1-sol`|medium|none|Everyday diff and PR review|
-|researcher|`gpt-6.1-sol`|medium|none|Read-only codebase or web investigation|
-|writer|`gpt-6.1-sol`|medium|none|Docs, substantial PR bodies, prose rewrites|
-|mechanic|`gpt-6-luna`|high|none|A known command, single lookup, or rote edit|
-|top-reviewer|`gpt-6-astra`|max|`gpt-6.1-sol` xhigh|Highest-stakes gap review, only on explicit user request|
+|coder|`gpt-6.2-sol`|high|none|Implementation with a clear spec and a verifiable check|
+|deep-reasoner|`gpt-6.2-astra`|xhigh|`gpt-6.2-sol` xhigh|Architecture, ambiguous design, security, subtle correctness|
+|reviewer|`gpt-6.2-sol`|medium|none|Everyday diff and PR review|
+|researcher|`gpt-6.2-sol`|medium|none|Read-only codebase or web investigation|
+|writer|`gpt-6.2-sol`|medium|none|Docs, substantial PR bodies, prose rewrites|
+|mechanic|`gpt-6-luna`|low|none|A known command, single lookup, or rote edit|
+|top-reviewer|`gpt-6.2-astra`|max|`gpt-6.2-sol` xhigh|Highest-stakes gap review, only on explicit user request|
 
 These are provisional task assignments based on published evidence, not measured Steward success rates. Read [profiles.json](profiles.json) for each role's brief and escalation settings. API list prices and AA cost per benchmark task do not describe ChatGPT subscription usage.
 
@@ -31,7 +31,9 @@ Read the chosen role's `instructions` in profiles.json and include them in the b
 
 Wait for results through the client's subagent wait tool. Inspect the actual diff or cited evidence, run the required checks, and fix or return concrete failures to the worker. A coder that misses its check can retry on Sol at xhigh. If a mechanic needs judgment or fails its check, move the task to Sol at low effort or the appropriate stronger role. Never silently lower a model or effort because it is unavailable. Explain the limitation and choose an available configuration within the user's instructions.
 
-Astra fallback (Operator decision, 2026-10-09): when `gpt-6-astra` is unavailable, the deep-reasoner and top-reviewer roles fall back to `gpt-6.1-sol` at xhigh, as recorded in each role's `fallback` field in profiles.json. Astra counts as unavailable when it is missing from the client's model list or a dispatch with it is rejected as unavailable. A worker that ran and produced weak results is not a reason to fall back. When you fall back, tell the user in one line, naming the role, the unavailable model, and the fallback, for example: "deep-reasoner: gpt-6-astra is unavailable, so this runs on gpt-6.1-sol at xhigh." This is the only pre-approved substitution; explain any other unavailable configuration as above. The named agents `steward-deep-reasoner` and `steward-top-reviewer` pin Astra and cannot fall back on their own. If one fails because Astra is unavailable, dispatch the same brief without that `agent_type` (or with the generic agent) and pass `model: gpt-6.1-sol` and `reasoning_effort: xhigh` explicitly. If the client does not support explicit model selection, report the limitation instead.
+Astra fallback policy (Operator decision, 2026-10-09): only the deep-reasoner and top-reviewer roles may fall back when Astra is unavailable. Astra counts as unavailable when it is missing from the client's model list or a dispatch with it is rejected as unavailable. A worker that ran and produced weak results is not a reason to fall back.
+
+The current model assignments are recorded in profiles.json: when `gpt-6.2-astra` is unavailable, those roles fall back to `gpt-6.2-sol` at xhigh, as recorded in each role's `fallback` field. When you fall back, tell the user in one line, naming the role, the unavailable model, and the fallback, for example: "deep-reasoner: gpt-6.2-astra is unavailable, so this runs on gpt-6.2-sol at xhigh." This is the only pre-approved substitution; explain any other unavailable configuration as above. The named agents `steward-deep-reasoner` and `steward-top-reviewer` pin Astra and cannot fall back on their own. If one fails because Astra is unavailable, dispatch the same brief without that `agent_type` (or with the generic agent) and pass `model: gpt-6.2-sol` and `reasoning_effort: xhigh` explicitly. If the client does not support explicit model selection, report the limitation instead.
 
 This port targets the local Codex runtime in the CLI and the ChatGPT desktop app (formerly the Codex app). If subagents or model overrides are unavailable in a client, disclose the limitation. Do not claim pinned execution when the tool cannot provide it. Carry out authorized work directly if delegation is unavailable.
 
