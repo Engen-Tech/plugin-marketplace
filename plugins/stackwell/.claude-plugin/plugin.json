@@ -1,8 +1,11 @@
 {
   "name": "stackwell",
-  "version": "0.4.1",
-  "description": "A calm right-side status pane for Claude Code: context, quota, session, git, agents and tools at a glance, grey by default with colour only for groups and for warn and crit.",
-  "author": { "name": "Engen Inc.", "url": "https://engen.tech" },
+  "version": "0.5.0",
+  "description": "A calm right-side status pane for Claude Code: context, quota, steward, hatch, folders, agents and session at a glance, grey by default with colour only for groups and for warn and crit. It observes only and never hooks tool calls.",
+  "author": {
+    "name": "Engen Inc.",
+    "url": "https://engen.tech"
+  },
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -11,7 +14,13 @@
       "title": "Theme",
       "description": "auto (palette file if set, else Claude Code's light or dark theme), vga, mocha, tokyo-night or latte.",
       "default": "auto",
-      "options": ["auto", "vga", "mocha", "tokyo-night", "latte"]
+      "options": [
+        "auto",
+        "vga",
+        "mocha",
+        "tokyo-night",
+        "latte"
+      ]
     },
     "quotaDir": {
       "type": "string",
@@ -24,6 +33,19 @@
       "title": "Palette file",
       "description": "A file holding a '# >>> PALETTE' ... '# <<< PALETTE' block of NAME=R,G,B lines; used when the theme is auto. Empty: off.",
       "default": ""
+    },
+    "sessionDirs": {
+      "type": "string",
+      "multiple": true,
+      "title": "Session folders",
+      "description": "Folders of Claude Code session files for steward peer status; for example ~/.claude/sessions; a '*' in a part of the path matches any folder name there. Empty: this session's own config folder.",
+      "default": []
+    },
+    "showIcon": {
+      "type": "boolean",
+      "title": "Show icon",
+      "description": "Draw the mod's icon in the header and the section icons on terminals that show images; off, the section words everywhere.",
+      "default": true
     }
   }
 }

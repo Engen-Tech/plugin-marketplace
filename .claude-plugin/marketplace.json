@@ -18,7 +18,7 @@
     },
     {
       "name": "stackwell",
-      "description": "A calm right-side status pane for Claude Code: context, quota, session, git, agents and tools at a glance, grey by default with colour only for groups and for warn and crit.",
+      "description": "A calm right-side status pane for Claude Code: context, quota, steward, hatch, folders, agents and session at a glance, grey by default with colour only for groups and for warn and crit. It observes only and never hooks tool calls.",
       "source": "./plugins/stackwell"
     },
     {
