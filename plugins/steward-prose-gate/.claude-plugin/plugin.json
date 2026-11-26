@@ -2,7 +2,7 @@
   "name": "steward-prose-gate",
   "displayName": "Steward Prose Gate",
   "description": "Blocks a reply or a gh pr create/edit body that reads like AI-generated text, and asks for a plain-language revision.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": {
     "name": "Engen Inc.",
     "url": "https://engen.tech"

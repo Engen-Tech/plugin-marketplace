@@ -58,11 +58,11 @@
     "pi": {}
   },
   "steward-prose-gate": {
-    "version": "1.0.1",
+    "version": "1.0.2",
     "source": "https://github.com/TejGandham/steward",
-    "tag": "steward-prose-gate--v1.0.1",
-    "commit": "4fdc3e381a870c6887f0b740ff6d035035c24827",
-    "tree": "f25125c325eb437e22aa1f2de905dda4ebd4b200",
+    "tag": "steward-prose-gate--v1.0.2",
+    "commit": "d526f56702ed15987ace2d6dcc7878b9889c3311",
+    "tree": "b5593461f21b1af4bbf4c96714b1309ad1bf80ad",
     "pi": {
       "extensions": [
         "pi/extensions/steward-prose-gate/index.ts"
