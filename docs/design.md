@@ -130,7 +130,7 @@ Failures: a failed run leaves the marketplace unchanged; fix the cause and re-ru
 - Product: `stackwell`, a Claude Code mod (hooks module plugin): `.claude-plugin/plugin.json`, `hooks/hooks.json`, `hooks/register.tsx`. Mods run only in Claude Code, so it has no `.codex-plugin`, no `.github/plugin` and no pi resources, and the catalog and lock entries carry none.
 - Product repo: Forgejo `stackhouse/utils`, folder `stackwell/mod/`. Workflow `.forgejo/workflows/release-marketplace.yml`, on tags `stackwell--v*`. Assembly `scripts/release_marketplace.sh` is utils' own. Publisher `scripts/publish_marketplace.py` is copied byte for byte, the same rule as the other two products.
 - Assembly: copies `stackwell/mod/` as is. No compile, bundle or minify step. It excludes `.git` and the engine-generated `.claude-plugin/types/`.
-- Recorded `source`: the neutral `https://engen.tech`, not the internal Forgejo URL (operator decided 2026-11-26), so no internal hostname reaches the lock or the release commits. The publisher's rule that a lock entry's `source` must be its own repo URL holds for stackwell with this value.
+- Recorded `source`: the neutral `https://engen.tech`, not the internal Forgejo URL (operator decided 2026-11-26), so no internal hostname reaches the lock or the release commits.
 - Licence: the stackwell plugin is MIT (`LICENSE` in the plugin folder, `license` in its `plugin.json`). The root `package.json` `"UNLICENSED"` is the pi package's own field and does not apply to it. This is an exception to "License" below.
 - Secret: utils has its own repo secret `MARKETPLACE_TOKEN`, a separate fine-grained PAT named `stackwell-marketplace-release`: resource owner Engen-Tech, repository `plugin-marketplace` only, Contents read and write.
 
