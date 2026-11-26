@@ -1,7 +1,7 @@
 // Pure drawing for the stackwell pane: view model + width -> one cell buffer.
 // A calm status pane: grey by default, muted hues mark groups, saturated colour only for warn and crit.
 
-import type { StackwellAgent, StackwellBreakdown, StackwellLogEntry, StackwellPalette, StackwellQuota, StackwellSteward, StackwellView } from '../types'
+import type { StackwellAgent, StackwellBreakdown, StackwellLogEntry, StackwellPalette, StackwellPeer, StackwellQuota, StackwellSteward, StackwellView } from '../types'
 
 export const DEFAULT_COLOR = 0x01000000
 
@@ -381,7 +381,7 @@ function toolsRow(v: StackwellView, W: number, LW: number, P: StackwellPalette):
     .slice(0, 3)
   if (top.length === 0) return undefined
   const label = (v.isToolsOpen ? '▾ ' : '▸ ') + 'tools'
-  const LWt = Math.max(LW, len(label) + 1)
+  const LWt = Math.max(LW, len(label) + 2)
   const fail: Row = v.bashFails > 0 ? [{ text: `✕ ${v.bashFails}`, fg: P.warn }] : []
   const room = W - LWt - (fail.length ? len(fail[0]!.text) + 1 : 0)
   const head: Seg = { text: label.padEnd(LWt), fg: P.tools }
@@ -408,31 +408,36 @@ export function fmtAgo(ms: number): string {
   return h < 48 ? `${h}h` : `${Math.floor(h / 24)}d`
 }
 
-/** The steward section: role and initiative, one row per peer, the decision log's age. */
-function stewardLines(st: StackwellSteward, v: StackwellView, W: number, LW: number, P: StackwellPalette): Line[] {
-  const out: Line[] = [
-    {
-      row: fitRow(
-        [
-          { text: 'steward'.padEnd(LW), fg: P.steward },
-          { text: st.role, fg: P.text },
-          { text: ' · ', fg: P.dim },
-          { text: st.initiative, fg: P.text },
-        ],
-        W,
-      ),
-      kind: 'core',
-    },
-  ]
-  const indent: Seg = { text: ' '.repeat(LW), fg: P.dim }
-  for (const peer of st.peers) {
-    const row: Row = [indent, { text: cut(peer.name, 16).padEnd(17), fg: P.text }]
-    if (peer.status) {
-      row.push({ text: peer.role.padEnd(12), fg: P.dim }, { text: peer.status, fg: peer.status === 'busy' ? P.text : P.dim })
-    } else row.push({ text: peer.role, fg: P.dim })
-    out.push({ row: fitRow(row, W), kind: 'speer' })
-  }
-  if (st.logMtime !== undefined) out.push({ row: fitRow([indent, { text: `log ${fmtAgo(v.now - st.logMtime)} ago`, fg: P.dim }], W), kind: 'slog' })
+/** A name with a status on the right; the status goes before the name is cut. */
+function nameStatus(W: number, lead: Row, name: string, status: Seg | undefined): Row {
+  const used = lead.reduce((n, x) => n + len(x.text), 0)
+  const fitsAll = status && used + len(name) + 1 + len(status.text) <= W
+  if (status && fitsAll) return sides(W, [...lead, { text: name, fg: 0 }], [status])
+  return fitRow([...lead, { text: name, fg: 0 }], W)
+}
+
+/**
+ * The steward section as a tree: `★ initiative` when this session is the primary (its
+ * secondaries below), the initiative alone when a secondary (`↑` the primary, then the
+ * siblings); the decision log's age last.
+ */
+function stewardLines(st: StackwellSteward, v: StackwellView, W: number, LW: number, isNarrow: boolean, P: StackwellPalette): Line[] {
+  const head: Row = [{ text: (isNarrow ? 'stw' : 'steward').padEnd(LW), fg: P.steward }]
+  if (st.role === 'primary') head.push({ text: '★ ', fg: P.steward })
+  head.push({ text: st.initiative, fg: P.text })
+  const out: Line[] = [{ row: fitRow(head, W), kind: 'core' }]
+  const hasLog = st.logMtime !== undefined
+  const branches = st.peers.filter(p => p.role !== 'primary')
+  const status = (p: StackwellPeer): Seg | undefined =>
+    p.status ? { text: p.status, fg: p.status === 'busy' ? P.text : P.dim } : undefined
+  const named = (row: Row): Row => row.map(x => (x.fg === 0 ? { ...x, fg: P.text } : x))
+  for (const p of st.peers.filter(p => p.role === 'primary'))
+    out.push({ row: named(nameStatus(W, [{ text: '  ↑  ', fg: P.dim }], p.name, status(p))), kind: 'speer' })
+  branches.forEach((p, i) => {
+    const isLast = i === branches.length - 1 && !hasLog
+    out.push({ row: named(nameStatus(W, [{ text: isLast ? '  └─ ' : '  ├─ ', fg: P.dim }], p.name, status(p))), kind: 'speer' })
+  })
+  if (hasLog) out.push({ row: fitRow([{ text: `  └─ log ${fmtAgo(v.now - st.logMtime!)} ago`, fg: P.dim }], W), kind: 'slog' })
   return out
 }
 
@@ -483,7 +488,7 @@ function accountRows(v: StackwellView, W: number, LW: number, isNarrow: boolean,
   const out: Row[] = []
   for (const a of v.accounts) {
     if (a.name === v.profile) continue
-    const label = cut(isNarrow ? a.name : `acct ${a.name}`, LW - 1)
+    const label = cut(isNarrow ? a.name : `acct ${a.name}`, LW - 2)
     if (isStale(a.updatedAt, v.now)) {
       out.push([{ text: cut(`${isNarrow ? a.name : 'acct ' + a.name}  stale`, W), fg: P.dim }])
       continue
@@ -615,18 +620,28 @@ function agentRow(a: StackwellAgent, label: string, v: StackwellView, W: number,
 const pad2 = (n: number) => String(n).padStart(2, '0')
 const hhmm = (ms: number) => `${pad2(new Date(ms).getHours())}:${pad2(new Date(ms).getMinutes())}`
 
-function logRow(e: StackwellLogEntry, W: number, P: StackwellPalette): Row {
+const NAME_CAP = 16
+
+/** One log line: time, the tool's name in a column `col` wide, the target, the duration. */
+function logRow(e: StackwellLogEntry, W: number, col: number, P: StackwellPalette): Row {
   const right: Seg =
     e.status === 'running' ? { text: '…', fg: P.dim }
     : e.status === 'failed' ? { text: '✕ ' + (e.ms === undefined ? '' : fmtDur(e.ms)), fg: P.warn }
     : { text: e.ms === undefined ? '' : fmtDur(e.ms), fg: P.dim }
-  const left: Row = [
+  const lead: Row = [
     { text: hhmm(e.at) + '  ', fg: P.dim },
-    { text: cut(toolName(e.tool), 6).padEnd(7), fg: P.tools },
-    { text: e.target, fg: P.text },
+    { text: cut(toolName(e.tool), col).padEnd(col), fg: P.tools },
   ]
+  const used = 5 + 2 + col + (len(right.text) ? len(right.text) + 1 : 0)
+  // the target shrinks first; under 4 cells it goes
+  const room = W - used - 2
+  const isMcp = e.tool.startsWith('mcp__')
+  const left: Row = room >= 4 && e.target ? [...lead, { text: '  ' + cut(e.target, room), fg: isMcp ? P.dim : P.text }] : lead
   return sides(W, left, [right])
 }
+
+/** The name column: as wide as the longest name shown, at most NAME_CAP. */
+const nameColumn = (log: StackwellLogEntry[]) => Math.min(NAME_CAP, Math.max(1, ...log.map(e => len(toolName(e.tool)))))
 
 type Kind = 'core' | 'trend' | 'acct' | 'cost' | 'git' | 'done' | 'tools' | 'slog' | 'speer'
 type Line = { row: Row; kind: Kind }
@@ -635,7 +650,8 @@ type Line = { row: Row; kind: Kind }
 function groups(v: StackwellView, W: number): Line[][] {
   const P = v.palette
   const isNarrow = W < 44
-  const LW = isNarrow ? 6 : 12
+  // every label is at most LW - 2 long: 2 spaces always stand before the content
+  const LW = isNarrow ? 7 : 12
   const core = (row: Row): Line => ({ row, kind: 'core' })
   const out: Line[][] = [[core(header(v, W, P))]]
   if (v.percent === undefined && v.tokens === undefined) {
@@ -648,7 +664,7 @@ function groups(v: StackwellView, W: number): Line[][] {
   const win = v.window ?? v.breakdown?.raw
   if (v.tokens !== undefined) nums.push({ text: fmtTok(v.tokens) + (win ? ` / ${fmtTok(win)}` : ''), fg: P.text })
   nums.push({ text: '  ' + pctText(pct).padStart(4), fg: stateCol(ctxLevel(pct), P.text, P) })
-  const ctx: Line[] = [core(sides(W, [{ text: isNarrow ? 'ctx' : 'context', fg: P.context }], fitRow(nums, W))), core(contextBar(v, W, P))]
+  const ctx: Line[] = [core(sides(W, [{ text: (isNarrow ? 'ctx' : 'context') + '  ', fg: P.context }], fitRow(nums, W))), core(contextBar(v, W, P))]
   const leg = legend(v, W, P)
   if (leg.length) ctx.push(core(leg))
   const tr = trendRow(v, W, LW, P)
@@ -666,7 +682,7 @@ function groups(v: StackwellView, W: number): Line[][] {
   if (c) sess.push({ row: c, kind: 'cost' })
   out.push(sess)
   // steward: only while this session is in the registry
-  out.push(v.steward ? stewardLines(v.steward, v, W, LW, P) : [])
+  out.push(v.steward ? stewardLines(v.steward, v, W, LW, isNarrow, P) : [])
   // git
   const g = gitRow(v, W, LW, P)
   out.push(g ? [{ row: g, kind: 'git' }] : [])
@@ -711,7 +727,8 @@ export function layoutAt(v: StackwellView, W: number, H = Infinity): { rows: Row
   const rows = lines.map(l => l.row)
   if (toolsAt >= 0 && v.isToolsOpen && !hasDropped && rows.length < H) {
     const log = [...v.log].reverse().slice(0, H === Infinity ? undefined : H - rows.length)
-    rows.push(...log.map(e => logRow(e, W, v.palette)))
+    const col = nameColumn(log)
+    rows.push(...log.map(e => logRow(e, W, col, v.palette)))
   }
   const cut = rows.slice(0, H === Infinity ? undefined : Math.max(1, H))
   return { rows: cut, toolsAt: toolsAt < cut.length ? toolsAt : -1 }

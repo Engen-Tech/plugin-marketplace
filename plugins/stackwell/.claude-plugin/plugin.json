@@ -1,6 +1,6 @@
 {
   "name": "stackwell",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "A calm right-side status pane for Claude Code: context, quota, session, git, agents and tools at a glance, grey by default with colour only for groups and for warn and crit.",
   "author": { "name": "Engen Inc.", "url": "https://engen.tech" },
   "license": "MIT",

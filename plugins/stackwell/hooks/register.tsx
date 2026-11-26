@@ -342,7 +342,8 @@ function targetOf(tool: string, input: Record<string, unknown>): string {
   if (['Read', 'Edit', 'Write', 'NotebookEdit'].includes(tool)) return clean(basename(str('file_path') || str('notebook_path')))
   if (tool === 'Grep' || tool === 'Glob') return clean(str('pattern')).slice(0, 60)
   if (tool === 'Agent') return clean(str('description') || str('subagent_type'))
-  if (tool.startsWith('mcp__')) return clean(tool.split('__').pop() ?? '')
+  // an MCP tool's name is in the name column; its server is the target
+  if (tool.startsWith('mcp__')) return clean(tool.split('__')[1] ?? '')
   return clean(str('description') || str('url') || str('query') || str('skill')).slice(0, 60)
 }
 

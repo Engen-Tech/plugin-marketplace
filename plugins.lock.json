@@ -24,11 +24,11 @@
     }
   },
   "stackwell": {
-    "version": "0.4.0",
+    "version": "0.4.1",
     "source": "https://engen.tech",
-    "tag": "stackwell--v0.4.0",
-    "commit": "6265226d4d8a847902da617b5a9f458aa0887c56",
-    "tree": "888e5ad23e22f97a3157a68e36b8b81174288bde",
+    "tag": "stackwell--v0.4.1",
+    "commit": "3f1a0d57a243c1cc8d592006abf9cb319f731ae5",
+    "tree": "ca2f2909ea62aa855e0ef0930832ccad367853fa",
     "pi": {}
   },
   "steward-delegation": {

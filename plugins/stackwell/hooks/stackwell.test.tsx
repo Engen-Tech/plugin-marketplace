@@ -615,7 +615,7 @@ test('accounts: every window named with percent and reset, no bar; warn and crit
   expect(br.some(s => s.text.includes('━'))).toBe(false)
   // too narrow for both: the fuller window alone, still named
   const narrow = layout(v, 24, 200).map(txt).find(l => l.startsWith('beta'))!
-  expect(narrow).toBe('beta  5h 58%  58m')
+  expect(narrow).toBe('beta   5h 58%  58m')
   expect(all.some(l => l.startsWith('acct none'))).toBe(false)
   expect(all.some(l => l.startsWith('acct me'))).toBe(false)
   const hot = find(v, /^acct hot/)!
@@ -681,9 +681,9 @@ test('tool log: newest first, time, tool in the tools hue, failed in warn with �
   const rows = layout(v, 48, 200)
   const t = rows.findIndex(r => txt(r).startsWith('▾ tools'))
   expect(rows.slice(t + 1).map(txt)).toEqual([
-    `${hhmm(NOW)}  Read   draw.ts` + '…'.padStart(27),
-    `${hhmm(NOW - M)}  Edit   register.tsx` + '✕ 1.5s'.padStart(22),
-    `${hhmm(NOW - 2 * M)}  Bash   git status --short` + '0.4s'.padStart(16),
+    `${hhmm(NOW)}  Read  draw.ts` + '…'.padStart(28),
+    `${hhmm(NOW - M)}  Edit  register.tsx` + '✕ 1.5s'.padStart(23),
+    `${hhmm(NOW - 2 * M)}  Bash  git status --short` + '0.4s'.padStart(17),
   ])
   expect(colourOf(rows[t + 2], 'Edit')).toBe(P.tools)
   expect(colourOf(rows[t + 2], '1.5s')).toBe(P.warn)
@@ -698,7 +698,7 @@ test('the tool log never takes more rows than there are', () => {
     expect(rows.length, `rows ${Hh}`).toBeLessThanOrEqual(Hh)
   }
   const full = layout(v, 48, 200).map(txt)
-  expect(full.filter(l => / {2}Bash {3}cmd/.test(l)).length).toBe(30)
+  expect(full.filter(l => / {2}Bash {2}cmd/.test(l)).length).toBe(30)
 })
 
 test('a short height drops, in order: log, finished agents, cost row, accounts, git, trend', () => {
@@ -723,7 +723,7 @@ test('a short height drops, in order: log, finished agents, cost row, accounts, 
       acct: all.some(l => l.startsWith('acct')), git: all.some(l => l.startsWith('git')), trend: all.some(l => l.startsWith('trend')),
       runner: all.some(l => l.includes('runner')),
       tools: all.some(l => /^. tools/.test(l)),
-      slog: all.some(l => /^ +log \d/.test(l)), speer: all.some(l => l.includes('beta-sec')),
+      slog: all.some(l => /└─ log \d+\w ago/.test(l)), speer: all.some(l => l.includes('beta-sec')),
       steward: all.some(l => l.startsWith('steward')),
     }
   }
@@ -822,7 +822,7 @@ test('tool calls fill the log through the engine, newest first, with targets', a
   const f = await frame($)
   const t = row(f, /^▾ tools/)
   expect(f.lines.slice(t + 1, t + 4).map(l => l.slice(7).trimEnd().replace(/\s+\S+$/, ''))).toEqual([
-    'Grep   readUsage', 'Read   register.tsx', 'Bash   git status --short --branch',
+    'Grep  readUsage', 'Read  register.tsx', 'Bash  git status --short --branch',
   ])
 })
 
@@ -854,14 +854,14 @@ test('the tools row is a Button: a click toggles it, and so does /stackwell tool
   await $.tool.call({ tool: 'Bash', command: 'ls' })
   let f = await frame($)
   expect(f.lines.some(l => l.startsWith('▸ tools'))).toBe(true)
-  expect(f.lines.some(l => / {2}Bash {3}ls/.test(l))).toBe(false)
+  expect(f.lines.some(l => / {2}Bash {2}ls/.test(l))).toBe(false)
   // the click path: press the Button by its key
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: TOOLS_KEY })
   await ui.unmount()
   f = await frame($)
   expect(f.lines.some(l => l.startsWith('▾ tools'))).toBe(true)
-  expect(f.lines.some(l => / {2}Bash {3}ls/.test(l))).toBe(true)
+  expect(f.lines.some(l => / {2}Bash {2}ls/.test(l))).toBe(true)
   // the command path
   const out = await run($, 'tools')
   expect(out.text).toContain('closed')
@@ -898,7 +898,7 @@ const stewardRows = (f: Frame) => {
   const i = row(f, /^steward/)
   if (i < 0) return []
   const out = [f.lines[i]!.trimEnd()]
-  for (let k = i + 1; k < f.lines.length && f.lines[k]!.startsWith('            ') && f.lines[k]!.trim() !== ''; k++) out.push(f.lines[k]!.trimEnd())
+  for (let k = i + 1; k < f.lines.length && f.lines[k]!.startsWith('  ') && f.lines[k]!.trim() !== ''; k++) out.push(f.lines[k]!.trimEnd())
   return out
 }
 
@@ -933,10 +933,10 @@ test('steward: primary view with peer states from ListAgents and the decision lo
   await start($)
   const f = await frame($)
   expect(stewardRows(f)).toEqual([
-    'steward     primary · widget-release',
-    '            beta-sec         secondary   busy',
-    '            gamma-sec        secondary   offline',
-    '            log 12m ago',
+    'steward     ★ widget-release',
+    '  ├─ beta-sec'.padEnd(44) + 'busy',
+    '  ├─ gamma-sec'.padEnd(41) + 'offline',
+    '  └─ log 12m ago',
   ])
   const y = row(f, /^steward/)
   expect(f.fg(0, y)).toBe(P.steward)
@@ -951,9 +951,9 @@ test('steward: secondary view, matched by the session id inside a messy cell', a
   millionSession(on)
   await start($)
   expect(stewardRows(await frame($))).toEqual([
-    'steward     secondary · widget-release',
-    '            alpha-main       primary',
-    '            gamma-sec        secondary',
+    'steward     widget-release',
+    '  ↑  alpha-main',
+    '  └─ gamma-sec',
   ])
 })
 
@@ -970,14 +970,14 @@ test('steward: the registry is parsed again only when its mtime changes', async 
   st.registry = REGISTRY.replace('widget-release', 'widget-launch')
   await complete($)
   expect(st.reads!.length).toBe(2)
-  expect(stewardRows(await frame($))[0]).toBe('steward     primary · widget-launch')
+  expect(stewardRows(await frame($))[0]).toBe('steward     ★ widget-launch')
 })
 
 test('steward: STEWARD_ORCHESTRATION_DIR moves the registry', async ($, on) => {
   world(on, { steward: { registry: REGISTRY, sessionId: ID_A, dir: '/srv/orchestration' } })
   millionSession(on)
   await start($)
-  expect(stewardRows(await frame($))[0]).toBe('steward     primary · widget-release')
+  expect(stewardRows(await frame($))[0]).toBe('steward     ★ widget-release')
 })
 
 
@@ -1065,6 +1065,98 @@ test('no local names, paths or real ids in the shipped code', () => {
   // test fixtures use patterned ids only
   for (const id of REGISTRY.match(UUID) ?? []) expect(/^(\d)\1{7}-/.test(id), id).toBe(true)
 })
+
+// ---------------------------------------------------------------- spacing and names
+
+test('every group label has at least 2 spaces before its content, at widths 30 to 60', () => {
+  const v = base({
+    costUsd: 5, startedAt: NOW - H, turnCosts: [1, 2], turns: 2, lastTurnMs: 1000, trend: [100_000, 131_000],
+    quotas: [{ kind: 'five_hour', pct: 10, resetsAt: NOW + H }, { kind: 'seven_day', pct: 20, resetsAt: NOW + 24 * H }],
+    accounts: [{ name: 'work-account', d7: 12, d7At: NOW + H, updatedAt: NOW / 1000 }],
+    git: { files: 1, added: 1, removed: 1, ahead: 0 },
+    agents: [{ id: '1', name: 'runner', isBackground: false, status: 'running', startedAt: NOW - M }],
+    toolCounts: { Bash: 5 }, log: logOf(2),
+    steward: { role: 'primary', initiative: 'widget-release', peers: [{ name: 'beta-sec', role: 'secondary', status: 'busy' }] },
+  })
+  const LABEL = /^(context|ctx|trend|quota \w+|5h|7d|acct [\w…-]+|work[\w…-]*|session|sess|cost|steward|stw|git|agents|agt|[▸▾] tools)( *)(\S)/
+  for (const isOpen of [false, true])
+    for (let W = 30; W <= 60; W++) {
+      const rows = layout({ ...v, isToolsOpen: isOpen }, W, 200).map(txt)
+      let seen = 0
+      for (const l of rows) {
+        const m = LABEL.exec(l)
+        if (!m) continue
+        seen++
+        expect(m[2]!.length, `width ${W}: "${l}"`).toBeGreaterThanOrEqual(2)
+      }
+      expect(seen, `width ${W}`).toBeGreaterThanOrEqual(10)
+    }
+})
+
+test('steward peers: a tree from a 2-space indent, the name whole; status goes first when tight', () => {
+  const long = 'a-rather-long-secondary-name'
+  const st = (x: NonNullable<StackwellView['steward']>) => x
+  const v = base({
+    steward: st({ role: 'primary', initiative: 'widget-release', peers: [{ name: long, role: 'secondary', status: 'idle' }, { name: 'b', role: 'secondary', status: 'busy' }] }),
+  })
+  const at = (W: number) => {
+    const all = layout(v, W, 200).map(txt)
+    const i = all.findIndex(l => l.startsWith('steward') || l.startsWith('stw'))
+    return all.slice(i, i + 3)
+  }
+  expect(at(48)).toEqual(['steward     ★ widget-release', '  ├─ ' + long + 'idle'.padStart(48 - 5 - long.length), '  └─ b'.padEnd(44) + 'busy'])
+  // 34 columns: the status no longer fits beside the whole name, so it goes; the name stays whole
+  expect(at(34)[1]).toBe('  ├─ ' + long)
+  // 30 columns: only then the name is cut
+  expect(at(30)[1]).toBe('  ├─ ' + long.slice(0, 24) + '…')
+  const rows = layout(v, 48, 200)
+  const r = rows.find(x => txt(x).includes('busy'))!
+  expect(colourOf(r, 'busy')).toBe(P.text)
+  expect(colourOf(rows.find(x => txt(x).includes('idle')), 'idle')).toBe(P.dim)
+  expect(colourOf(r, '└─')).toBe(P.dim)
+})
+
+test('tool log: the name column fits the longest name shown (cap 16); MCP shows tool then server', () => {
+  const log: StackwellView['log'] = [
+    { id: 'a', at: NOW - 2 * M, tool: 'ListAgents', target: '', ms: 100, status: 'ok' },
+    { id: 'b', at: NOW - M, tool: 'mcp__chrome-devtools__evaluate_script', target: 'chrome-devtools', ms: 300, status: 'ok' },
+    { id: 'c', at: NOW, tool: 'Bash', target: 'ls -la', ms: 200, status: 'ok' },
+  ]
+  const v = base({ toolCounts: { Bash: 1, ListAgents: 1 }, log })
+  const rows = layout(v, 48, 200)
+  const t = rows.findIndex(r => txt(r).startsWith('▾ tools'))
+  const lines = rows.slice(t + 1).map(txt)
+  // evaluate_script is 15 long: the column fits it whole
+  expect(lines[0]).toBe(`${hhmm(NOW)}  Bash` + ' '.repeat(13) + 'ls -la' + '0.2s'.padStart(48 - 5 - 2 - 15 - 2 - 6))
+  expect(lines[1]).toBe(`${hhmm(NOW - M)}  evaluate_script  chrome-devtools` + '0.3s'.padStart(48 - 5 - 2 - 15 - 2 - 15))
+  // a longer name: the column caps at 16
+  const capped = layout(base({ toolCounts: { Bash: 1 }, log: [{ ...log[1]!, tool: 'mcp__x__a_very_long_tool_name_here' }] }), 48, 200).map(txt)
+  expect(capped.find(l => l.includes('a_very'))).toMatch(/^\d\d:\d\d {2}a_very_long_too… {2}chrome-devtools/)
+  expect(lines[2]).toBe(`${hhmm(NOW - 2 * M)}  ListAgents` + '0.1s'.padStart(48 - 5 - 2 - 10))
+  expect(colourOf(rows[t + 2], 'chrome-devtools')).toBe(P.dim)
+  expect(colourOf(rows[t + 1], 'ls -la')).toBe(P.text)
+  // a shorter name list: the column shrinks to it
+  const short = layout(base({ toolCounts: { Bash: 1 }, log: [log[2]!, { ...log[0]!, tool: 'Read', target: 'a.md' }] }), 48, 200).map(txt)
+  expect(short.find(l => l.includes('ls -la'))).toMatch(/^\d\d:\d\d {2}Bash {2}ls -la/)
+  // narrow: the target shrinks first, the MCP server goes when there is no room
+  const narrow = layout(v, 30, 200).map(txt)
+  const mcp = narrow.find(l => l.includes('evaluate'))!
+  expect(mcp).toMatch(/^\d\d:\d\d {2}evaluate_script/)
+  expect(Array.from(mcp).length).toBeLessThanOrEqual(30)
+})
+
+test('an MCP call logs its server as the target', async ($, on) => {
+  world(on)
+  millionSession(on)
+  on('tool.call', () => ({ result: {}, text: '' }))
+  await start($)
+  await run($, 'tools')
+  await $.tool.call({ tool: 'mcp__chrome-devtools__evaluate_script', function: '() => 1' } as never)
+  const f = await frame($)
+  const t = row(f, /^▾ tools/)
+  expect(f.lines[t + 1]).toMatch(/^\d\d:\d\d {2}evaluate_script {2}chrome-devtools/)
+})
+
 // ---------------------------------------------------------------- margins
 
 test('margins: 1 blank row top and bottom, 2 blank columns each side, at 48 and narrow', async ($, on) => {
