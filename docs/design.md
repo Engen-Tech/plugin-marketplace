@@ -11,6 +11,7 @@ Paths below are `steward ...` (`/mnt/agent-storage/vader/src/steward`, main 0508
 ## Scope
 
 - In: steward-delegation, steward-prose-gate, steward-orchestration (from `TejGandham/steward`) and plainlanguage (from Forgejo `stackhouse/common-skills`) (operator decided).
+- In, added 2026-11-26: stackwell, a Claude Code mod, from Forgejo `stackhouse/utils`, folder `stackwell/mod/` (operator decided). See "Stackwell (third product)".
 - The steward repo stops being a distribution point. Its catalogs keep only `steward` pinned to `v0.14.2`; its READMEs point here; its root `package.json` stays for local development (operator decided).
 - Dependencies between plugins stay manual, with no `dependencies` field; the README lists the sets (operator decided).
 - Non-goals: other products, including hatch, are not covered. No checks or CI inside the marketplace. No npm publishing.
@@ -85,12 +86,12 @@ Static fields come from the skeleton and no release touches them: catalog `name`
 
 ## Release pipeline (product side)
 
-| Part | steward | common-skills |
-|-|-|-|
-| Workflow | `.github/workflows/release-marketplace.yml`, GitHub Actions, `on: push: tags: ["steward-delegation--v*", "steward-prose-gate--v*", "steward-orchestration--v*"]` | `.forgejo/workflows/release-marketplace.yml`, Forgejo Actions, `on: push: tags: ["plainlanguage--v*"]`, `uses: https://code.forgejo.org/actions/checkout@v4`, `runs-on: ubuntu-latest` |
-| Assembly | `scripts/release_marketplace.sh` | `scripts/release_marketplace.sh` |
-| Publisher | `scripts/publish_marketplace.py` (canonical copy) | the same file, copied byte for byte |
-| Secret | Actions secret `MARKETPLACE_TOKEN` | Forgejo Actions secret `MARKETPLACE_TOKEN` |
+| Part | steward | common-skills | utils (stackwell) |
+|-|-|-|-|
+| Workflow | `.github/workflows/release-marketplace.yml`, GitHub Actions, `on: push: tags: ["steward-delegation--v*", "steward-prose-gate--v*", "steward-orchestration--v*"]` | `.forgejo/workflows/release-marketplace.yml`, Forgejo Actions, `on: push: tags: ["plainlanguage--v*"]`, `uses: https://code.forgejo.org/actions/checkout@v4`, `runs-on: ubuntu-latest` | `.forgejo/workflows/release-marketplace.yml`, Forgejo Actions, `on: push: tags: ["stackwell--v*"]` |
+| Assembly | `scripts/release_marketplace.sh` | `scripts/release_marketplace.sh` | `scripts/release_marketplace.sh` (utils' own; copies `stackwell/mod/` as is) |
+| Publisher | `scripts/publish_marketplace.py` (canonical copy) | the same file, copied byte for byte | the same file, copied byte for byte |
+| Secret | Actions secret `MARKETPLACE_TOKEN` | Forgejo Actions secret `MARKETPLACE_TOKEN` | Forgejo Actions secret `MARKETPLACE_TOKEN` in `stackhouse/utils` (its own token, see "Stackwell (third product)") |
 
 Designer's call: one publisher shared by copy, plus a short assembly script per product. The marketplace edits must be the same in both products or they clobber each other; only the assembly differs. The publisher writes its own sha256 into each commit body, so a drifted copy shows in marketplace history.
 
@@ -121,6 +122,17 @@ Failures: a failed run leaves the marketplace unchanged; fix the cause and re-ru
 | Codex catalog: entries for exactly the plugins with `.codex-plugin/plugin.json`, fields as in the table | the same |
 | `package.json` `pi` equals the lock's pi lists and every path exists | missing or stale pi paths |
 | `claude plugin validate .` when `claude` is on PATH | schema errors; runs in the operator's dry runs, skipped with a printed note on runners |
+
+## Stackwell (third product)
+
+(operator decided) Status 2026-11-26: the pipeline is on utils branch `stackwell-release-pipeline`; the first release is pending.
+
+- Product: `stackwell`, a Claude Code mod (hooks module plugin): `.claude-plugin/plugin.json`, `hooks/hooks.json`, `hooks/register.tsx`. Mods run only in Claude Code, so it has no `.codex-plugin`, no `.github/plugin` and no pi resources, and the catalog and lock entries carry none.
+- Product repo: Forgejo `stackhouse/utils`, folder `stackwell/mod/`. Workflow `.forgejo/workflows/release-marketplace.yml`, on tags `stackwell--v*`. Assembly `scripts/release_marketplace.sh` is utils' own. Publisher `scripts/publish_marketplace.py` is copied byte for byte, the same rule as the other two products.
+- Assembly: copies `stackwell/mod/` as is. No compile, bundle or minify step. It excludes `.git` and the engine-generated `.claude-plugin/types/`.
+- Recorded `source`: the neutral `https://engen.tech`, not the internal Forgejo URL (operator decided 2026-11-26), so no internal hostname reaches the lock or the release commits. The publisher's rule that a lock entry's `source` must be its own repo URL holds for stackwell with this value.
+- Licence: the stackwell plugin is MIT (`LICENSE` in the plugin folder, `license` in its `plugin.json`). The root `package.json` `"UNLICENSED"` is the pi package's own field and does not apply to it. This is an exception to "License" below.
+- Secret: utils has its own repo secret `MARKETPLACE_TOKEN`, a separate fine-grained PAT named `stackwell-marketplace-release`: resource owner Engen-Tech, repository `plugin-marketplace` only, Contents read and write.
 
 ## Delivering plainlanguage
 
