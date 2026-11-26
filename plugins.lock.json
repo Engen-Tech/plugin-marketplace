@@ -23,6 +23,14 @@
       ]
     }
   },
+  "stackwell": {
+    "version": "0.4.0",
+    "source": "https://engen.tech",
+    "tag": "stackwell--v0.4.0",
+    "commit": "6265226d4d8a847902da617b5a9f458aa0887c56",
+    "tree": "888e5ad23e22f97a3157a68e36b8b81174288bde",
+    "pi": {}
+  },
   "steward-delegation": {
     "version": "1.0.2",
     "source": "https://github.com/TejGandham/steward",

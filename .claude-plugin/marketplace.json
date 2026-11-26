@@ -17,6 +17,11 @@
       "source": "./plugins/plainlanguage"
     },
     {
+      "name": "stackwell",
+      "description": "A calm right-side status pane for Claude Code: context, quota, session, git, agents and tools at a glance, grey by default with colour only for groups and for warn and crit.",
+      "source": "./plugins/stackwell"
+    },
+    {
       "name": "steward-delegation",
       "description": "Delegation edict for Claude Code: seven pinned subagent profiles chosen by task complexity, and a gate that denies a second direct edit on the main thread.",
       "source": "./plugins/steward-delegation"
